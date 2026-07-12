@@ -185,7 +185,8 @@ impl Default for ServiceState {
 }
 
 fn emit_snapshot(app: &AppHandle, snapshot: &UiSnapshot) -> Result<(), String> {
-    app.emit(SNAPSHOT_EVENT, snapshot.clone()).map_err(|error| error.to_string())
+    app.emit(SNAPSHOT_EVENT, snapshot.clone())
+        .map_err(|error| error.to_string())
 }
 
 fn update<F>(state: &ServiceState, app: &AppHandle, operation: F) -> Result<(), String>
@@ -193,7 +194,10 @@ where
     F: FnOnce(&mut UiSnapshot) -> Result<(), String>,
 {
     let snapshot = {
-        let mut snapshot = state.0.lock().map_err(|_| "Rust 服务状态锁已损坏".to_string())?;
+        let mut snapshot = state
+            .0
+            .lock()
+            .map_err(|_| "Rust 服务状态锁已损坏".to_string())?;
         operation(&mut snapshot)?;
         snapshot.bump();
         snapshot.clone()
@@ -201,8 +205,15 @@ where
     emit_snapshot(app, &snapshot)
 }
 
-pub fn capture_local_clipboard(state: &ServiceState, app: &AppHandle, text: String, now: String) -> Result<(), String> {
-    if text.trim().is_empty() { return Ok(()); }
+pub fn capture_local_clipboard(
+    state: &ServiceState,
+    app: &AppHandle,
+    text: String,
+    now: String,
+) -> Result<(), String> {
+    if text.trim().is_empty() {
+        return Ok(());
+    }
     update(state, app, |snapshot| {
         snapshot.current_clipboard = CurrentClipboard {
             source: "local".into(),
@@ -224,9 +235,20 @@ pub fn capture_local_clipboard(state: &ServiceState, app: &AppHandle, text: Stri
 }
 
 #[tauri::command]
-pub fn get_snapshot(state: State<'_, ServiceState>, platform: String, now: String) -> Result<UiSnapshot, String> {
-    let mut snapshot = state.0.lock().map_err(|_| "Rust 服务状态锁已损坏".to_string())?;
-    snapshot.platform = if platform == "android" { "android".into() } else { "desktop".into() };
+pub fn get_snapshot(
+    state: State<'_, ServiceState>,
+    platform: String,
+    now: String,
+) -> Result<UiSnapshot, String> {
+    let mut snapshot = state
+        .0
+        .lock()
+        .map_err(|_| "Rust 服务状态锁已损坏".to_string())?;
+    snapshot.platform = if platform == "android" {
+        "android".into()
+    } else {
+        "desktop".into()
+    };
     if snapshot.last_synchronized_at.starts_with("1970-") {
         snapshot.last_synchronized_at = now.clone();
         snapshot.current_clipboard.changed_at = now;
@@ -235,16 +257,31 @@ pub fn get_snapshot(state: State<'_, ServiceState>, platform: String, now: Strin
 }
 
 #[tauri::command]
-pub fn set_pause(state: State<'_, ServiceState>, app: AppHandle, kind: String, paused: bool) -> Result<(), String> {
+pub fn set_pause(
+    state: State<'_, ServiceState>,
+    app: AppHandle,
+    kind: String,
+    paused: bool,
+) -> Result<(), String> {
     update(&state, &app, |snapshot| match kind.as_str() {
-        "publish" => { snapshot.publish_paused = paused; Ok(()) }
-        "subscribe" => { snapshot.subscribe_paused = paused; Ok(()) }
+        "publish" => {
+            snapshot.publish_paused = paused;
+            Ok(())
+        }
+        "subscribe" => {
+            snapshot.subscribe_paused = paused;
+            Ok(())
+        }
         _ => Err("未知暂停类型".into()),
     })
 }
 
 #[tauri::command]
-pub fn set_synchronization_paused(state: State<'_, ServiceState>, app: AppHandle, paused: bool) -> Result<(), String> {
+pub fn set_synchronization_paused(
+    state: State<'_, ServiceState>,
+    app: AppHandle,
+    paused: bool,
+) -> Result<(), String> {
     update(&state, &app, |snapshot| {
         snapshot.publish_paused = paused;
         snapshot.subscribe_paused = paused;
@@ -253,54 +290,102 @@ pub fn set_synchronization_paused(state: State<'_, ServiceState>, app: AppHandle
 }
 
 #[tauri::command]
-pub fn set_app_activity(state: State<'_, ServiceState>, app: AppHandle, activity: String, now: String) -> Result<(), String> {
+pub fn set_app_activity(
+    state: State<'_, ServiceState>,
+    app: AppHandle,
+    activity: String,
+    now: String,
+) -> Result<(), String> {
     update(&state, &app, |snapshot| {
-        if snapshot.platform != "android" { return Ok(()); }
+        if snapshot.platform != "android" {
+            return Ok(());
+        }
         snapshot.activity = match activity.as_str() {
             "background" => "suspended",
             "foreground" => "foreground_live",
             _ => return Err("未知应用生命周期状态".into()),
-        }.into();
-        if activity == "foreground" { snapshot.last_synchronized_at = now; }
+        }
+        .into();
+        if activity == "foreground" {
+            snapshot.last_synchronized_at = now;
+        }
         Ok(())
     })
 }
 
 #[tauri::command]
-pub fn publish_local_clipboard(state: State<'_, ServiceState>, app: AppHandle, text: String, now: String) -> Result<(), String> {
-    if text.trim().is_empty() { return Err("当前文本剪贴板为空".into()); }
+pub fn publish_local_clipboard(
+    state: State<'_, ServiceState>,
+    app: AppHandle,
+    text: String,
+    now: String,
+) -> Result<(), String> {
+    if text.trim().is_empty() {
+        return Err("当前文本剪贴板为空".into());
+    }
     capture_local_clipboard(&state, &app, text, now)
 }
 
 #[tauri::command]
-pub fn update_settings(state: State<'_, ServiceState>, app: AppHandle, settings: Value) -> Result<(), String> {
+pub fn update_settings(
+    state: State<'_, ServiceState>,
+    app: AppHandle,
+    settings: Value,
+) -> Result<(), String> {
     update(&state, &app, |snapshot| {
-        let mut current = serde_json::to_value(&snapshot.settings).map_err(|error| error.to_string())?;
-        let current_object = current.as_object_mut().ok_or_else(|| "设置状态格式错误".to_string())?;
-        let patch = settings.as_object().ok_or_else(|| "设置更新必须是对象".to_string())?;
-        for (key, value) in patch { current_object.insert(key.clone(), value.clone()); }
-        snapshot.settings = serde_json::from_value(current).map_err(|error| format!("设置值无效：{error}"))?;
+        let mut current =
+            serde_json::to_value(&snapshot.settings).map_err(|error| error.to_string())?;
+        let current_object = current
+            .as_object_mut()
+            .ok_or_else(|| "设置状态格式错误".to_string())?;
+        let patch = settings
+            .as_object()
+            .ok_or_else(|| "设置更新必须是对象".to_string())?;
+        for (key, value) in patch {
+            current_object.insert(key.clone(), value.clone());
+        }
+        snapshot.settings =
+            serde_json::from_value(current).map_err(|error| format!("设置值无效：{error}"))?;
         Ok(())
     })
 }
 
 #[tauri::command]
-pub fn create_import_intent(state: State<'_, ServiceState>, slot_id: String, revision: u64) -> Result<String, String> {
-    let snapshot = state.0.lock().map_err(|_| "Rust 服务状态锁已损坏".to_string())?;
-    let slot = snapshot.slots.iter().find(|slot| slot.id == slot_id && slot.revision == revision)
+pub fn create_import_intent(
+    state: State<'_, ServiceState>,
+    slot_id: String,
+    revision: u64,
+) -> Result<String, String> {
+    let snapshot = state
+        .0
+        .lock()
+        .map_err(|_| "Rust 服务状态锁已损坏".to_string())?;
+    let slot = snapshot
+        .slots
+        .iter()
+        .find(|slot| slot.id == slot_id && slot.revision == revision)
         .ok_or_else(|| "设备槽位不存在或已经更新".to_string())?;
     Err(format!("{} 的远端正文传输尚未就绪", slot.device_name))
 }
 
 #[tauri::command]
-pub fn confirm_import(_state: State<'_, ServiceState>, _import_id: String) -> Result<String, String> {
+pub fn confirm_import(
+    _state: State<'_, ServiceState>,
+    _import_id: String,
+) -> Result<String, String> {
     Err("没有可确认的远端剪贴板导入".into())
 }
 
 #[tauri::command]
-pub fn cancel_import(state: State<'_, ServiceState>, app: AppHandle, import_id: String) -> Result<(), String> {
+pub fn cancel_import(
+    state: State<'_, ServiceState>,
+    app: AppHandle,
+    import_id: String,
+) -> Result<(), String> {
     update(&state, &app, |snapshot| {
-        snapshot.imports.retain(|operation| operation.id != import_id);
+        snapshot
+            .imports
+            .retain(|operation| operation.id != import_id);
         Ok(())
     })
 }

@@ -9,14 +9,14 @@ import { GroupsPage } from "../features/groups/GroupsPage";
 import { TransfersPage } from "../features/transfers/TransfersPage";
 import { SettingsPage } from "../features/settings/SettingsPage";
 import { applyAppearanceSettings, subscribeToSystemAppearanceChanges } from "../features/settings/appearance";
-import { useAppLifecycle } from "./useAppLifecycle";
+import { useAndroidLifecycle } from "../platform/android/useAndroidLifecycle";
 import { FloatingOrbManager } from "../features/floating/FloatingOrbManager";
 
 export function App({ client }: { client: DesktopClient }) {
   const [page, setPage] = useState<PageId>("home");
   const [snapshot, setSnapshot] = useState<UiSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
-  useAppLifecycle(client);
+  useAndroidLifecycle(client);
 
   useEffect(() => {
     let mounted = true;

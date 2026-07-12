@@ -13,14 +13,14 @@
 ### Task 1: Project skeleton and shared model
 
 **Files:**
-- Create: `desktop/package.json`
-- Create: `desktop/tsconfig.json`
-- Create: `desktop/vite.config.ts`
-- Create: `desktop/index.html`
-- Create: `desktop/src/main.tsx`
-- Create: `desktop/src/model.ts`
-- Create: `desktop/src/ipc/client.ts`
-- Create: `desktop/src/ipc/demo-client.ts`
+- Create: `app/package.json`
+- Create: `app/tsconfig.json`
+- Create: `app/vite.config.ts`
+- Create: `app/index.html`
+- Create: `app/src/main.tsx`
+- Create: `app/src/model.ts`
+- Create: `app/src/ipc/client.ts`
+- Create: `app/src/ipc/demo-client.ts`
 
 - [ ] Scaffold the Vite/React entry without a browser-oriented router.
 - [ ] Define device, clipboard representation, slot availability, import state, pause state and snapshot revision types.
@@ -31,12 +31,12 @@
 ### Task 2: Visual system and application shell
 
 **Files:**
-- Create: `desktop/src/styles/tokens.css`
-- Create: `desktop/src/styles/global.css`
-- Create: `desktop/src/app/App.tsx`
-- Create: `desktop/src/app/AppShell.tsx`
-- Create: `desktop/src/components/Icon.tsx`
-- Create: `desktop/src/components/StatusBadge.tsx`
+- Create: `app/src/styles/tokens.css`
+- Create: `app/src/styles/global.css`
+- Create: `app/src/app/App.tsx`
+- Create: `app/src/app/AppShell.tsx`
+- Create: `app/src/components/Icon.tsx`
+- Create: `app/src/components/StatusBadge.tsx`
 
 - [ ] Implement semantic light/dark tokens, typography, focus rings and reduced-motion behavior.
 - [ ] Implement desktop title bar, sidebar navigation and responsive content frame.
@@ -47,12 +47,12 @@
 ### Task 3: Clipboard switcher and device slots
 
 **Files:**
-- Create: `desktop/src/features/clipboard/ClipboardSwitcher.tsx`
-- Create: `desktop/src/features/clipboard/CurrentClipboard.tsx`
-- Create: `desktop/src/features/clipboard/DeviceSlotCard.tsx`
-- Create: `desktop/src/features/clipboard/RepresentationList.tsx`
-- Create: `desktop/src/features/clipboard/ImportProgress.tsx`
-- Create: `desktop/src/features/clipboard/clipboard.test.tsx`
+- Create: `app/src/features/clipboard/ClipboardSwitcher.tsx`
+- Create: `app/src/features/clipboard/CurrentClipboard.tsx`
+- Create: `app/src/features/clipboard/DeviceSlotCard.tsx`
+- Create: `app/src/features/clipboard/RepresentationList.tsx`
+- Create: `app/src/features/clipboard/ImportProgress.tsx`
+- Create: `app/src/features/clipboard/clipboard.test.tsx`
 
 - [ ] Render current system clipboard separately from the last published local slot.
 - [ ] Render one card per origin device with ready, metadata-only, partial, stale, expired, blocked and conflict states.
@@ -64,13 +64,13 @@
 ### Task 4: Main desktop pages
 
 **Files:**
-- Create: `desktop/src/features/home/HomePage.tsx`
-- Create: `desktop/src/features/devices/DevicesPage.tsx`
-- Create: `desktop/src/features/groups/GroupsPage.tsx`
-- Create: `desktop/src/features/transfers/TransfersPage.tsx`
-- Create: `desktop/src/features/settings/SettingsPage.tsx`
-- Create: `desktop/src/components/Toggle.tsx`
-- Create: `desktop/src/components/EmptyState.tsx`
+- Create: `app/src/features/home/HomePage.tsx`
+- Create: `app/src/features/devices/DevicesPage.tsx`
+- Create: `app/src/features/groups/GroupsPage.tsx`
+- Create: `app/src/features/transfers/TransfersPage.tsx`
+- Create: `app/src/features/settings/SettingsPage.tsx`
+- Create: `app/src/components/Toggle.tsx`
+- Create: `app/src/components/EmptyState.tsx`
 
 - [ ] Build the overview from the same slot components used by the switcher.
 - [ ] Build device and sync-group management surfaces with clear unavailable-backend messaging.
@@ -81,13 +81,13 @@
 ### Task 5: Tauri desktop integration
 
 **Files:**
-- Create: `desktop/src-tauri/Cargo.toml`
-- Create: `desktop/src-tauri/build.rs`
-- Create: `desktop/src-tauri/tauri.conf.json`
-- Create: `desktop/src-tauri/capabilities/default.json`
-- Create: `desktop/src-tauri/src/main.rs`
-- Create: `desktop/src/ipc/tauri-client.ts`
-- Create: `desktop/src-tauri/icons/*`
+- Create: `app/src-tauri/Cargo.toml`
+- Create: `app/src-tauri/build.rs`
+- Create: `app/src-tauri/tauri.conf.json`
+- Create: `app/src-tauri/capabilities/default.json`
+- Create: `app/src-tauri/src/main.rs`
+- Create: `app/src/ipc/tauri-client.ts`
+- Create: `app/src-tauri/icons/*`
 
 - [ ] Configure the native application window and bundled resources.
 - [ ] Register clipboard-manager with the minimum clipboard permissions.
@@ -112,5 +112,5 @@
 - Frontend project, shared model, desktop pages, Clipboard Switcher and Tauri configuration are implemented.
 - `npm run typecheck`, `npm test -- --run`, `npm run build` and the Vite development server have been verified.
 - Tauri configuration is recognized by the CLI and the clipboard plugin is registered with write-text-only frontend permission.
-- Native Linux prerequisites were subsequently installed. `cargo check`, release compilation and `.deb` packaging now succeed; verified artifacts are copied to `desktop/release/`.
+- Native Linux prerequisites were subsequently installed. `cargo check`, release compilation and `.deb` packaging now succeed; verified artifacts are copied to `app/release/`.
 - Network synchronization remains intentionally unimplemented; the current client uses visibly labelled demo slots and never represents them as real discovered devices.

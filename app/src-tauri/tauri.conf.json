@@ -2,7 +2,7 @@
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "AirDrop",
   "version": "0.1.0",
-  "identifier": "dev.airdrop.desktop",
+  "identifier": "io.github.wudao1006.airdrop",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",

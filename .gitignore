@@ -1,9 +1,9 @@
-desktop/node_modules/
-desktop/dist/
-desktop/dist-android/
-desktop/src-tauri/target/
-desktop/release/
-desktop/*.tsbuildinfo
+app/node_modules/
+app/dist/
+app/dist-android/
+app/src-tauri/target/
+app/release/
+app/*.tsbuildinfo
 /*.png
 *.log
 .DS_Store

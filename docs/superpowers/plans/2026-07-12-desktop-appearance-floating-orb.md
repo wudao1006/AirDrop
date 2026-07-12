@@ -12,27 +12,27 @@
 
 ## File Structure
 
-- Create `desktop/src/features/settings/appearance.ts`: appearance defaults, validation, persistence, and DOM variable application.
-- Create `desktop/src/features/settings/AppearanceSettings.tsx`: appearance editor UI.
-- Create `desktop/src/features/floating/floating-events.ts`: typed action/state event contracts.
-- Create `desktop/src/features/floating/FloatingOrbManager.tsx`: main-window lifecycle and event bridge.
-- Create `desktop/src/features/floating/floating-adapter.ts`: injectable Tauri window/event and geometry boundary.
-- Create `desktop/src/features/floating/floating-adapter.test.ts`: lifecycle, capability-boundary, and creation-event tests.
-- Create `desktop/src/features/floating/floating-geometry.test.ts`: scale-aware clamping and side-anchor tests.
-- Create `desktop/src-tauri/capabilities/floating-main.json`: desktop-only main-window creation/lookup and shared event permissions.
-- Create `desktop/src-tauri/capabilities/floating-orb.json`: least-privilege desktop-only orb event, drag, and geometry permissions.
-- Create `desktop/src/features/floating/FloatingOrbApp.tsx`: floating surface UI, layout requests, and acknowledgement-driven rendering.
-- Create `desktop/src/features/floating/floating.css`: fused-droplet and expanded capsule styling.
-- Create `desktop/src/features/settings/appearance.test.ts`: normalization and persistence tests.
-- Create `desktop/src/features/floating/FloatingOrbApp.test.tsx`: browser-safe floating surface tests.
-- Modify `desktop/src/model.ts`: extend `AppSettings`.
-- Modify `desktop/src/ipc/demo-client.ts`: load and persist normalized settings.
-- Modify `desktop/src/app/App.tsx`: apply appearance variables and mount the manager.
-- Modify `desktop/src/features/settings/SettingsPage.tsx`: render the new appearance section.
-- Modify `desktop/src/main.tsx`: route `?surface=floating` to the orb frontend.
-- Modify `desktop/src/styles/tokens.css`: replace customizable hard-coded alpha values with variables.
-- Modify `desktop/src/styles/global.css`: live blur/radius/highlight variables and refined cursor.
-- Modify `desktop/src-tauri/src/lib.rs`: exit the process when the main window closes so the orb cannot outlive it.
+- Create `app/src/features/settings/appearance.ts`: appearance defaults, validation, persistence, and DOM variable application.
+- Create `app/src/features/settings/AppearanceSettings.tsx`: appearance editor UI.
+- Create `app/src/features/floating/floating-events.ts`: typed action/state event contracts.
+- Create `app/src/features/floating/FloatingOrbManager.tsx`: main-window lifecycle and event bridge.
+- Create `app/src/features/floating/floating-adapter.ts`: injectable Tauri window/event and geometry boundary.
+- Create `app/src/features/floating/floating-adapter.test.ts`: lifecycle, capability-boundary, and creation-event tests.
+- Create `app/src/features/floating/floating-geometry.test.ts`: scale-aware clamping and side-anchor tests.
+- Create `app/src-tauri/capabilities/floating-main.json`: desktop-only main-window creation/lookup and shared event permissions.
+- Create `app/src-tauri/capabilities/floating-orb.json`: least-privilege desktop-only orb event, drag, and geometry permissions.
+- Create `app/src/features/floating/FloatingOrbApp.tsx`: floating surface UI, layout requests, and acknowledgement-driven rendering.
+- Create `app/src/features/floating/floating.css`: fused-droplet and expanded capsule styling.
+- Create `app/src/features/settings/appearance.test.ts`: normalization and persistence tests.
+- Create `app/src/features/floating/FloatingOrbApp.test.tsx`: browser-safe floating surface tests.
+- Modify `app/src/model.ts`: extend `AppSettings`.
+- Modify `app/src/ipc/demo-client.ts`: load and persist normalized settings.
+- Modify `app/src/app/App.tsx`: apply appearance variables and mount the manager.
+- Modify `app/src/features/settings/SettingsPage.tsx`: render the new appearance section.
+- Modify `app/src/main.tsx`: route `?surface=floating` to the orb frontend.
+- Modify `app/src/styles/tokens.css`: replace customizable hard-coded alpha values with variables.
+- Modify `app/src/styles/global.css`: live blur/radius/highlight variables and refined cursor.
+- Modify `app/src-tauri/src/lib.rs`: exit the process when the main window closes so the orb cannot outlive it.
 
 ### Task 1: Appearance model and persistence
 
@@ -99,5 +99,5 @@
 - [ ] Run `npm run build`.
 - [ ] Run `npx vite build --mode android --outDir dist-android`.
 - [ ] Build the Tauri release binary with `cargo build --bins --features tauri/custom-protocol --release --manifest-path src-tauri/Cargo.toml`.
-- [ ] Replace `desktop/release/AirDrop` and launch with `desktop/release/run-wsl.sh`.
+- [ ] Replace `app/release/AirDrop` and launch with `app/release/run-wsl.sh`.
 - [ ] Enable the orb, inspect collapsed/expanded states, confirm drag and actions, and verify appearance persistence after restart.

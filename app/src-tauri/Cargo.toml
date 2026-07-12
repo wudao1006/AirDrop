@@ -1,12 +1,12 @@
 [package]
-name = "airdrop-desktop"
+name = "airdrop-app"
 version = "0.1.0"
 description = "Local-first multi-device clipboard switcher"
 authors = ["AirDrop contributors"]
 edition = "2021"
 
 [lib]
-name = "airdrop_desktop_lib"
+name = "airdrop_app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

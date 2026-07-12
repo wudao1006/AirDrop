@@ -1,7 +1,7 @@
 import { useEffect } from "react";
-import type { DesktopClient } from "../ipc/client";
+import type { DesktopClient } from "../../ipc/client";
 
-export function useAppLifecycle(client: DesktopClient): void {
+export function useAndroidLifecycle(client: DesktopClient): void {
   useEffect(() => {
     if (client.platform !== "android") return;
 

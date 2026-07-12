@@ -3,14 +3,15 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { DesktopClient, Unsubscribe } from "./client";
 import { DemoDesktopClient } from "./demo-client";
-import type { AppSettings, PlatformKind, UiSnapshot } from "../model";
+import type { AppSettings, UiSnapshot } from "../model";
 import { loadAppearanceSettings, normalizeAppearanceSettings, saveAppearanceSettings } from "../features/settings/appearance";
+import { detectPlatform } from "../platform/runtime";
 
 const SNAPSHOT_EVENT = "airdrop://snapshot";
 
 const browserClipboardWriter = async (text: string): Promise<void> => {
   if (!navigator.clipboard) {
-    throw new Error("浏览器预览不能访问系统剪贴板，请使用 Tauri 桌面程序");
+    throw new Error("浏览器预览不能访问系统剪贴板，请打开 AirDrop 应用");
   }
   await navigator.clipboard.writeText(text);
 };
@@ -22,13 +23,7 @@ const browserClipboardReader = async (): Promise<string> => {
   return navigator.clipboard.readText();
 };
 
-export const detectPlatform = (): PlatformKind => {
-  const override = import.meta.env.VITE_PLATFORM;
-  if (override === "android") return "android";
-  return /Android/i.test(navigator.userAgent) ? "android" : "desktop";
-};
-
-class TauriDesktopClient implements DesktopClient {
+class TauriAppClient implements DesktopClient {
   readonly platform = detectPlatform();
   private appearanceInitialized = false;
 
@@ -99,7 +94,7 @@ class TauriDesktopClient implements DesktopClient {
 
 export const createDesktopClient = (): DesktopClient => {
   const inTauri = Boolean(window.__TAURI_INTERNALS__);
-  if (inTauri) return new TauriDesktopClient();
+  if (inTauri) return new TauriAppClient();
   return new DemoDesktopClient(
     browserClipboardWriter,
     browserClipboardReader,

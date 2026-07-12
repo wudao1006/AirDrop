@@ -1159,7 +1159,7 @@ CLI 默认调用本地 Daemon，不重复维护网络连接。
     │   ├── platform/
     │   ├── daemon/
     │   └── cli/
-    ├── desktop/                 # 历史目录名；Tauri 桌面与 Android 共享应用
+    ├── app/                 # 历史目录名；Tauri 桌面与 Android 共享应用
     │   ├── src/
     │   │   ├── app/             # 窗口入口、路由和错误边界
     │   │   ├── features/
@@ -1183,7 +1183,7 @@ CLI 默认调用本地 Daemon，不重复维护网络连接。
 
 建议使用 Cargo Workspace，但第一阶段不为每个领域建立独立 crate，避免过早形成大量依赖边和循环抽象。protocol 只保存规范化编码、消息模型和版本兼容规则，不依赖网络与存储；core 内部按领域模块隔离；platform 保存文件系统、凭据、剪贴板和 IPC Adapter；daemon 是唯一组合根。
 
-desktop/src 按业务功能垂直切分，不建立一个包含全部远端状态的万能前端 Store。目录名保留是为了避免无价值迁移，不表示只支持桌面；ipc 层负责 Snapshot + event_revision 的一致性和生成的 TypeScript 类型，feature 只能通过 ipc command 改变状态。通用 components 不接受 group_id、SourceRef 等授权对象，避免权限逻辑泄漏到视觉组件。桌面主窗口、桌面 Switcher 和 Android 全屏选择器共享 feature 与 ipc 层，不复制 Import 流程。
+app/src 按业务功能垂直切分，不建立一个包含全部远端状态的万能前端 Store。目录名保留是为了避免无价值迁移，不表示只支持桌面；ipc 层负责 Snapshot + event_revision 的一致性和生成的 TypeScript 类型，feature 只能通过 ipc command 改变状态。通用 components 不接受 group_id、SourceRef 等授权对象，避免权限逻辑泄漏到视觉组件。桌面主窗口、桌面 Switcher 和 Android 全屏选择器共享 feature 与 ipc 层，不复制 Import 流程。
 
 当某个 core 模块已经形成稳定公共接口、拥有独立测试需求或需要被其他项目复用时再拆 crate。Transfer 通过抽象 ByteStream、RandomAccessSource 和 TargetFs 接口测试，不强绑定 Quinn 或具体平台 API。
 

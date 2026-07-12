@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "airdrop-desktop"
+name = "airdrop-app"
 version = "0.1.0"
 dependencies = [
  "serde",

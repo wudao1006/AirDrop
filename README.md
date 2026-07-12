@@ -22,7 +22,7 @@
 ## 运行前端预览
 
 ```bash
-cd desktop
+cd app
 npm install
 npm run dev
 ```
@@ -32,7 +32,7 @@ npm run dev
 Android 触控布局可以在没有 Android SDK 时预览：
 
 ```bash
-cd desktop
+cd app
 npm run dev:android
 ```
 
@@ -41,16 +41,16 @@ npm run dev:android
 先安装 Rust 与 Tauri 在当前平台要求的系统依赖。Linux 通常需要 WebKitGTK、GTK、AppIndicator 和 SVG 开发包，具体包名随发行版变化。
 
 ```bash
-cd desktop
+cd app
 npm install
 npm run tauri dev
 ```
 
-当前开发机已经安装 Rust、WebKitGTK、GTK、AppIndicator、librsvg 和相关开发库，可以直接编译 Linux 原生程序。已验证产物位于 `desktop/release/`。
+当前开发机已经安装 Rust、WebKitGTK、GTK、AppIndicator、librsvg 和相关开发库，可以直接编译 Linux 原生程序。已验证产物位于 `app/release/`。
 
 ## Android
 
-Android 使用同一个 `desktop/` Tauri 工程；目录名是历史名称，不代表仅支持桌面。应用在前台时恢复连接并实时更新设备槽位，进入后台后允许系统暂停，重新前台时重新获取完整 Snapshot。生命周期变化不会读取或写入系统剪贴板。
+Android 使用同一个 `app/` Tauri 工程。应用在前台时恢复连接并实时更新设备槽位，进入后台后允许系统暂停，重新前台时重新获取完整 Snapshot。生命周期变化不会读取或写入系统剪贴板。
 
 生成和运行 Android 原生工程需要：
 
@@ -62,7 +62,7 @@ Android 使用同一个 `desktop/` Tauri 工程；目录名是历史名称，不
 工具链准备完成后执行：
 
 ```bash
-cd desktop
+cd app
 npm run android:init
 npm run android:dev
 ```
@@ -75,10 +75,31 @@ npm run android:build
 
 当前主机已有 Rust，但仍没有 Java 和 Android SDK/NDK，因此尚未生成 `gen/android` 或 APK。仓库不会包含 iOS 工程和依赖。
 
+## 项目结构
+
+```text
+app/
+├── src/
+│   ├── app/                  # 共享应用外壳
+│   ├── features/             # 共享页面与业务组件
+│   └── platform/
+│       ├── desktop/          # 桌面标题栏、导航与窗口交互
+│       └── android/          # Android 导航与生命周期
+└── src-tauri/src/
+    ├── core/                 # 跨平台状态、同步模型与 Tauri 命令
+    └── platform/
+        ├── windows/          # Windows 原生适配入口
+        ├── macos/            # macOS 原生适配入口
+        ├── linux/            # Linux/Wayland/X11 适配入口
+        └── android/          # Android 权限与前台生命周期适配入口
+```
+
+Windows、macOS 和 Linux 共享 React 界面与 Rust Core，仅把剪贴板、窗口材质、托盘、权限和系统集成放入各自的平台目录。Android 共享协议与状态模型，但保留独立的生命周期和触控导航适配。
+
 ## 验证
 
 ```bash
-cd desktop
+cd app
 npm run typecheck
 npm test -- --run
 npm run build

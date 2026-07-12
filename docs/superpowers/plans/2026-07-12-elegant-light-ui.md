@@ -13,10 +13,10 @@
 ### Task 1: Navigation and page hierarchy
 
 **Files:**
-- Modify: `desktop/src/app/AppShell.tsx`
-- Modify: `desktop/src/features/home/HomePage.tsx`
-- Modify: `desktop/src/features/clipboard/ClipboardPage.tsx`
-- Test: `desktop/src/features/clipboard/clipboard.test.tsx`
+- Modify: `app/src/app/AppShell.tsx`
+- Modify: `app/src/features/home/HomePage.tsx`
+- Modify: `app/src/features/clipboard/ClipboardPage.tsx`
+- Test: `app/src/features/clipboard/clipboard.test.tsx`
 
 - [ ] Reduce desktop brand and navigation chrome.
 - [ ] Reduce Android bottom navigation to Home, Clipboard, Devices and Settings.
@@ -27,11 +27,11 @@
 ### Task 2: Clipboard component simplification
 
 **Files:**
-- Modify: `desktop/src/features/clipboard/CurrentClipboard.tsx`
-- Modify: `desktop/src/features/clipboard/DeviceSlotCard.tsx`
-- Modify: `desktop/src/features/clipboard/ClipboardSwitcher.tsx`
-- Modify: `desktop/src/features/clipboard/ImportProgress.tsx`
-- Modify: `desktop/src/components/StatusBadge.tsx`
+- Modify: `app/src/features/clipboard/CurrentClipboard.tsx`
+- Modify: `app/src/features/clipboard/DeviceSlotCard.tsx`
+- Modify: `app/src/features/clipboard/ClipboardSwitcher.tsx`
+- Modify: `app/src/features/clipboard/ImportProgress.tsx`
+- Modify: `app/src/components/StatusBadge.tsx`
 
 - [ ] Convert nested cards to flat rows and separators.
 - [ ] Use quiet status dots/labels and reserve strong color for conflicts.
@@ -41,10 +41,10 @@
 ### Task 3: Visual tokens and restrained glass
 
 **Files:**
-- Modify: `desktop/src/styles/tokens.css`
-- Modify: `desktop/src/styles/global.css`
-- Modify: `desktop/src/features/clipboard/clipboard.css`
-- Modify: `desktop/src-tauri/tauri.conf.json`
+- Modify: `app/src/styles/tokens.css`
+- Modify: `app/src/styles/global.css`
+- Modify: `app/src/features/clipboard/clipboard.css`
+- Modify: `app/src-tauri/tauri.conf.json`
 
 - [ ] Replace saturated surfaces and large shadows with neutral tokens.
 - [ ] Apply blur only to navigation, mobile bars and switcher toolbar.
@@ -57,7 +57,7 @@
 - [ ] Run TypeScript typecheck and all tests.
 - [ ] Build desktop and Android-mode frontend assets and compare sizes.
 - [ ] Run Cargo check and release compilation.
-- [ ] Copy the redesigned native binary to `desktop/release/AirDrop`.
+- [ ] Copy the redesigned native binary to `app/release/AirDrop`.
 - [ ] Launch through the WSL compatibility script for user inspection.
 
 ## Execution status
@@ -67,4 +67,4 @@
 - Clipboard surfaces use flat rows, subtle selection tint and a single glass toolbar layer.
 - Neutral light/dark tokens, compact typography and restrained 140ms interaction transitions are active.
 - All 8 behavior tests pass; desktop and Android-mode assets build successfully.
-- The redesigned Linux native binary compiles to 4.9 MiB and is running through `desktop/release/run-wsl.sh` for inspection.
+- The redesigned Linux native binary compiles to 4.9 MiB and is running through `app/release/run-wsl.sh` for inspection.

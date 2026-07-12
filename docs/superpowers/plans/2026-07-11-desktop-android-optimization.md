@@ -24,12 +24,12 @@
 ### Task 2: Platform and lifecycle model
 
 **Files:**
-- Modify: `desktop/src/model.ts`
-- Modify: `desktop/src/ipc/client.ts`
-- Modify: `desktop/src/ipc/demo-client.ts`
-- Modify: `desktop/src/ipc/tauri-client.ts`
-- Create: `desktop/src/app/useAppLifecycle.ts`
-- Test: `desktop/src/features/clipboard/clipboard.test.tsx`
+- Modify: `app/src/model.ts`
+- Modify: `app/src/ipc/client.ts`
+- Modify: `app/src/ipc/demo-client.ts`
+- Modify: `app/src/ipc/tauri-client.ts`
+- Create: `app/src/app/useAppLifecycle.ts`
+- Test: `app/src/features/clipboard/clipboard.test.tsx`
 
 - [ ] Add `desktop | android`, `foreground_live | reconnecting | suspended` and clipboard capability types.
 - [ ] Detect Android without coupling feature components to user-agent parsing.
@@ -39,13 +39,13 @@
 ### Task 3: Android-adaptive application shell
 
 **Files:**
-- Modify: `desktop/src/app/App.tsx`
-- Modify: `desktop/src/app/AppShell.tsx`
-- Modify: `desktop/src/styles/global.css`
-- Modify: `desktop/src/features/home/HomePage.tsx`
-- Modify: `desktop/src/features/clipboard/ClipboardPage.tsx`
-- Modify: `desktop/src/features/clipboard/clipboard.css`
-- Modify: `desktop/src/features/settings/SettingsPage.tsx`
+- Modify: `app/src/app/App.tsx`
+- Modify: `app/src/app/AppShell.tsx`
+- Modify: `app/src/styles/global.css`
+- Modify: `app/src/features/home/HomePage.tsx`
+- Modify: `app/src/features/clipboard/ClipboardPage.tsx`
+- Modify: `app/src/features/clipboard/clipboard.css`
+- Modify: `app/src/features/settings/SettingsPage.tsx`
 
 - [ ] Add Android bottom navigation and safe-area spacing while retaining desktop sidebar behavior.
 - [ ] Add foreground-live, suspended and reconnecting indicators.
@@ -56,13 +56,13 @@
 ### Task 4: Explicit current clipboard publication
 
 **Files:**
-- Modify: `desktop/src/ipc/client.ts`
-- Modify: `desktop/src/ipc/demo-client.ts`
-- Modify: `desktop/src/ipc/tauri-client.ts`
-- Modify: `desktop/src/features/home/HomePage.tsx`
-- Modify: `desktop/src/features/settings/SettingsPage.tsx`
-- Modify: `desktop/src-tauri/capabilities/default.json`
-- Test: `desktop/src/features/clipboard/clipboard.test.tsx`
+- Modify: `app/src/ipc/client.ts`
+- Modify: `app/src/ipc/demo-client.ts`
+- Modify: `app/src/ipc/tauri-client.ts`
+- Modify: `app/src/features/home/HomePage.tsx`
+- Modify: `app/src/features/settings/SettingsPage.tsx`
+- Modify: `app/src-tauri/capabilities/default.json`
+- Test: `app/src/features/clipboard/clipboard.test.tsx`
 
 - [ ] Add a clipboard reader only used by an explicit foreground user command.
 - [ ] Publish the read text as the local latest slot without changing remote slots.
