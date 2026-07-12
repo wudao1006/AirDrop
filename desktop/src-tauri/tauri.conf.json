@@ -1,0 +1,39 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "AirDrop",
+  "version": "0.1.0",
+  "identifier": "dev.airdrop.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "AirDrop",
+        "width": 1060,
+        "height": 720,
+        "minWidth": 760,
+        "minHeight": 480,
+        "center": true,
+        "decorations": false,
+        "transparent": true,
+        "windowEffects": {
+          "effects": ["acrylic"],
+          "color": "#DDF6F6B8"
+        },
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": false,
+    "targets": "all"
+  }
+}

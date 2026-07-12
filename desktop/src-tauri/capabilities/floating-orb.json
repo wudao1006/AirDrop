@@ -1,0 +1,14 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "floating-orb",
+  "description": "Restricted permissions available inside the floating orb",
+  "windows": ["floating-orb"],
+  "platforms": ["linux", "macOS", "windows"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "core:event:allow-emit",
+    "core:event:allow-emit-to",
+    "core:window:allow-start-dragging"
+  ]
+}

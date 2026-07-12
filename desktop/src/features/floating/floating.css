@@ -1,0 +1,50 @@
+html:has(.floating-orb-root), body:has(.floating-orb-root), body:has(.floating-orb-root) #root {
+  min-width: 0;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+  background: transparent;
+}
+
+.floating-orb-root {
+  width: 100%; height: 100%; display: grid; place-items: center; overflow: hidden;
+  color: white; user-select: none; -webkit-user-select: none;
+}
+.floating-collapsed-shell { position: relative; width: 72px; height: 68px; display: grid; place-items: center; }
+.floating-droplet { position: relative; width: 62px; height: 58px; margin-top: 5px; padding: 0; border: 0; background: transparent; filter: drop-shadow(0 7px 10px rgba(6, 86, 137, .25)); }
+.floating-droplet:disabled { opacity: 1; }
+.floating-lobe { position: absolute; width: 43px; height: 43px; border: 1px solid rgba(255,255,255,.76); transition: transform .24s cubic-bezier(.2,.8,.2,1); }
+.floating-lobe-cyan { left: 7px; top: 3px; border-radius: 55% 45% 48% 52% / 47% 58% 42% 53%; background: radial-gradient(circle at 30% 24%, rgba(255,255,255,.82), transparent 18%), linear-gradient(145deg, rgba(61,240,240,.9), rgba(19,166,218,.7)); box-shadow: inset 3px 3px 8px rgba(255,255,255,.35); }
+.floating-lobe-blue { right: 6px; bottom: 3px; border-radius: 47% 53% 57% 43% / 58% 45% 55% 42%; background: radial-gradient(circle at 65% 68%, rgba(115,204,255,.65), transparent 24%), linear-gradient(145deg, rgba(21,177,226,.72), rgba(36,91,229,.92)); box-shadow: inset -3px -3px 10px rgba(10,43,154,.24); }
+.floating-liquid-edge { position: absolute; inset: 6px 8px 4px 7px; border-radius: 48% 52% 53% 47%; border: 1px solid rgba(239,255,255,.72); background: linear-gradient(145deg, rgba(255,255,255,.13), rgba(255,255,255,.02)); box-shadow: inset 0 1px 2px rgba(255,255,255,.7), 0 0 9px rgba(94,235,255,.35); backdrop-filter: blur(7px) saturate(var(--glass-saturation)); }
+.floating-droplet:hover .floating-lobe-cyan { transform: translate(-1.5px, -1px) rotate(-2deg); }
+.floating-droplet:hover .floating-lobe-blue { transform: translate(1.5px, 1px) rotate(2deg); }
+.floating-flow-mark { position: absolute; inset: 12px 11px 9px; width: 40px; height: 34px; overflow: visible; fill: rgba(248,255,255,.96); stroke: rgba(248,255,255,.96); stroke-width: 2.15; stroke-linecap: round; filter: drop-shadow(0 1px 2px rgba(8,74,147,.4)); }
+.flow-stroke { fill: none; stroke-dasharray: 31; }
+.is-live .flow-stroke-a { animation: orb-flow 3.2s ease-in-out infinite; }
+.is-live .flow-stroke-b { animation: orb-flow 3.2s ease-in-out -1.6s infinite reverse; }
+.is-paused .floating-droplet, .is-paused .floating-capsule-mark { filter: saturate(.38) opacity(.78); }
+
+.floating-drag-handle { width: 36px; height: 36px; padding: 0; border: 0; border-radius: 18px; background: transparent; display: grid; place-items: center; touch-action: none; }
+.floating-drag-handle span { width: 15px; height: 4px; border-radius: 3px; background: rgba(255,255,255,.62); box-shadow: 0 1px 2px rgba(13,75,112,.24); }
+.floating-drag-handle-collapsed { position: absolute; z-index: 5; top: 0; left: 18px; }
+.floating-capsule { position: relative; width: calc(100% - 8px); height: calc(100% - 8px); display: flex; align-items: center; gap: 3px; padding: 7px 8px 7px 5px; border: 1px solid rgba(255,255,255,calc(.4 + var(--glass-highlight-opacity))); border-radius: min(calc(var(--user-radius) + 18px), 38px); background: linear-gradient(130deg, rgba(72,225,231,calc(.26 + var(--window-opacity) * .18)), rgba(32,116,225,calc(.22 + var(--window-opacity) * .2))), rgba(15,53,78,.42); box-shadow: 0 12px 28px rgba(8,55,92,.26), inset 0 1px rgba(255,255,255,.7), inset 0 -1px rgba(68,169,244,.28); backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturation)); }
+.floating-capsule > .floating-drag-handle { flex: 0 0 36px; }
+.floating-capsule-mark { position: relative; flex: 0 0 39px; height: 42px; }
+.floating-capsule-mark .floating-flow-mark { inset: 4px 0; width: 38px; }
+.floating-actions { min-width: 0; flex: 1; display: flex; justify-content: flex-end; gap: 2px; }
+.floating-actions button { display: grid; place-items: center; flex: 0 0 38px; width: 38px; height: 38px; padding: 0; border: 1px solid rgba(255,255,255,.18); border-radius: 13px; color: rgba(255,255,255,.95); background: rgba(255,255,255,.1); box-shadow: inset 0 1px rgba(255,255,255,.14); }
+.floating-actions button:hover:not(:disabled) { background: rgba(255,255,255,.22); transform: translateY(-1px); }
+.floating-actions .floating-hide-action { color: #ffe9ec; }
+
+@keyframes orb-flow { 0%,100% { stroke-dashoffset: 0; opacity: .72; } 50% { stroke-dashoffset: 12; opacity: 1; } }
+@media (prefers-reduced-motion: reduce) {
+  .floating-orb-root *, .floating-orb-root *::before, .floating-orb-root *::after { animation: none !important; transition: none !important; }
+  .floating-droplet:hover .floating-lobe { transform: none; }
+}
+@media (forced-colors: active) {
+  .floating-droplet, .floating-capsule, .floating-actions button, .floating-drag-handle { forced-color-adjust: none; cursor: default; }
+  .floating-lobe, .floating-liquid-edge, .floating-capsule { border: 2px solid CanvasText; background: Canvas; }
+  .floating-flow-mark, .floating-actions button { color: CanvasText; stroke: CanvasText; fill: CanvasText; }
+}
