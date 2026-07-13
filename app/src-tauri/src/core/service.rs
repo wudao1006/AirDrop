@@ -1,7 +1,12 @@
+use super::{
+    identity::Identity,
+    storage::{Store, StoredRuntime, TrustedDevice},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::Mutex;
-use tauri::{AppHandle, Emitter, State};
+use std::{collections::HashMap, path::Path, sync::Mutex};
+use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_clipboard_manager::ClipboardExt;
 
 const SNAPSHOT_EVENT: &str = "airdrop://snapshot";
 
@@ -77,24 +82,60 @@ pub struct ImportOperation {
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct NearbyDevice {
+    pub(crate) instance_id: String,
+    pub(crate) device_id: String,
+    pub(crate) device_name: String,
+    pub(crate) platform: String,
+    pub(crate) addresses: Vec<String>,
+    pub(crate) port: u16,
+    pub(crate) last_seen_at: String,
+    pub(crate) paired: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrustedDeviceView {
+    device_id: String,
+    device_name: String,
+    platform: String,
+    paired_at: String,
+    online: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingPairing {
+    pub(crate) pairing_id: String,
+    pub(crate) device_id: String,
+    pub(crate) device_name: String,
+    pub(crate) platform: String,
+    pub(crate) sas: String,
+    pub(crate) direction: String,
+    pub(crate) expires_at: String,
+    pub(crate) status: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AppSettings {
-    theme: String,
-    accent_color: String,
-    window_opacity: f64,
-    blur_strength: u8,
-    glass_saturation: f64,
-    corner_radius: u8,
-    highlight_strength: f64,
-    floating_orb_enabled: bool,
-    preview_text: bool,
-    preview_images: bool,
-    preview_file_names: bool,
-    allow_text: bool,
-    allow_html: bool,
-    allow_images: bool,
-    allow_urls: bool,
-    allow_files: bool,
-    allow_private: bool,
+    pub(crate) theme: String,
+    pub(crate) accent_color: String,
+    pub(crate) window_opacity: f64,
+    pub(crate) blur_strength: u8,
+    pub(crate) glass_saturation: f64,
+    pub(crate) corner_radius: u8,
+    pub(crate) highlight_strength: f64,
+    pub(crate) floating_orb_enabled: bool,
+    pub(crate) preview_text: bool,
+    pub(crate) preview_images: bool,
+    pub(crate) preview_file_names: bool,
+    pub(crate) allow_text: bool,
+    pub(crate) allow_html: bool,
+    pub(crate) allow_images: bool,
+    pub(crate) allow_urls: bool,
+    pub(crate) allow_files: bool,
+    pub(crate) allow_private: bool,
 }
 
 impl Default for AppSettings {
@@ -136,12 +177,23 @@ pub struct UiSnapshot {
     current_clipboard: CurrentClipboard,
     last_published_preview: String,
     slots: Vec<DeviceSlot>,
+    nearby_devices: Vec<NearbyDevice>,
+    trusted_devices: Vec<TrustedDeviceView>,
+    pending_pairings: Vec<PendingPairing>,
     imports: Vec<ImportOperation>,
     settings: AppSettings,
 }
 
 impl UiSnapshot {
-    fn initial() -> Self {
+    fn initial(
+        settings: AppSettings,
+        runtime: Option<StoredRuntime>,
+        trusted_devices: Vec<TrustedDevice>,
+    ) -> Self {
+        let runtime = runtime.unwrap_or(StoredRuntime {
+            publish_paused: false,
+            subscribe_paused: false,
+        });
         Self {
             revision: 1,
             platform: "desktop".into(),
@@ -155,8 +207,8 @@ impl UiSnapshot {
             },
             demo_mode: false,
             daemon_connected: true,
-            publish_paused: false,
-            subscribe_paused: false,
+            publish_paused: runtime.publish_paused,
+            subscribe_paused: runtime.subscribe_paused,
             current_clipboard: CurrentClipboard {
                 source: "unknown".into(),
                 source_label: "正在监听本机剪贴板".into(),
@@ -166,8 +218,20 @@ impl UiSnapshot {
             },
             last_published_preview: "等待本机剪贴板变化".into(),
             slots: Vec::new(),
+            nearby_devices: Vec::new(),
+            trusted_devices: trusted_devices
+                .into_iter()
+                .map(|device| TrustedDeviceView {
+                    device_id: device.device_id,
+                    device_name: device.device_name,
+                    platform: device.platform,
+                    paired_at: device.paired_at,
+                    online: false,
+                })
+                .collect(),
+            pending_pairings: Vec::new(),
             imports: Vec::new(),
-            settings: AppSettings::default(),
+            settings,
         }
     }
 
@@ -176,11 +240,72 @@ impl UiSnapshot {
     }
 }
 
-pub struct ServiceState(Mutex<UiSnapshot>);
+pub struct ServiceState {
+    snapshot: Mutex<UiSnapshot>,
+    store: Store,
+    identity: Identity,
+    remote_bodies: Mutex<HashMap<String, String>>,
+    suppress_next_capture: Mutex<Option<String>>,
+}
 
-impl Default for ServiceState {
-    fn default() -> Self {
-        Self(Mutex::new(UiSnapshot::initial()))
+impl ServiceState {
+    pub fn open(data_dir: &Path) -> Result<Self, String> {
+        let store = Store::open(data_dir)?;
+        let identity = Identity::load_or_create(data_dir)?;
+        let settings = store.load_settings()?.unwrap_or_default();
+        let runtime = store.load_runtime()?;
+        let trusted_devices = store.trusted_devices()?;
+        Ok(Self {
+            snapshot: Mutex::new(UiSnapshot::initial(settings, runtime, trusted_devices)),
+            store,
+            identity,
+            remote_bodies: Mutex::new(HashMap::new()),
+            suppress_next_capture: Mutex::new(None),
+        })
+    }
+
+    pub(crate) fn device_id(&self) -> &str {
+        self.identity.device_id()
+    }
+
+    pub(crate) fn device_name(&self) -> &str {
+        self.identity.device_name()
+    }
+
+    pub(crate) fn identity(&self) -> &Identity {
+        &self.identity
+    }
+
+    pub(crate) fn trusted_device(&self, device_id: &str) -> Result<Option<TrustedDevice>, String> {
+        self.store.trusted_device(device_id)
+    }
+
+    pub(crate) fn save_pending_pairing(
+        &self,
+        pairing_id: &str,
+        device: &TrustedDevice,
+        expires_at: &str,
+    ) -> Result<(), String> {
+        self.store
+            .save_pending_pairing(pairing_id, device, expires_at)
+    }
+
+    pub(crate) fn promote_trusted_device(
+        &self,
+        pairing_id: &str,
+        paired_at: &str,
+    ) -> Result<TrustedDevice, String> {
+        self.store.promote_trusted_device(pairing_id, paired_at)
+    }
+
+    pub(crate) fn nearby_device(&self, device_id: &str) -> Option<NearbyDevice> {
+        self.snapshot.lock().ok().and_then(|snapshot| {
+            snapshot
+                .nearby_devices
+                .iter()
+                .find(|device| device.device_id == device_id)
+                .cloned()
+        })
     }
 }
 
@@ -189,20 +314,31 @@ fn emit_snapshot(app: &AppHandle, snapshot: &UiSnapshot) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
-fn update<F>(state: &ServiceState, app: &AppHandle, operation: F) -> Result<(), String>
+fn update<F>(state: &ServiceState, app: &AppHandle, operation: F) -> Result<UiSnapshot, String>
 where
     F: FnOnce(&mut UiSnapshot) -> Result<(), String>,
 {
     let snapshot = {
         let mut snapshot = state
-            .0
+            .snapshot
             .lock()
             .map_err(|_| "Rust 服务状态锁已损坏".to_string())?;
         operation(&mut snapshot)?;
         snapshot.bump();
         snapshot.clone()
     };
-    emit_snapshot(app, &snapshot)
+    emit_snapshot(app, &snapshot)?;
+    Ok(snapshot)
+}
+
+fn truncate_text(text: &str, maximum_chars: usize) -> String {
+    let mut characters = text.chars();
+    let preview: String = characters.by_ref().take(maximum_chars).collect();
+    if characters.next().is_some() {
+        format!("{preview}…")
+    } else {
+        preview
+    }
 }
 
 pub fn capture_local_clipboard(
@@ -214,24 +350,317 @@ pub fn capture_local_clipboard(
     if text.trim().is_empty() {
         return Ok(());
     }
-    update(state, app, |snapshot| {
-        snapshot.current_clipboard = CurrentClipboard {
-            source: "local".into(),
-            source_label: "来自本机系统剪贴板".into(),
-            preview: text.clone(),
-            types: vec!["纯文本".into()],
-            changed_at: now.clone(),
-        };
-        if !snapshot.publish_paused {
-            let preview: String = text.chars().take(80).collect();
+    if text.len() > 1024 * 1024 {
+        return report_clipboard_failure(state, app, "文本剪贴板超过 1 MiB，已跳过同步".into());
+    }
+    let suppress_publish = {
+        let mut suppressed = state
+            .suppress_next_capture
+            .lock()
+            .map_err(|_| "剪贴板回环抑制锁已损坏".to_string())?;
+        if suppressed.as_deref() == Some(text.as_str()) {
+            *suppressed = None;
+            true
+        } else {
+            false
+        }
+    };
+    let snapshot = update(state, app, |snapshot| {
+        if !suppress_publish {
+            snapshot.current_clipboard = CurrentClipboard {
+                source: "local".into(),
+                source_label: "来自本机系统剪贴板".into(),
+                preview: truncate_text(&text, 4096),
+                types: vec!["纯文本".into()],
+                changed_at: now.clone(),
+            };
+        }
+        if !snapshot.publish_paused && !suppress_publish {
+            let preview = truncate_text(&text, 80);
             snapshot.last_published_preview = format!("本机最近捕获：{preview}");
         }
-        snapshot.last_synchronized_at = now;
+        snapshot.last_synchronized_at = now.clone();
         snapshot.clipboard_capability.can_read_text = true;
         snapshot.clipboard_capability.foreground_capture = true;
         snapshot.clipboard_capability.limitation = None;
         Ok(())
-    })
+    })?;
+    if !snapshot.publish_paused && !suppress_publish {
+        let sequence = state.store.next_origin_sequence()?;
+        if let Some(transport) = app.try_state::<super::transport::TransportHandle>() {
+            transport.broadcast_text(sequence, text, now);
+        }
+    }
+    Ok(())
+}
+
+pub fn report_clipboard_failure(
+    state: &ServiceState,
+    app: &AppHandle,
+    message: String,
+) -> Result<(), String> {
+    tracing::warn!(error = %message, "clipboard capture unavailable");
+    update(state, app, |snapshot| {
+        snapshot.clipboard_capability.can_read_text = false;
+        snapshot.clipboard_capability.foreground_capture = false;
+        snapshot.clipboard_capability.limitation = Some(message);
+        Ok(())
+    })?;
+    Ok(())
+}
+
+pub fn report_clipboard_recovered(state: &ServiceState, app: &AppHandle) -> Result<(), String> {
+    update(state, app, |snapshot| {
+        snapshot.clipboard_capability.can_read_text = true;
+        snapshot.clipboard_capability.foreground_capture = true;
+        snapshot.clipboard_capability.limitation = None;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+pub fn upsert_nearby_device(
+    state: &ServiceState,
+    app: &AppHandle,
+    mut nearby: NearbyDevice,
+) -> Result<(), String> {
+    nearby.paired = state.trusted_device(&nearby.device_id)?.is_some();
+    update(state, app, |snapshot| {
+        if let Some(existing) = snapshot
+            .nearby_devices
+            .iter_mut()
+            .find(|device| device.instance_id == nearby.instance_id)
+        {
+            *existing = nearby;
+        } else {
+            snapshot.nearby_devices.push(nearby);
+            snapshot
+                .nearby_devices
+                .sort_by(|left, right| left.device_name.cmp(&right.device_name));
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+pub(crate) fn show_pending_pairing(
+    state: &ServiceState,
+    app: &AppHandle,
+    pairing: PendingPairing,
+) -> Result<(), String> {
+    update(state, app, |snapshot| {
+        snapshot
+            .pending_pairings
+            .retain(|item| item.pairing_id != pairing.pairing_id);
+        snapshot.pending_pairings.push(pairing);
+        Ok(())
+    })?;
+    Ok(())
+}
+
+pub(crate) fn pairing_status(
+    state: &ServiceState,
+    app: &AppHandle,
+    pairing_id: &str,
+    status: &str,
+) -> Result<(), String> {
+    update(state, app, |snapshot| {
+        if let Some(pairing) = snapshot
+            .pending_pairings
+            .iter_mut()
+            .find(|item| item.pairing_id == pairing_id)
+        {
+            pairing.status = status.to_string();
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+pub(crate) fn pairing_completed(
+    state: &ServiceState,
+    app: &AppHandle,
+    pairing_id: &str,
+    device: TrustedDevice,
+) -> Result<(), String> {
+    update(state, app, |snapshot| {
+        snapshot
+            .pending_pairings
+            .retain(|item| item.pairing_id != pairing_id);
+        snapshot
+            .trusted_devices
+            .retain(|item| item.device_id != device.device_id);
+        snapshot.trusted_devices.push(TrustedDeviceView {
+            device_id: device.device_id.clone(),
+            device_name: device.device_name.clone(),
+            platform: device.platform.clone(),
+            paired_at: device.paired_at.clone(),
+            online: true,
+        });
+        if let Some(nearby) = snapshot
+            .nearby_devices
+            .iter_mut()
+            .find(|item| item.device_id == device.device_id)
+        {
+            nearby.paired = true;
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+pub(crate) fn set_trusted_online(
+    state: &ServiceState,
+    app: &AppHandle,
+    device_id: &str,
+    online: bool,
+) -> Result<(), String> {
+    update(state, app, |snapshot| {
+        if let Some(device) = snapshot
+            .trusted_devices
+            .iter_mut()
+            .find(|item| item.device_id == device_id)
+        {
+            device.online = online;
+        }
+        for slot in snapshot
+            .slots
+            .iter_mut()
+            .filter(|item| item.device_id == device_id)
+        {
+            slot.online = online;
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+pub(crate) fn receive_remote_text(
+    state: &ServiceState,
+    app: &AppHandle,
+    device: &TrustedDevice,
+    sequence: u64,
+    text: String,
+    captured_at: String,
+) -> Result<(), String> {
+    if text.len() > 1024 * 1024 {
+        return Err("远端文本超过 1 MiB".into());
+    }
+    if state
+        .snapshot
+        .lock()
+        .map_err(|_| "Rust 服务状态锁已损坏".to_string())?
+        .subscribe_paused
+    {
+        return Ok(());
+    }
+    let slot_id = format!("device:{}", device.device_id);
+    {
+        let mut bodies = state
+            .remote_bodies
+            .lock()
+            .map_err(|_| "远端正文缓存锁已损坏".to_string())?;
+        bodies.insert(slot_id.clone(), text.clone());
+    }
+    update(state, app, |snapshot| {
+        if let Some(existing) = snapshot
+            .slots
+            .iter()
+            .find(|slot| slot.device_id == device.device_id)
+        {
+            if sequence <= existing.sequence {
+                return Ok(());
+            }
+        }
+        let slot = DeviceSlot {
+            id: slot_id.clone(),
+            revision: sequence,
+            device_id: device.device_id.clone(),
+            device_name: device.device_name.clone(),
+            platform: device.platform.clone(),
+            online: true,
+            pinned: None,
+            availability: "ready".into(),
+            preview: truncate_text(&text, 4096),
+            captured_at: captured_at.clone(),
+            age_label: "刚刚".into(),
+            groups: vec!["直接配对".into()],
+            sequence,
+            size: text.len() as u64,
+            representations: vec![ClipboardRepresentation {
+                id: "text/plain".into(),
+                kind: "text".into(),
+                label: "纯文本".into(),
+                mime: "text/plain;charset=utf-8".into(),
+                size: text.len() as u64,
+                status: "ready".into(),
+                enabled: true,
+            }],
+            blocked_reason: None,
+            progress: None,
+        };
+        snapshot
+            .slots
+            .retain(|item| item.device_id != device.device_id);
+        snapshot.slots.push(slot);
+        snapshot.last_synchronized_at = captured_at;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+pub fn remove_nearby_device(
+    state: &ServiceState,
+    app: &AppHandle,
+    instance_id: &str,
+) -> Result<(), String> {
+    update(state, app, |snapshot| {
+        snapshot
+            .nearby_devices
+            .retain(|device| device.instance_id != instance_id);
+        Ok(())
+    })?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn allow_pairing(
+    transport: State<'_, super::transport::TransportHandle>,
+) -> Result<(), String> {
+    transport.allow_pairing(120);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn begin_pairing(
+    state: State<'_, ServiceState>,
+    transport: State<'_, super::transport::TransportHandle>,
+    app: AppHandle,
+    instance_id: String,
+) -> Result<(), String> {
+    let nearby = state
+        .snapshot
+        .lock()
+        .map_err(|_| "Rust 服务状态锁已损坏".to_string())?
+        .nearby_devices
+        .iter()
+        .find(|device| device.instance_id == instance_id)
+        .cloned()
+        .ok_or_else(|| "附近设备已离线".to_string())?;
+    if nearby.paired {
+        return Err("该设备已经配对".into());
+    }
+    transport.connect_pairing(app, nearby);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn confirm_pairing(
+    transport: State<'_, super::transport::TransportHandle>,
+    pairing_id: String,
+    accepted: bool,
+) -> Result<(), String> {
+    transport.confirm_pairing(&pairing_id, accepted)
 }
 
 #[tauri::command]
@@ -241,7 +670,7 @@ pub fn get_snapshot(
     now: String,
 ) -> Result<UiSnapshot, String> {
     let mut snapshot = state
-        .0
+        .snapshot
         .lock()
         .map_err(|_| "Rust 服务状态锁已损坏".to_string())?;
     snapshot.platform = if platform == "android" {
@@ -249,6 +678,9 @@ pub fn get_snapshot(
     } else {
         "desktop".into()
     };
+    snapshot
+        .pending_pairings
+        .retain(|pairing| pairing.expires_at.as_str() > now.as_str());
     if snapshot.last_synchronized_at.starts_with("1970-") {
         snapshot.last_synchronized_at = now.clone();
         snapshot.current_clipboard.changed_at = now;
@@ -263,7 +695,7 @@ pub fn set_pause(
     kind: String,
     paused: bool,
 ) -> Result<(), String> {
-    update(&state, &app, |snapshot| match kind.as_str() {
+    let snapshot = update(&state, &app, |snapshot| match kind.as_str() {
         "publish" => {
             snapshot.publish_paused = paused;
             Ok(())
@@ -273,7 +705,10 @@ pub fn set_pause(
             Ok(())
         }
         _ => Err("未知暂停类型".into()),
-    })
+    })?;
+    state
+        .store
+        .save_runtime(snapshot.publish_paused, snapshot.subscribe_paused)
 }
 
 #[tauri::command]
@@ -282,11 +717,14 @@ pub fn set_synchronization_paused(
     app: AppHandle,
     paused: bool,
 ) -> Result<(), String> {
-    update(&state, &app, |snapshot| {
+    let snapshot = update(&state, &app, |snapshot| {
         snapshot.publish_paused = paused;
         snapshot.subscribe_paused = paused;
         Ok(())
-    })
+    })?;
+    state
+        .store
+        .save_runtime(snapshot.publish_paused, snapshot.subscribe_paused)
 }
 
 #[tauri::command]
@@ -310,7 +748,8 @@ pub fn set_app_activity(
             snapshot.last_synchronized_at = now;
         }
         Ok(())
-    })
+    })?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -332,7 +771,7 @@ pub fn update_settings(
     app: AppHandle,
     settings: Value,
 ) -> Result<(), String> {
-    update(&state, &app, |snapshot| {
+    let snapshot = update(&state, &app, |snapshot| {
         let mut current =
             serde_json::to_value(&snapshot.settings).map_err(|error| error.to_string())?;
         let current_object = current
@@ -347,33 +786,112 @@ pub fn update_settings(
         snapshot.settings =
             serde_json::from_value(current).map_err(|error| format!("设置值无效：{error}"))?;
         Ok(())
-    })
+    })?;
+    state.store.save_settings(&snapshot.settings)
 }
 
 #[tauri::command]
 pub fn create_import_intent(
     state: State<'_, ServiceState>,
+    app: AppHandle,
     slot_id: String,
     revision: u64,
 ) -> Result<String, String> {
-    let snapshot = state
-        .0
+    let mut snapshot = state
+        .snapshot
         .lock()
         .map_err(|_| "Rust 服务状态锁已损坏".to_string())?;
     let slot = snapshot
         .slots
         .iter()
         .find(|slot| slot.id == slot_id && slot.revision == revision)
+        .cloned()
         .ok_or_else(|| "设备槽位不存在或已经更新".to_string())?;
-    Err(format!("{} 的远端正文传输尚未就绪", slot.device_name))
+    let bodies = state
+        .remote_bodies
+        .lock()
+        .map_err(|_| "远端正文缓存锁已损坏".to_string())?;
+    if !bodies.contains_key(&slot.id) {
+        return Err(format!("{} 的远端正文当前不可用", slot.device_name));
+    }
+    let import_id = uuid::Uuid::new_v4().simple().to_string();
+    snapshot.imports.push(ImportOperation {
+        id: import_id.clone(),
+        slot_id: slot.id.clone(),
+        device_name: slot.device_name.clone(),
+        source_summary: truncate_text(&slot.preview, 80),
+        status: "awaiting_confirmation".into(),
+        progress: 100,
+        message: Some("确认后才会写入本机系统剪贴板".into()),
+    });
+    snapshot.bump();
+    let emitted = snapshot.clone();
+    drop(bodies);
+    drop(snapshot);
+    emit_snapshot(&app, &emitted)?;
+    Ok(import_id)
 }
 
 #[tauri::command]
 pub fn confirm_import(
-    _state: State<'_, ServiceState>,
-    _import_id: String,
-) -> Result<String, String> {
-    Err("没有可确认的远端剪贴板导入".into())
+    state: State<'_, ServiceState>,
+    app: AppHandle,
+    import_id: String,
+) -> Result<(), String> {
+    let (slot_id, text) = {
+        let snapshot = state
+            .snapshot
+            .lock()
+            .map_err(|_| "Rust 服务状态锁已损坏".to_string())?;
+        let operation = snapshot
+            .imports
+            .iter()
+            .find(|item| item.id == import_id && item.status == "awaiting_confirmation")
+            .ok_or_else(|| "没有可确认的远端剪贴板导入".to_string())?;
+        let bodies = state
+            .remote_bodies
+            .lock()
+            .map_err(|_| "远端正文缓存锁已损坏".to_string())?;
+        let text = bodies
+            .get(&operation.slot_id)
+            .cloned()
+            .ok_or_else(|| "远端正文已经不可用".to_string())?;
+        (operation.slot_id.clone(), text)
+    };
+    {
+        *state
+            .suppress_next_capture
+            .lock()
+            .map_err(|_| "剪贴板回环抑制锁已损坏".to_string())? = Some(text.clone());
+    }
+    if let Err(error) = app.clipboard().write_text(&text) {
+        *state
+            .suppress_next_capture
+            .lock()
+            .map_err(|_| "剪贴板回环抑制锁已损坏".to_string())? = None;
+        return Err(format!("无法写入本机系统剪贴板：{error}"));
+    }
+    update(&state, &app, |snapshot| {
+        if let Some(operation) = snapshot
+            .imports
+            .iter_mut()
+            .find(|item| item.id == import_id && item.slot_id == slot_id)
+        {
+            operation.status = "imported".into();
+            operation.message = Some("已写入本机剪贴板".into());
+            snapshot.current_clipboard = CurrentClipboard {
+                source: "remote".into(),
+                source_label: format!("取自 {}", operation.device_name),
+                preview: truncate_text(&text, 4096),
+                types: vec!["纯文本".into()],
+                changed_at: time::OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_else(|_| "1970-01-01T00:00:00Z".into()),
+            };
+        }
+        Ok(())
+    })?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -387,5 +905,6 @@ pub fn cancel_import(
             .imports
             .retain(|operation| operation.id != import_id);
         Ok(())
-    })
+    })?;
+    Ok(())
 }

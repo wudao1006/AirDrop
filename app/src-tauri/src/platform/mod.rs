@@ -37,3 +37,7 @@ pub(crate) use clipboard_monitor::start_clipboard_monitor;
 pub(crate) fn clipboard_poll_interval() -> std::time::Duration {
     current::clipboard_poll_interval()
 }
+
+pub(crate) fn platform_name() -> &'static str {
+    current::platform_name()
+}

@@ -7,11 +7,40 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 pub(crate) fn start_clipboard_monitor(app: AppHandle) {
     thread::spawn(move || {
         let mut previous = None::<String>;
+        let mut initialized = false;
+        let mut consecutive_failures = 0_u8;
+        let mut failure_reported = false;
         loop {
             thread::sleep(platform::clipboard_poll_interval());
-            let Ok(text) = app.clipboard().read_text() else {
-                continue;
+            let text = match app.clipboard().read_text() {
+                Ok(text) => {
+                    consecutive_failures = 0;
+                    if failure_reported {
+                        let state = app.state::<service::ServiceState>();
+                        let _ = service::report_clipboard_recovered(&state, &app);
+                        failure_reported = false;
+                    }
+                    text
+                }
+                Err(error) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    if consecutive_failures >= 3 && !failure_reported {
+                        let state = app.state::<service::ServiceState>();
+                        let _ = service::report_clipboard_failure(
+                            &state,
+                            &app,
+                            format!("暂时无法读取系统剪贴板：{error}"),
+                        );
+                        failure_reported = true;
+                    }
+                    continue;
+                }
             };
+            if !initialized {
+                previous = Some(text);
+                initialized = true;
+                continue;
+            }
             if text.trim().is_empty() || previous.as_ref() == Some(&text) {
                 continue;
             }

@@ -4,3 +4,7 @@ use std::time::Duration;
 pub(super) fn clipboard_poll_interval() -> Duration {
     Duration::from_millis(900)
 }
+
+pub(super) fn platform_name() -> &'static str {
+    "android"
+}

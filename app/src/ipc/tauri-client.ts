@@ -1,4 +1,4 @@
-import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
+import { readText } from "@tauri-apps/plugin-clipboard-manager";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { DesktopClient, Unsubscribe } from "./client";
@@ -60,8 +60,7 @@ class TauriAppClient implements DesktopClient {
   }
 
   async confirmImport(importId: string): Promise<void> {
-    const text = await invoke<string>("confirm_import", { importId });
-    await writeText(text);
+    await invoke("confirm_import", { importId });
   }
 
   cancelImport(importId: string): Promise<void> {
@@ -89,6 +88,18 @@ class TauriAppClient implements DesktopClient {
     await invoke("update_settings", { settings });
     const appearance = normalizeAppearanceSettings({ ...loadAppearanceSettings(), ...settings });
     saveAppearanceSettings(appearance);
+  }
+
+  allowPairing(): Promise<void> {
+    return invoke("allow_pairing");
+  }
+
+  beginPairing(instanceId: string): Promise<void> {
+    return invoke("begin_pairing", { instanceId });
+  }
+
+  confirmPairing(pairingId: string, accepted: boolean): Promise<void> {
+    return invoke("confirm_pairing", { pairingId, accepted });
   }
 }
 

@@ -13,11 +13,30 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+directories = "6"
+data-encoding = "2"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+gethostname = "1"
+hkdf = "0.12"
+hmac = "0.12"
+mdns-sd = "0.17"
+quinn = "0.11"
+rand_core = { version = "0.6", features = ["getrandom"] }
+rcgen = "0.13"
+rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = [] }
 tauri-plugin-clipboard-manager = "2"
+tauri-plugin-single-instance = "2"
 time = { version = "0.3", features = ["formatting"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
 
 [profile.release]
 panic = "abort"

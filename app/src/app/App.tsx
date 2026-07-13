@@ -41,7 +41,7 @@ export function App({ client }: { client: DesktopClient }) {
     switch (page) {
       case "home": return <HomePage {...shared} openClipboard={() => setPage("clipboard")} />;
       case "clipboard": return <ClipboardPage {...shared} />;
-      case "devices": return <DevicesPage snapshot={snapshot} />;
+      case "devices": return <DevicesPage snapshot={snapshot} client={client} onError={setError} />;
       case "groups": return <GroupsPage snapshot={snapshot} />;
       case "transfers": return <TransfersPage />;
       case "settings": return <SettingsPage {...shared} />;

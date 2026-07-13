@@ -44,7 +44,7 @@ export interface DeviceSlot {
   revision: number;
   deviceId: string;
   deviceName: string;
-  platform: "macos" | "windows" | "linux";
+  platform: "macos" | "windows" | "linux" | "android";
   online: boolean;
   pinned?: boolean;
   availability: SlotAvailability;
@@ -57,6 +57,36 @@ export interface DeviceSlot {
   representations: ClipboardRepresentation[];
   blockedReason?: string;
   progress?: number;
+}
+
+export interface NearbyDevice {
+  instanceId: string;
+  deviceId: string;
+  deviceName: string;
+  platform: "macos" | "windows" | "linux" | "android" | "unknown";
+  addresses: string[];
+  port: number;
+  lastSeenAt: string;
+  paired: boolean;
+}
+
+export interface TrustedDevice {
+  deviceId: string;
+  deviceName: string;
+  platform: "macos" | "windows" | "linux" | "android" | "unknown";
+  pairedAt: string;
+  online: boolean;
+}
+
+export interface PendingPairing {
+  pairingId: string;
+  deviceId: string;
+  deviceName: string;
+  platform: "macos" | "windows" | "linux" | "android" | "unknown";
+  sas: string;
+  direction: "incoming" | "outgoing";
+  expiresAt: string;
+  status: "awaiting_confirmation" | "waiting_for_peer";
 }
 
 export interface CurrentClipboard {
@@ -110,6 +140,9 @@ export interface UiSnapshot {
   currentClipboard: CurrentClipboard;
   lastPublishedPreview: string;
   slots: DeviceSlot[];
+  nearbyDevices: NearbyDevice[];
+  trustedDevices: TrustedDevice[];
+  pendingPairings: PendingPairing[];
   imports: ImportOperation[];
   settings: AppSettings;
 }

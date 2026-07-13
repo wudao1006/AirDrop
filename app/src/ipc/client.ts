@@ -14,6 +14,9 @@ export interface AppClient {
   setAppActivity(activity: "foreground" | "background"): Promise<void>;
   publishCurrentClipboard(): Promise<void>;
   updateSettings(settings: Partial<AppSettings>): Promise<void>;
+  allowPairing(): Promise<void>;
+  beginPairing(instanceId: string): Promise<void>;
+  confirmPairing(pairingId: string, accepted: boolean): Promise<void>;
 }
 
 export type DesktopClient = AppClient;

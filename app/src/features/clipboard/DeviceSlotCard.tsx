@@ -6,7 +6,7 @@ import { StatusBadge } from "../../components/StatusBadge";
 import { RepresentationList } from "./RepresentationList";
 import { ImportProgress } from "./ImportProgress";
 
-const platformIcon: Record<DeviceSlot["platform"], IconName> = { macos: "apple", windows: "windows", linux: "linux" };
+const platformIcon: Record<DeviceSlot["platform"], IconName> = { macos: "apple", windows: "windows", linux: "linux", android: "phone" };
 
 const statusCopy: Record<DeviceSlot["availability"], { label: string; tone: "success" | "warning" | "danger" | "info" | "neutral"; icon: IconName }> = {
   metadata_only: { label: "仅元数据", tone: "info", icon: "download" },

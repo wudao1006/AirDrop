@@ -111,6 +111,9 @@ const initialSnapshot: UiSnapshot = {
   },
   lastPublishedPreview: "本机最近发布：一段更早的本地复制内容",
   slots: initialSlots,
+  nearbyDevices: [],
+  trustedDevices: [],
+  pendingPairings: [],
   imports: [],
   settings: {
     ...DEFAULT_APPEARANCE_SETTINGS,
@@ -317,6 +320,18 @@ export class DemoDesktopClient implements DesktopClient {
     this.snapshot.settings = { ...mergedSettings, ...appearance };
     saveAppearanceSettings(appearance);
     this.bump();
+  }
+
+  async allowPairing(): Promise<void> {
+    throw new Error("浏览器预览不能开放局域网配对，请打开 AirDrop 应用");
+  }
+
+  async beginPairing(_instanceId: string): Promise<void> {
+    throw new Error("浏览器预览不能建立设备配对，请打开 AirDrop 应用");
+  }
+
+  async confirmPairing(_pairingId: string, _accepted: boolean): Promise<void> {
+    throw new Error("浏览器预览没有真实配对会话");
   }
 
   private bump(): void {
