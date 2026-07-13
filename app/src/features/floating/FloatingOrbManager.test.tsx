@@ -75,6 +75,12 @@ describe("FloatingOrbManager", () => {
 
     handlers.get(FLOATING_EVENTS.action)?.({ action: "toggle-sync" });
     await waitFor(() => expect(pause).toHaveBeenCalledWith(true));
+
+    const createImport = vi.spyOn(demo, "createImportIntent");
+    const confirmImport = vi.spyOn(demo, "confirmImport");
+    handlers.get(FLOATING_EVENTS.action)?.({ action: "use-slot", slotId: "macbook-slot", revision: 7 });
+    await waitFor(() => expect(createImport).toHaveBeenCalledWith("macbook-slot", 7));
+    await waitFor(() => expect(confirmImport).toHaveBeenCalled());
   });
 
   it("acknowledges a clamped, side-aware layout transaction", async () => {
@@ -87,7 +93,7 @@ describe("FloatingOrbManager", () => {
       expanded: true,
       success: true,
       side: "right",
-      bounds: { x: 700, y: 100, width: 300, height: 76 },
+      bounds: { x: 644, y: 100, width: 356, height: 420 },
     }));
   });
 

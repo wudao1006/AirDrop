@@ -49,6 +49,8 @@ export interface DeviceSlot {
   pinned?: boolean;
   availability: SlotAvailability;
   preview: string;
+  imagePreview?: string;
+  fileNames?: string[];
   capturedAt: string;
   ageLabel: string;
   groups: string[];
@@ -137,6 +139,8 @@ export interface CurrentClipboard {
   source: "local" | "remote" | "unknown";
   sourceLabel: string;
   preview: string;
+  imagePreview?: string;
+  fileNames?: string[];
   types: string[];
   changedAt: string;
 }
@@ -160,6 +164,7 @@ export interface AppSettings {
   cornerRadius: number;
   highlightStrength: number;
   floatingOrbEnabled: boolean;
+  globalShortcut: string;
   previewText: boolean;
   previewImages: boolean;
   previewFileNames: boolean;

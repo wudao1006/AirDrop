@@ -64,6 +64,22 @@ export const snapshotToFloatingState = (snapshot: UiSnapshot): FloatingOrbStateP
   activity: snapshot.activity,
   canReadClipboard: snapshot.clipboardCapability.canReadText,
   busy: snapshot.activity === "reconnecting" || snapshot.imports.some((item) => item.status === "fetching" || item.status === "committing"),
+  slots: [...snapshot.slots]
+    .sort((left, right) => Number(right.online) - Number(left.online) || right.sequence - left.sequence)
+    .slice(0, 4)
+    .map((slot) => ({
+      id: slot.id,
+      revision: slot.revision,
+      deviceName: slot.deviceName,
+      platform: slot.platform,
+      kind: slot.representations.find((item) => item.enabled)?.kind ?? "private",
+      preview: slot.preview,
+      imagePreview: snapshot.settings.previewImages ? slot.imagePreview : undefined,
+      fileNames: snapshot.settings.previewFileNames ? slot.fileNames : undefined,
+      ageLabel: slot.ageLabel,
+      available: (slot.availability === "ready" || slot.availability === "stale")
+        && !snapshot.imports.some((item) => item.slotId === slot.id && (item.status === "fetching" || item.status === "committing")),
+    })),
   appearance: {
     theme: snapshot.settings.theme,
     accentColor: snapshot.settings.accentColor,
@@ -113,7 +129,14 @@ export function FloatingOrbManager({ client, snapshot, setPage, onError, adapter
       }
     };
 
-    const handleAction = async ({ action }: FloatingOrbActionPayload) => {
+    const handleAction = async (payload: FloatingOrbActionPayload) => {
+      if (payload.action === "use-slot") {
+        const importId = await client.createImportIntent(payload.slotId, payload.revision);
+        await client.confirmImport(importId);
+        await broadcastState();
+        return;
+      }
+      const { action } = payload;
       switch (action) {
         case "open-main":
           await adapter.showMain();
@@ -137,13 +160,13 @@ export function FloatingOrbManager({ client, snapshot, setPage, onError, adapter
       }
     };
 
-    const handleLayout = async ({ requestId, expanded }: FloatingOrbLayoutPayload) => {
+    const handleLayout = async ({ requestId, expanded, width, height }: FloatingOrbLayoutPayload) => {
       await transactGeometry(async () => {
         try {
           const [current, workArea] = await Promise.all([adapter.getOrbBounds(), adapter.getOrbWorkArea()]);
           const placement = readFloatingPlacement();
           const side = sideForRect(current, workArea) ?? placement.side;
-          const bounds = resizedRect(current, workArea, side, expanded);
+          const bounds = resizedRect(current, workArea, side, expanded, { width, height });
           await adapter.setOrbBounds(bounds);
           await adapter.emit(FLOATING_EVENTS.layoutState, { requestId, expanded, success: true, side, bounds });
         } catch (error) {

@@ -1,4 +1,4 @@
-import type { AppActivity } from "../../model";
+import type { AppActivity, RepresentationKind } from "../../model";
 import type { AppearanceSettings } from "../settings/appearance";
 
 export const FLOATING_ORB_LABEL = "floating-orb";
@@ -9,6 +9,7 @@ export const FLOATING_EVENTS = {
   action: "airdrop://orb-action",
   layout: "airdrop://orb-layout",
   layoutState: "airdrop://orb-layout-state",
+  openMenu: "airdrop://orb-open-menu",
 } as const;
 
 export type FloatingOrbAction =
@@ -17,6 +18,19 @@ export type FloatingOrbAction =
   | "publish-current"
   | "toggle-sync"
   | "hide-orb";
+
+export interface FloatingSlotSummary {
+  id: string;
+  revision: number;
+  deviceName: string;
+  platform: "macos" | "windows" | "linux" | "android";
+  kind: RepresentationKind;
+  preview: string;
+  imagePreview?: string;
+  fileNames?: string[];
+  ageLabel: string;
+  available: boolean;
+}
 
 export interface FloatingOrbReadyPayload {
   protocolVersion: 1;
@@ -28,19 +42,22 @@ export interface FloatingOrbStatePayload {
   activity: AppActivity;
   canReadClipboard: boolean;
   busy: boolean;
+  slots: FloatingSlotSummary[];
   appearance: Pick<
     AppearanceSettings,
     "theme" | "accentColor" | "windowOpacity" | "blurStrength" | "glassSaturation" | "cornerRadius" | "highlightStrength"
   >;
 }
 
-export interface FloatingOrbActionPayload {
-  action: FloatingOrbAction;
-}
+export type FloatingOrbActionPayload =
+  | { action: FloatingOrbAction }
+  | { action: "use-slot"; slotId: string; revision: number };
 
 export interface FloatingOrbLayoutPayload {
   requestId: string;
   expanded: boolean;
+  width?: number;
+  height?: number;
 }
 
 export type FloatingOrbSide = "left" | "right";
@@ -60,4 +77,5 @@ export interface FloatingEventPayloads {
   [FLOATING_EVENTS.action]: FloatingOrbActionPayload;
   [FLOATING_EVENTS.layout]: FloatingOrbLayoutPayload;
   [FLOATING_EVENTS.layoutState]: FloatingOrbLayoutStatePayload;
+  [FLOATING_EVENTS.openMenu]: Record<string, never>;
 }

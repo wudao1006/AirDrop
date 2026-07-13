@@ -133,6 +133,7 @@ const initialSnapshot: UiSnapshot = {
     allowUrls: true,
     allowFiles: false,
     allowPrivate: false,
+    globalShortcut: "Ctrl+Alt+KeyZ",
   },
 };
 
@@ -326,6 +327,11 @@ export class DemoDesktopClient implements DesktopClient {
     const appearance = extractAppearanceSettings(mergedSettings);
     this.snapshot.settings = { ...mergedSettings, ...appearance };
     saveAppearanceSettings(appearance);
+    this.bump();
+  }
+
+  async setGlobalShortcut(shortcut: string): Promise<void> {
+    this.snapshot.settings.globalShortcut = shortcut;
     this.bump();
   }
 

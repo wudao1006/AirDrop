@@ -1,14 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Icon } from "../../components/Icon";
+import { Icon, type IconName } from "../../components/Icon";
 import { applyAppearanceSettings, loadAppearanceSettings } from "../settings/appearance";
 import {
   FLOATING_EVENTS,
   type FloatingEventPayloads,
-  type FloatingOrbAction,
+  type FloatingOrbActionPayload,
   type FloatingOrbLayoutStatePayload,
   type FloatingOrbStatePayload,
+  type FloatingSlotSummary,
 } from "./floating-events";
 import "./floating.css";
 
@@ -36,70 +37,92 @@ const FlowMark = () => <svg className="floating-flow-mark" viewBox="0 0 40 34" a
   <circle cx="7" cy="12" r="2.2" /><circle cx="33" cy="20" r="2.2" />
 </svg>;
 
+const platformIcon: Record<FloatingSlotSummary["platform"], IconName> = {
+  macos: "apple",
+  windows: "windows",
+  linux: "linux",
+  android: "phone",
+};
+
+const kindIcon: Record<FloatingSlotSummary["kind"], IconName> = {
+  text: "text",
+  html: "code",
+  image: "image",
+  url: "link",
+  files: "files",
+  private: "shield",
+};
+
 interface FloatingOrbAppProps {
   adapter?: FloatingOrbWindowAdapter;
 }
 
 const LAYOUT_ACK_TIMEOUT_MS = 2_000;
+const MENU_WIDTH = 356;
+const menuHeight = (slotCount: number): number => Math.min(520, 132 + Math.max(1, slotCount) * 76);
 
 export function FloatingOrbApp({ adapter = defaultAdapter }: FloatingOrbAppProps) {
   const [state, setState] = useState<FloatingOrbStatePayload | null>(null);
   const [expanded, setExpanded] = useState(false);
   const [pendingLayout, setPendingLayout] = useState<{ requestId: string; expanded: boolean } | null>(null);
   const [status, setStatus] = useState("正在连接主窗口…");
+  const [usingSlotId, setUsingSlotId] = useState<string | null>(null);
   const pendingRef = useRef(pendingLayout);
   const expandedRef = useRef(expanded);
+  const stateRef = useRef(state);
   const mountedRef = useRef(true);
   const collapseTimerRef = useRef<number | undefined>(undefined);
   const layoutAckTimerRef = useRef<number | undefined>(undefined);
-  const focusTargetRef = useRef<"expanded" | "collapsed" | null>(null);
-  const dropletRef = useRef<HTMLButtonElement>(null);
   const firstActionRef = useRef<HTMLButtonElement>(null);
   pendingRef.current = pendingLayout;
   expandedRef.current = expanded;
+  stateRef.current = state;
 
   const requestLayout = useCallback(function issueLayout(nextExpanded: boolean, recovery = false) {
     if (!mountedRef.current || pendingRef.current || (!recovery && nextExpanded === expandedRef.current)) return;
-    const request = { requestId: requestId(), expanded: nextExpanded };
+    const request = {
+      requestId: requestId(),
+      expanded: nextExpanded,
+      width: nextExpanded ? MENU_WIDTH : undefined,
+      height: nextExpanded ? menuHeight(stateRef.current?.slots.length ?? 0) : undefined,
+    };
     pendingRef.current = request;
     setPendingLayout(request);
-    setStatus(nextExpanded ? "正在展开悬浮球…" : "正在收起悬浮球…");
+    setStatus(nextExpanded ? "正在打开快捷菜单…" : "正在收起悬浮球…");
     window.clearTimeout(layoutAckTimerRef.current);
     layoutAckTimerRef.current = window.setTimeout(() => {
       if (!mountedRef.current || pendingRef.current?.requestId !== request.requestId) return;
       pendingRef.current = null;
       setPendingLayout(null);
-      if (nextExpanded && !recovery) {
-        setStatus("展开确认超时，正在恢复折叠布局…");
-        issueLayout(false, true);
-      } else if (recovery) {
-        setStatus("主窗口未确认恢复折叠，悬浮窗状态可能异常");
-      } else {
-        setStatus("主窗口未确认收起，操作面板保持展开");
-      }
+      if (nextExpanded && !recovery) issueLayout(false, true);
+      else setStatus("悬浮窗布局调整超时");
     }, LAYOUT_ACK_TIMEOUT_MS);
     void adapter.emit(FLOATING_EVENTS.layout, request).catch(() => {
       if (!mountedRef.current || pendingRef.current?.requestId !== request.requestId) return;
       window.clearTimeout(layoutAckTimerRef.current);
       pendingRef.current = null;
       setPendingLayout(null);
-      setStatus(recovery ? "无法恢复折叠布局，悬浮窗状态可能异常" : "无法调整悬浮球布局");
+      setStatus("无法调整悬浮球布局");
     });
   }, [adapter]);
 
   const scheduleCollapse = useCallback(() => {
     window.clearTimeout(collapseTimerRef.current);
-    collapseTimerRef.current = window.setTimeout(() => {
-      if (mountedRef.current) requestLayout(false);
-    }, 80);
+    collapseTimerRef.current = window.setTimeout(() => requestLayout(false), 100);
   }, [requestLayout]);
 
-  const runAction = useCallback((action: FloatingOrbAction) => {
-    void adapter.emit(FLOATING_EVENTS.action, { action }).then(() => {
+  const runAction = useCallback((payload: FloatingOrbActionPayload) => {
+    if (payload.action === "use-slot") setUsingSlotId(payload.slotId);
+    void adapter.emit(FLOATING_EVENTS.action, payload).then(() => {
       if (!mountedRef.current) return;
-      setStatus("操作已发送");
-      if (expandedRef.current) scheduleCollapse();
-    }).catch(() => { if (mountedRef.current) setStatus("操作发送失败"); });
+      setUsingSlotId(null);
+      setStatus(payload.action === "use-slot" ? "已取入本机剪贴板" : "操作已发送");
+      scheduleCollapse();
+    }).catch(() => {
+      if (!mountedRef.current) return;
+      setUsingSlotId(null);
+      setStatus("操作失败，请打开主窗口查看");
+    });
   }, [adapter, scheduleCollapse]);
 
   useEffect(() => {
@@ -123,9 +146,8 @@ export function FloatingOrbApp({ adapter = defaultAdapter }: FloatingOrbAppProps
         pendingRef.current = null;
         setPendingLayout(null);
         if (layout.success) {
-          focusTargetRef.current = layout.expanded ? "expanded" : "collapsed";
           setExpanded(layout.expanded);
-          setStatus(layout.expanded ? "操作面板已展开" : "悬浮球已收起");
+          setStatus(layout.expanded ? "快捷菜单已打开" : "悬浮球已收起");
         } else {
           setStatus(layout.message ?? "无法调整悬浮球布局");
         }
@@ -133,14 +155,15 @@ export function FloatingOrbApp({ adapter = defaultAdapter }: FloatingOrbAppProps
       if (disposed) { layoutUnlisten(); return; }
       unlisteners.push(layoutUnlisten);
 
+      const openMenuUnlisten = await adapter.listen(FLOATING_EVENTS.openMenu, () => requestLayout(true));
+      if (disposed) { openMenuUnlisten(); return; }
+      unlisteners.push(openMenuUnlisten);
       await adapter.emit(FLOATING_EVENTS.ready, { protocolVersion: 1 });
     };
 
     void install().catch(() => { if (!disposed) setStatus("无法连接主窗口"); });
     const collapse = () => { if (expandedRef.current) requestLayout(false); };
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") collapse();
-    };
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") collapse(); };
     window.addEventListener("blur", collapse);
     window.addEventListener("keydown", onKeyDown);
     return () => {
@@ -155,42 +178,59 @@ export function FloatingOrbApp({ adapter = defaultAdapter }: FloatingOrbAppProps
   }, [adapter, requestLayout]);
 
   useEffect(() => {
-    if (focusTargetRef.current === "expanded" && expanded) {
-      firstActionRef.current?.focus();
-      focusTargetRef.current = null;
-    } else if (focusTargetRef.current === "collapsed" && !expanded) {
-      dropletRef.current?.focus();
-      focusTargetRef.current = null;
-    }
+    if (expanded) firstActionRef.current?.focus();
   }, [expanded]);
 
-  const startDragging = () => {
+  const startDragging = (event: React.PointerEvent<HTMLElement>) => {
+    if (event.button > 0) return;
+    event.preventDefault();
     void adapter.startDragging().catch(() => { if (mountedRef.current) setStatus("当前环境不支持拖动"); });
   };
-  const finishDragging = (event: React.MouseEvent<HTMLButtonElement>) => {
-    event.stopPropagation();
+  const openContextMenu = (event: React.MouseEvent) => {
+    event.preventDefault();
+    requestLayout(true);
   };
   const paused = Boolean(state?.publishPaused && state?.subscribePaused);
   const inactive = paused || state?.activity === "suspended";
 
   return <main className={`floating-orb-root ${expanded ? "is-expanded" : "is-collapsed"} ${inactive ? "is-paused" : "is-live"}`}>
-    {expanded ? <section className="floating-capsule" aria-label="AirDrop 悬浮操作面板">
-      <button className="floating-drag-handle" type="button" aria-label="拖动悬浮窗" title="拖动悬浮窗" onPointerDown={startDragging} onClick={finishDragging}><span /></button>
-      <div className="floating-capsule-mark"><FlowMark /></div>
-      <div className="floating-actions">
-        <button ref={firstActionRef} type="button" aria-label="打开剪贴板" title="打开剪贴板" onClick={() => runAction("open-clipboard")}><Icon name="clipboard" /></button>
-        <button type="button" aria-label="刷新本机剪贴板" title="刷新本机剪贴板" disabled={!state?.canReadClipboard || state.busy} onClick={() => runAction("publish-current")}><Icon name="transfer" /></button>
-        <button type="button" aria-label={paused ? "恢复同步" : "暂停同步"} title={paused ? "恢复同步" : "暂停同步"} onClick={() => runAction("toggle-sync")}><Icon name={paused ? "play" : "pause"} /></button>
-        <button type="button" aria-label="打开主窗口" title="打开主窗口" onClick={() => runAction("open-main")}><Icon name="monitor" /></button>
-        <button type="button" className="floating-hide-action" aria-label="禁用悬浮球" title="禁用悬浮球" onClick={() => runAction("hide-orb")}><Icon name="x" /></button>
+    {expanded ? <section className="floating-menu" aria-label="AirDrop 快捷菜单" onContextMenu={(event) => event.preventDefault()}>
+      <header className="floating-menu-header" onPointerDown={startDragging}>
+        <span className="floating-menu-mark"><FlowMark /></span>
+        <span><strong>设备剪贴板</strong><small>{state?.slots.length ? "选择内容即可取入本机" : "等待其他设备内容"}</small></span>
+        <button ref={firstActionRef} type="button" aria-label="关闭快捷菜单" onPointerDown={(event) => event.stopPropagation()} onClick={() => requestLayout(false)}><Icon name="x" size={15} /></button>
+      </header>
+      <div className="floating-device-list">
+        {state?.slots.length ? state.slots.map((slot) => <article className="floating-device-item" key={`${slot.id}-${slot.revision}`}>
+          <span className="floating-device-icon"><Icon name={platformIcon[slot.platform]} size={17} /><i><Icon name={kindIcon[slot.kind]} size={10} /></i></span>
+          <span className="floating-device-copy">
+            <span className="floating-device-title"><strong>{slot.deviceName}</strong><small>{slot.ageLabel}</small></span>
+            {slot.imagePreview ? <img src={slot.imagePreview} alt={slot.preview} />
+              : slot.fileNames?.length ? <span className="floating-file-names">{slot.fileNames.join(" · ")}</span>
+                : <span className="floating-device-preview">{slot.preview}</span>}
+          </span>
+          <button type="button" disabled={!slot.available || usingSlotId !== null} onClick={() => runAction({ action: "use-slot", slotId: slot.id, revision: slot.revision })}>{usingSlotId === slot.id ? "取入中" : "使用"}</button>
+        </article>) : <div className="floating-empty"><Icon name="devices" size={22} /><span>暂无可用的设备剪贴板</span></div>}
       </div>
-    </section> : <div className="floating-collapsed-shell">
-      <button className="floating-drag-handle floating-drag-handle-collapsed" type="button" aria-label="拖动悬浮球" title="拖动悬浮球" onPointerDown={startDragging} onClick={finishDragging}><span /></button>
-      <button ref={dropletRef} className="floating-droplet" type="button" aria-label="展开 AirDrop 悬浮球" aria-expanded="false" disabled={Boolean(pendingLayout)} onClick={() => requestLayout(true)}>
-        <span className="floating-lobe floating-lobe-cyan" /><span className="floating-lobe floating-lobe-blue" />
-        <span className="floating-liquid-edge" /><FlowMark />
-      </button>
-    </div>}
+      <footer className="floating-menu-actions">
+        <button type="button" disabled={!state?.canReadClipboard || state.busy} onClick={() => runAction({ action: "publish-current" })}><Icon name="refresh" /><span>刷新</span></button>
+        <button type="button" onClick={() => runAction({ action: "toggle-sync" })}><Icon name={paused ? "play" : "pause"} /><span>{paused ? "恢复" : "暂停"}</span></button>
+        <button type="button" onClick={() => runAction({ action: "open-clipboard" })}><Icon name="clipboard" /><span>剪贴板</span></button>
+        <button type="button" onClick={() => runAction({ action: "open-main" })}><Icon name="monitor" /><span>主窗口</span></button>
+        <button type="button" onClick={() => runAction({ action: "hide-orb" })}><Icon name="x" /><span>隐藏</span></button>
+      </footer>
+    </section> : <button
+      className="floating-droplet"
+      type="button"
+      aria-label="AirDrop 悬浮球，左键拖动，右键打开菜单"
+      title="左键拖动 · 右键打开菜单"
+      disabled={Boolean(pendingLayout)}
+      onPointerDown={startDragging}
+      onContextMenu={openContextMenu}
+    >
+      <span className="floating-lobe floating-lobe-cyan" /><span className="floating-lobe floating-lobe-blue" />
+      <span className="floating-liquid-edge" /><FlowMark />
+    </button>}
     <span className="sr-only" role="status" aria-live="polite">{status}</span>
   </main>;
 }

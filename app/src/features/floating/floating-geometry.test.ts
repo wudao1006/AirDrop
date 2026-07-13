@@ -23,7 +23,7 @@ describe("floating geometry", () => {
 
   it("grows left from the right edge and remains inside the work area", () => {
     const expanded = resizedRect({ x: 1028, y: 720, width: 72, height: 68 }, workArea, "right", true);
-    expect(expanded).toEqual({ x: 800, y: 664, ...EXPANDED_ORB_SIZE });
+    expect(expanded).toEqual({ x: 744, y: 320, ...EXPANDED_ORB_SIZE });
     expect(sideForRect(expanded, workArea)).toBe("right");
     expect(verticalFractionForRect(expanded, workArea)).toBe(1);
   });

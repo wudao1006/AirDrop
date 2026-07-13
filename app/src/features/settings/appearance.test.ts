@@ -22,6 +22,7 @@ const settings: AppSettings = {
   allowUrls: false,
   allowFiles: true,
   allowPrivate: true,
+  globalShortcut: "Ctrl+Alt+KeyZ",
 };
 
 describe("appearance settings", () => {

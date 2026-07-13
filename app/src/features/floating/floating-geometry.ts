@@ -1,7 +1,7 @@
 import type { FloatingOrbSide } from "./floating-events";
 
-export const COLLAPSED_ORB_SIZE = { width: 72, height: 68 } as const;
-export const EXPANDED_ORB_SIZE = { width: 300, height: 76 } as const;
+export const COLLAPSED_ORB_SIZE = { width: 64, height: 60 } as const;
+export const EXPANDED_ORB_SIZE = { width: 356, height: 420 } as const;
 
 export interface FloatingRect {
   x: number;
@@ -69,8 +69,14 @@ export const resizedRect = (
   workArea: FloatingRect,
   side: FloatingOrbSide,
   expanded: boolean,
+  requestedSize?: Partial<Pick<FloatingRect, "width" | "height">>,
 ): FloatingRect => {
-  const target = expanded ? EXPANDED_ORB_SIZE : COLLAPSED_ORB_SIZE;
+  const target = expanded
+    ? {
+        width: requestedSize?.width ?? EXPANDED_ORB_SIZE.width,
+        height: requestedSize?.height ?? EXPANDED_ORB_SIZE.height,
+      }
+    : COLLAPSED_ORB_SIZE;
   const width = Math.min(target.width, workArea.width);
   const height = Math.min(target.height, workArea.height);
   const anchoredX = side === "right" ? current.x + current.width - width : current.x;

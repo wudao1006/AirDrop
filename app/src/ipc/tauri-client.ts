@@ -88,6 +88,10 @@ class TauriAppClient implements DesktopClient {
     saveAppearanceSettings(appearance);
   }
 
+  setGlobalShortcut(shortcut: string): Promise<void> {
+    return invoke("set_global_shortcut", { shortcut });
+  }
+
   allowPairing(): Promise<void> {
     return invoke("allow_pairing");
   }

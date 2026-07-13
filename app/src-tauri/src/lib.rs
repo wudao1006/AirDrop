@@ -3,7 +3,7 @@ mod platform;
 
 use tauri::{Emitter, Manager};
 #[cfg(desktop)]
-use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -19,7 +19,12 @@ pub fn run() {
                     if event.state() != ShortcutState::Pressed {
                         return;
                     }
-                    if let Some(window) = app.get_webview_window("main") {
+                    if let Some(window) = app.get_webview_window("floating-orb") {
+                        let _ = window.show();
+                        let _ = window.unminimize();
+                        let _ = window.set_focus();
+                        let _ = window.emit("airdrop://orb-open-menu", serde_json::json!({}));
+                    } else if let Some(window) = app.get_webview_window("main") {
                         let _ = window.show();
                         let _ = window.unminimize();
                         let _ = window.set_focus();
@@ -37,13 +42,6 @@ pub fn run() {
             }
         }))
         .setup(|app| {
-            #[cfg(desktop)]
-            {
-                let shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyV);
-                if let Err(error) = app.global_shortcut().register(shortcut) {
-                    tracing::warn!(error = %error, "global clipboard shortcut unavailable");
-                }
-            }
             let data_dir = app.path().app_data_dir()?;
             let log_guard = core::logging::initialize(&data_dir).map_err(std::io::Error::other)?;
             app.manage(log_guard);
@@ -54,6 +52,15 @@ pub fn run() {
             }));
             let state =
                 core::service::ServiceState::open(&data_dir).map_err(std::io::Error::other)?;
+            #[cfg(desktop)]
+            {
+                let shortcut = state
+                    .configured_global_shortcut()
+                    .map_err(std::io::Error::other)?;
+                if let Err(error) = app.global_shortcut().register(shortcut.as_str()) {
+                    tracing::warn!(shortcut, error = %error, "global clipboard shortcut unavailable");
+                }
+            }
             app.manage(state);
             let transport =
                 core::transport::start(app.handle().clone()).map_err(std::io::Error::other)?;
@@ -73,6 +80,7 @@ pub fn run() {
             core::service::publish_local_clipboard,
             core::service::publish_current_clipboard,
             core::service::update_settings,
+            core::service::set_global_shortcut,
             core::service::create_import_intent,
             core::service::confirm_import,
             core::service::cancel_import,

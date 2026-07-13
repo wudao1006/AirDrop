@@ -12,6 +12,7 @@ use super::{
     },
 };
 use data_encoding::BASE64;
+use image::{codecs::png::PngEncoder, ColorType, ImageEncoder, RgbaImage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -22,6 +23,8 @@ use std::{
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_clipboard_manager::ClipboardExt;
+#[cfg(desktop)]
+use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
 const SNAPSHOT_EVENT: &str = "airdrop://snapshot";
 
@@ -60,6 +63,10 @@ pub struct DeviceSlot {
     pinned: Option<bool>,
     availability: String,
     preview: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_preview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_names: Option<Vec<String>>,
     captured_at: String,
     age_label: String,
     groups: Vec<String>,
@@ -79,6 +86,10 @@ pub struct CurrentClipboard {
     source: String,
     source_label: String,
     preview: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_preview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_names: Option<Vec<String>>,
     types: Vec<String>,
     changed_at: String,
 }
@@ -236,6 +247,8 @@ pub struct AppSettings {
     pub(crate) corner_radius: u8,
     pub(crate) highlight_strength: f64,
     pub(crate) floating_orb_enabled: bool,
+    #[serde(default = "default_global_shortcut")]
+    pub(crate) global_shortcut: String,
     pub(crate) preview_text: bool,
     pub(crate) preview_images: bool,
     pub(crate) preview_file_names: bool,
@@ -260,6 +273,7 @@ impl Default for AppSettings {
             corner_radius: 22,
             highlight_strength: 0.28,
             floating_orb_enabled: false,
+            global_shortcut: default_global_shortcut(),
             preview_text: true,
             preview_images: false,
             preview_file_names: false,
@@ -328,6 +342,8 @@ impl UiSnapshot {
                 source: "unknown".into(),
                 source_label: "正在监听本机剪贴板".into(),
                 preview: "复制文本、图片、富文本或文件后会自动显示在这里。".into(),
+                image_preview: None,
+                file_names: None,
                 types: Vec::new(),
                 changed_at: "1970-01-01T00:00:00.000Z".into(),
             },
@@ -495,6 +511,13 @@ impl ServiceState {
 
     pub(crate) fn device_name(&self) -> &str {
         self.identity.device_name()
+    }
+
+    pub(crate) fn configured_global_shortcut(&self) -> Result<String, String> {
+        self.snapshot
+            .lock()
+            .map(|snapshot| snapshot.settings.global_shortcut.clone())
+            .map_err(|_| "Rust 服务状态锁已损坏".to_string())
     }
 
     pub(crate) fn identity(&self) -> &Identity {
@@ -813,6 +836,39 @@ fn truncate_text(text: &str, maximum_chars: usize) -> String {
     }
 }
 
+fn default_global_shortcut() -> String {
+    "Ctrl+Alt+KeyZ".into()
+}
+
+fn image_preview_data_url(rgba: &[u8], width: u32, height: u32) -> Option<String> {
+    let source = RgbaImage::from_raw(width, height, rgba.to_vec())?;
+    let thumbnail = image::imageops::thumbnail(&source, 360, 240);
+    let mut png = Vec::new();
+    PngEncoder::new(&mut png)
+        .write_image(
+            thumbnail.as_raw(),
+            thumbnail.width(),
+            thumbnail.height(),
+            ColorType::Rgba8.into(),
+        )
+        .ok()?;
+    Some(format!("data:image/png;base64,{}", BASE64.encode(&png)))
+}
+
+fn copied_file_names(files: &[String]) -> Vec<String> {
+    files
+        .iter()
+        .map(|file| {
+            Path::new(file)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty())
+                .unwrap_or(file)
+                .to_string()
+        })
+        .collect()
+}
+
 fn text_slot(
     device: &TrustedDevice,
     sequence: u64,
@@ -838,6 +894,8 @@ fn text_slot(
         pinned: None,
         availability: availability.into(),
         preview: truncate_text(text, 4096),
+        image_preview: None,
+        file_names: None,
         captured_at,
         age_label: if online {
             "刚刚".into()
@@ -865,7 +923,7 @@ fn text_slot(
 fn image_slot(
     device: &TrustedDevice,
     sequence: u64,
-    rgba_len: usize,
+    rgba: &[u8],
     width: u32,
     height: u32,
     captured_at: String,
@@ -881,18 +939,20 @@ fn image_slot(
         pinned: None,
         availability: "ready".into(),
         preview: format!("图片 · {width} × {height}"),
+        image_preview: image_preview_data_url(rgba, width, height),
+        file_names: None,
         captured_at,
         age_label: "刚刚".into(),
         groups: groups.names,
         group_ids: groups.ids,
         sequence,
-        size: rgba_len as u64,
+        size: rgba.len() as u64,
         representations: vec![ClipboardRepresentation {
             id: "image/rgba".into(),
             kind: "image".into(),
             label: "图片".into(),
             mime: "image/png".into(),
-            size: rgba_len as u64,
+            size: rgba.len() as u64,
             status: "ready".into(),
             enabled: true,
         }],
@@ -949,6 +1009,8 @@ fn rich_slot(device: &TrustedDevice, rich: &RemoteRich, groups: SlotGroups) -> D
         pinned: None,
         availability: "ready".into(),
         preview: truncate_text(&rich.text, 4096),
+        image_preview: None,
+        file_names: None,
         captured_at: rich.captured_at.clone(),
         age_label: "刚刚".into(),
         groups: groups.names,
@@ -984,6 +1046,8 @@ fn file_slot(
         pinned: None,
         availability: "ready".into(),
         preview,
+        image_preview: None,
+        file_names: Some(names),
         captured_at: files.captured_at.clone(),
         age_label: "刚刚".into(),
         groups: groups.names,
@@ -1126,6 +1190,8 @@ pub fn capture_local_clipboard(
                 source: "local".into(),
                 source_label: "来自本机系统剪贴板".into(),
                 preview: truncate_text(&text, 4096),
+                image_preview: None,
+                file_names: None,
                 types: vec![if content_type == "url" {
                     "URL".into()
                 } else {
@@ -1202,6 +1268,8 @@ pub fn capture_local_rich(
                 source: "local".into(),
                 source_label: "来自本机系统剪贴板".into(),
                 preview: truncate_text(&text, 4096),
+                image_preview: None,
+                file_names: None,
                 types: vec!["富文本 / HTML".into(), "纯文本降级".into()],
                 changed_at: now.clone(),
             };
@@ -1280,12 +1348,15 @@ pub fn capture_local_files(
             false
         }
     };
+    let file_names = copied_file_names(&files);
     let snapshot = update(state, app, |snapshot| {
         if !suppress_publish {
             snapshot.current_clipboard = CurrentClipboard {
                 source: "local".into(),
                 source_label: "来自本机系统剪贴板".into(),
                 preview: format!("{} 个文件或目录", files.len()),
+                image_preview: None,
+                file_names: Some(file_names.clone()),
                 types: vec!["文件与目录".into()],
                 changed_at: now.clone(),
             };
@@ -1344,12 +1415,15 @@ pub fn capture_local_image(
             false
         }
     };
+    let image_preview = image_preview_data_url(&rgba, width, height);
     let snapshot = update(state, app, |snapshot| {
         if !suppress_publish {
             snapshot.current_clipboard = CurrentClipboard {
                 source: "local".into(),
                 source_label: "来自本机系统剪贴板".into(),
                 preview: format!("图片 · {width} × {height}"),
+                image_preview: image_preview.clone(),
+                file_names: None,
                 types: vec!["图片".into()],
                 changed_at: now.clone(),
             };
@@ -1845,7 +1919,7 @@ pub(crate) fn receive_remote_image(
         snapshot.slots.push(image_slot(
             device,
             image.sequence,
-            image.rgba.len(),
+            &image.rgba,
             image.width,
             image.height,
             image.captured_at.clone(),
@@ -2939,6 +3013,9 @@ pub fn update_settings(
             .as_object()
             .ok_or_else(|| "设置更新必须是对象".to_string())?;
         for (key, value) in patch {
+            if key == "globalShortcut" {
+                continue;
+            }
             current_object.insert(key.clone(), value.clone());
         }
         snapshot.settings =
@@ -3071,6 +3148,75 @@ pub fn update_settings(
 }
 
 #[tauri::command]
+pub fn set_global_shortcut(
+    state: State<'_, ServiceState>,
+    app: AppHandle,
+    shortcut: String,
+) -> Result<(), String> {
+    #[cfg(not(desktop))]
+    {
+        let _ = (state, app, shortcut);
+        return Err("移动端不支持桌面全局快捷键".into());
+    }
+    #[cfg(desktop)]
+    {
+        let shortcut = shortcut.trim();
+        if !shortcut.contains('+') {
+            return Err("快捷键必须包含 Ctrl、Alt、Shift 或 Super 修饰键".into());
+        }
+        let old_shortcut = state.configured_global_shortcut()?;
+        if shortcut == old_shortcut {
+            if !app.global_shortcut().is_registered(shortcut) {
+                app.global_shortcut()
+                    .register(shortcut)
+                    .map_err(|error| format!("快捷键不可用或已被占用：{error}"))?;
+            }
+            return Ok(());
+        }
+        app.global_shortcut()
+            .register(shortcut)
+            .map_err(|error| format!("快捷键不可用或已被占用：{error}"))?;
+        let old_was_registered = app.global_shortcut().is_registered(old_shortcut.as_str());
+        if old_was_registered {
+            if let Err(error) = app.global_shortcut().unregister(old_shortcut.as_str()) {
+                let _ = app.global_shortcut().unregister(shortcut);
+                return Err(format!("无法替换原快捷键：{error}"));
+            }
+        }
+
+        let mut next_settings = {
+            let snapshot = state
+                .snapshot
+                .lock()
+                .map_err(|_| "Rust 服务状态锁已损坏".to_string())?;
+            snapshot.settings.clone()
+        };
+        next_settings.global_shortcut = shortcut.to_string();
+        if let Err(error) = state.store.save_settings(&next_settings) {
+            let _ = app.global_shortcut().unregister(shortcut);
+            if old_was_registered {
+                let _ = app.global_shortcut().register(old_shortcut.as_str());
+            }
+            return Err(error);
+        }
+        if let Err(error) = update(&state, &app, |snapshot| {
+            snapshot.settings.global_shortcut = shortcut.to_string();
+            Ok(())
+        }) {
+            let _ = app.global_shortcut().unregister(shortcut);
+            if old_was_registered {
+                let _ = app.global_shortcut().register(old_shortcut.as_str());
+            }
+            let mut restored = next_settings;
+            restored.global_shortcut = old_shortcut;
+            let _ = state.store.save_settings(&restored);
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+#[tauri::command]
 pub fn create_import_intent(
     state: State<'_, ServiceState>,
     app: AppHandle,
@@ -3176,7 +3322,7 @@ pub fn confirm_import(
             .ok_or_else(|| "远端正文已经不可用".to_string())?;
         (operation.slot_id.clone(), body)
     };
-    let (preview, types) = match &body {
+    let (preview, types, image_preview, file_names) = match &body {
         RemoteClipboardBody::Text(text) => {
             *state
                 .suppress_next_capture
@@ -3196,6 +3342,8 @@ pub fn confirm_import(
                 } else {
                     "纯文本".into()
                 }],
+                None,
+                None,
             )
         }
         RemoteClipboardBody::Rich { text, html, rtf } => {
@@ -3224,6 +3372,8 @@ pub fn confirm_import(
             (
                 truncate_text(text, 4096),
                 vec!["富文本 / HTML".into(), "纯文本降级".into()],
+                None,
+                None,
             )
         }
         RemoteClipboardBody::Files(bundle) => {
@@ -3247,6 +3397,8 @@ pub fn confirm_import(
             (
                 format!("{} 个文件或目录", bundle.clipboard_paths().len()),
                 vec!["文件与目录".into()],
+                None,
+                Some(bundle.display_names()),
             )
         }
         RemoteClipboardBody::Image {
@@ -3267,7 +3419,12 @@ pub fn confirm_import(
                     .map_err(|_| "图片剪贴板回环抑制锁已损坏".to_string())? = None;
                 return Err(format!("无法写入本机图片剪贴板：{error}"));
             }
-            (format!("图片 · {width} × {height}"), vec!["图片".into()])
+            (
+                format!("图片 · {width} × {height}"),
+                vec!["图片".into()],
+                image_preview_data_url(rgba, *width, *height),
+                None,
+            )
         }
     };
     update(&state, &app, |snapshot| {
@@ -3282,6 +3439,8 @@ pub fn confirm_import(
                 source: "remote".into(),
                 source_label: format!("取自 {}", operation.device_name),
                 preview: preview.clone(),
+                image_preview: image_preview.clone(),
+                file_names: file_names.clone(),
                 types: types.clone(),
                 changed_at: time::OffsetDateTime::now_utc()
                     .format(&time::format_description::well_known::Rfc3339)

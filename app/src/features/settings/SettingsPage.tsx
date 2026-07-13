@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { DesktopClient } from "../../ipc/client";
 import type { AppSettings, UiSnapshot } from "../../model";
 import { Toggle } from "../../components/Toggle";
@@ -5,13 +6,59 @@ import { Icon } from "../../components/Icon";
 import { AppearanceSettings } from "./AppearanceSettings";
 import { AppUpdater } from "./AppUpdater";
 
+const shortcutLabels = (shortcut: string): string[] => shortcut.split("+").map((part) => {
+  if (part.startsWith("Key")) return part.slice(3);
+  if (part.startsWith("Digit")) return part.slice(5);
+  if (part === "Super") return "Win";
+  return part;
+});
+
+function ShortcutRecorder({ value, onSave, onError }: { value: string; onSave: (shortcut: string) => Promise<void>; onError: (message: string) => void }) {
+  const [recording, setRecording] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const capture = (event: React.KeyboardEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.key === "Escape") { setRecording(false); return; }
+    if (["Control", "Alt", "Shift", "Meta"].includes(event.key) || event.repeat) return;
+    const supportedCode = /^(Key[A-Z]|Digit[0-9]|F(?:[1-9]|1[0-2]))$/.test(event.code);
+    if (!supportedCode || !(event.ctrlKey || event.altKey || event.shiftKey || event.metaKey)) {
+      onError("快捷键需要至少一个修饰键，并使用字母、数字或 F1–F12");
+      return;
+    }
+    const parts = [
+      event.ctrlKey ? "Ctrl" : "",
+      event.altKey ? "Alt" : "",
+      event.shiftKey ? "Shift" : "",
+      event.metaKey ? "Super" : "",
+      event.code,
+    ].filter(Boolean);
+    setRecording(false);
+    setSaving(true);
+    void onSave(parts.join("+")).catch((reason: unknown) => {
+      onError(reason instanceof Error ? reason.message : "快捷键保存失败");
+    }).finally(() => setSaving(false));
+  };
+  return <button
+    type="button"
+    className={`shortcut-recorder ${recording ? "recording" : ""}`}
+    aria-label="自定义全局快捷键"
+    onClick={() => setRecording(true)}
+    onKeyDown={capture}
+    onBlur={() => setRecording(false)}
+  >
+    {recording ? <span className="shortcut-recording-copy">请按下新组合键…</span> : <span className="shortcut-keys">{shortcutLabels(value).map((part) => <kbd key={part}>{part}</kbd>)}</span>}
+    <span className="shortcut-edit-copy">{saving ? "保存中" : "修改"}</span>
+  </button>;
+}
+
 export function SettingsPage({ snapshot, client, onError }: { snapshot: UiSnapshot; client: DesktopClient; onError: (message: string) => void }) {
   const update = (settings: Partial<AppSettings>) => { void client.updateSettings(settings).catch((reason: unknown) => onError(reason instanceof Error ? reason.message : "设置保存失败")); };
   return <div className="page">
     <header className="page-header"><div><p className="page-eyebrow">本地策略</p><h1 className="page-title">设置</h1><p className="page-subtitle">支持复制的类型会按 capability 自动出现，由你决定哪些类型允许发布、订阅和预取。</p></div></header>
     <div className="grid-2">
       <section><div className="section-title"><h2>同步控制</h2></div><div className="card settings-card"><Toggle label="发布本机剪贴板槽位" description="只同步本机新复制的内容，不转发从其他设备取用的内容" checked={!snapshot.publishPaused} onChange={(checked) => void client.setPause("publish", !checked)} /><Toggle label="订阅远端设备槽位" description="实时更新设备卡片，但不会自动写入本机剪贴板" checked={!snapshot.subscribePaused} onChange={(checked) => void client.setPause("subscribe", !checked)} /></div></section>
-      <section><div className="section-title"><h2>{snapshot.platform === "desktop" ? "快捷操作" : "运行模式"}</h2></div><div className="card settings-card">{snapshot.platform === "desktop" ? <div className="toggle-row"><div className="toggle-copy"><strong>打开剪贴板切换器</strong><span>在任意应用中按下快捷键即可唤起 AirDrop</span></div><span className="shortcut-keys" aria-label="Control Alt V"><kbd>Ctrl</kbd><kbd>Alt</kbd><kbd>V</kbd></span></div> : <div className="toggle-row"><div className="toggle-copy"><strong>前台实时模式</strong><span>退到后台允许系统暂停，回到前台自动恢复</span></div><span className="tag">轻量模式</span></div>}</div></section>
+      <section><div className="section-title"><h2>{snapshot.platform === "desktop" ? "快捷操作" : "运行模式"}</h2></div><div className="card settings-card">{snapshot.platform === "desktop" ? <div className="toggle-row"><div className="toggle-copy"><strong>唤起悬浮球</strong><span>优先打开悬浮球快捷菜单；悬浮球关闭时打开主窗口</span></div><ShortcutRecorder value={snapshot.settings.globalShortcut} onSave={(shortcut) => client.setGlobalShortcut(shortcut)} onError={onError} /></div> : <div className="toggle-row"><div className="toggle-copy"><strong>前台实时模式</strong><span>退到后台允许系统暂停，回到前台自动恢复</span></div><span className="tag">轻量模式</span></div>}</div></section>
     </div>
     {snapshot.platform === "desktop" && <AppUpdater />}
     <AppearanceSettings settings={snapshot.settings} platform={snapshot.platform} onUpdate={update} />

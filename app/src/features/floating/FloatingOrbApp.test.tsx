@@ -1,7 +1,5 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import type { FloatingEventPayloads, FloatingOrbStatePayload } from "./floating-events";
 import { FLOATING_EVENTS } from "./floating-events";
 import { FloatingOrbApp, type FloatingOrbWindowAdapter } from "./FloatingOrbApp";
@@ -13,6 +11,7 @@ const liveState: FloatingOrbStatePayload = {
   activity: "foreground_live",
   canReadClipboard: true,
   busy: false,
+  slots: [],
   appearance: {
     theme: "light",
     accentColor: "#168fae",
@@ -44,203 +43,102 @@ const setup = () => {
   return { adapter, calls, dispatch, unlisteners };
 };
 
-const expand = async (context: ReturnType<typeof setup>) => {
-  fireEvent.click(screen.getByRole("button", { name: "展开 AirDrop 悬浮球" }));
+const openMenu = async (context: ReturnType<typeof setup>) => {
+  fireEvent.contextMenu(screen.getByRole("button", { name: /AirDrop 悬浮球/ }));
   const layout = vi.mocked(context.adapter.emit).mock.calls.filter(([event, payload]) =>
     event === FLOATING_EVENTS.layout && (payload as { expanded: boolean }).expanded,
   ).at(-1)?.[1] as FloatingEventPayloads[typeof FLOATING_EVENTS.layout];
   context.dispatch(FLOATING_EVENTS.layoutState, { ...layout, success: true });
-  await screen.findByRole("region", { name: "AirDrop 悬浮操作面板" });
+  await screen.findByRole("region", { name: "AirDrop 快捷菜单" });
 };
 
 describe("FloatingOrbApp", () => {
   it("renders only the floating surface for the floating route", () => {
     const createClient = vi.fn();
     render(<AirDropSurface search="?surface=floating" createClient={createClient} />);
-    expect(screen.getByRole("button", { name: "展开 AirDrop 悬浮球" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /AirDrop 悬浮球/ })).toBeInTheDocument();
     expect(screen.queryByRole("navigation", { name: "主导航" })).not.toBeInTheDocument();
     expect(createClient).not.toHaveBeenCalled();
   });
 
-  it("installs state and layout listeners before announcing ready", async () => {
+  it("installs all listeners before announcing ready", async () => {
     const context = setup();
     render(<FloatingOrbApp adapter={context.adapter} />);
     await waitFor(() => expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.ready, { protocolVersion: 1 }));
     expect(context.calls).toEqual([
       `listen:${FLOATING_EVENTS.state}`,
       `listen:${FLOATING_EVENTS.layoutState}`,
+      `listen:${FLOATING_EVENTS.openMenu}`,
       `emit:${FLOATING_EVENTS.ready}`,
     ]);
   });
 
-  it("renders expanded controls only after the matching successful layout ack", async () => {
+  it("uses the whole orb for dragging and opens only from the context menu", async () => {
     const context = setup();
     render(<FloatingOrbApp adapter={context.adapter} />);
     await waitFor(() => expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.ready, expect.anything()));
-    fireEvent.click(screen.getByRole("button", { name: "展开 AirDrop 悬浮球" }));
+    const orb = screen.getByRole("button", { name: /AirDrop 悬浮球/ });
+    fireEvent.pointerDown(orb, { button: 0 });
+    expect(context.adapter.startDragging).toHaveBeenCalledOnce();
+    fireEvent.click(orb);
+    expect(context.adapter.emit).not.toHaveBeenCalledWith(FLOATING_EVENTS.layout, expect.anything());
+    fireEvent.contextMenu(orb);
+    expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.layout, expect.objectContaining({ expanded: true, width: 356 }));
+  });
+
+  it("opens from the global-shortcut event after the matching layout ack", async () => {
+    const context = setup();
+    render(<FloatingOrbApp adapter={context.adapter} />);
+    await waitFor(() => expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.ready, expect.anything()));
+    context.dispatch(FLOATING_EVENTS.openMenu, {});
     const layout = vi.mocked(context.adapter.emit).mock.calls.find(([event]) => event === FLOATING_EVENTS.layout)?.[1] as FloatingEventPayloads[typeof FLOATING_EVENTS.layout];
-    expect(screen.queryByRole("region", { name: "AirDrop 悬浮操作面板" })).not.toBeInTheDocument();
-    context.dispatch(FLOATING_EVENTS.layoutState, { requestId: "other", expanded: true, success: true });
-    expect(screen.queryByRole("region", { name: "AirDrop 悬浮操作面板" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "AirDrop 快捷菜单" })).not.toBeInTheDocument();
     context.dispatch(FLOATING_EVENTS.layoutState, { ...layout, success: true });
-    expect(await screen.findByRole("region", { name: "AirDrop 悬浮操作面板" })).toBeInTheDocument();
+    expect(await screen.findByRole("region", { name: "AirDrop 快捷菜单" })).toBeInTheDocument();
   });
 
-  it("stays collapsed and exposes a useful status when layout fails", async () => {
+  it("shows remote content and emits a precise quick-use action", async () => {
     const context = setup();
     render(<FloatingOrbApp adapter={context.adapter} />);
     await waitFor(() => expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.ready, expect.anything()));
-    fireEvent.click(screen.getByRole("button", { name: "展开 AirDrop 悬浮球" }));
-    const layout = vi.mocked(context.adapter.emit).mock.calls.find(([event]) => event === FLOATING_EVENTS.layout)?.[1] as FloatingEventPayloads[typeof FLOATING_EVENTS.layout];
-    context.dispatch(FLOATING_EVENTS.layoutState, { ...layout, success: false, message: "窗口空间不足" });
-    await waitFor(() => expect(screen.getByRole("button", { name: "展开 AirDrop 悬浮球" })).toBeEnabled());
-    expect(screen.getByRole("status")).toHaveTextContent("窗口空间不足");
+    context.dispatch(FLOATING_EVENTS.state, {
+      ...liveState,
+      slots: [{
+        id: "slot-1",
+        revision: 8,
+        deviceName: "工作电脑",
+        platform: "windows",
+        kind: "files",
+        preview: "2 个文件",
+        fileNames: ["完整文件名设计稿.fig", "资料目录"],
+        ageLabel: "刚刚",
+        available: true,
+      }],
+    });
+    await openMenu(context);
+    expect(screen.getByText("完整文件名设计稿.fig · 资料目录")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "使用" }));
+    expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.action, { action: "use-slot", slotId: "slot-1", revision: 8 });
   });
 
-  it("uses paused state for the sync label and emits exact action values", async () => {
+  it("uses paused state for quick actions", async () => {
     const context = setup();
     render(<FloatingOrbApp adapter={context.adapter} />);
     await waitFor(() => expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.ready, expect.anything()));
     context.dispatch(FLOATING_EVENTS.state, { ...liveState, publishPaused: true, subscribePaused: true });
-    await expand(context);
-    fireEvent.click(screen.getByRole("button", { name: "恢复同步" }));
+    await openMenu(context);
+    fireEvent.click(screen.getByRole("button", { name: "恢复" }));
     expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.action, { action: "toggle-sync" });
-    fireEvent.click(screen.getByRole("button", { name: "禁用悬浮球" }));
+    fireEvent.click(screen.getByRole("button", { name: "隐藏" }));
     expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.action, { action: "hide-orb" });
   });
 
-  it("starts native dragging and consumes a long drag's trailing click without blocking a later intentional click", async () => {
+  it("removes all native listeners on unmount", async () => {
     const context = setup();
-    const now = vi.spyOn(Date, "now").mockReturnValue(1);
-    render(<FloatingOrbApp adapter={context.adapter} />);
-    await waitFor(() => expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.ready, expect.anything()));
-    const handle = screen.getByRole("button", { name: "拖动悬浮球" });
-    const styles = readFileSync(resolve(process.cwd(), "src/features/floating/floating.css"), "utf8");
-    expect(styles).toMatch(/\.floating-drag-handle\s*\{[^}]*width:\s*36px;[^}]*height:\s*36px;/s);
-    expect(styles).toMatch(/\.floating-drag-handle-collapsed\s*\{[^}]*top:\s*0;/s);
-    fireEvent.pointerDown(handle);
-    expect(context.adapter.startDragging).toHaveBeenCalledOnce();
-    now.mockReturnValue(60_001);
-    fireEvent.click(handle);
-    expect(context.adapter.emit).not.toHaveBeenCalledWith(FLOATING_EVENTS.layout, expect.anything());
-    fireEvent.click(screen.getByRole("button", { name: "展开 AirDrop 悬浮球" }));
-    expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.layout, expect.objectContaining({ expanded: true }));
-    now.mockRestore();
-  });
-
-  it("recovers a timed-out expand with a matching collapse transaction and ignores the late expand ack", async () => {
-    vi.useFakeTimers();
-    const context = setup();
-    render(<FloatingOrbApp adapter={context.adapter} />);
-    await vi.waitFor(() => expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.ready, expect.anything()));
-    fireEvent.click(screen.getByRole("button", { name: "展开 AirDrop 悬浮球" }));
-    const expandRequest = vi.mocked(context.adapter.emit).mock.calls.find(([event, payload]) =>
-      event === FLOATING_EVENTS.layout && (payload as { expanded: boolean }).expanded,
-    )?.[1] as FloatingEventPayloads[typeof FLOATING_EVENTS.layout];
-    expect(screen.getByRole("button", { name: "展开 AirDrop 悬浮球" })).toBeDisabled();
-    await act(() => vi.advanceTimersByTimeAsync(2_000));
-    const recoveryRequest = vi.mocked(context.adapter.emit).mock.calls.filter(([event, payload]) =>
-      event === FLOATING_EVENTS.layout && !(payload as { expanded: boolean }).expanded,
-    ).at(-1)?.[1] as FloatingEventPayloads[typeof FLOATING_EVENTS.layout];
-    expect(recoveryRequest.requestId).not.toBe(expandRequest.requestId);
-    expect(screen.getByRole("button", { name: "展开 AirDrop 悬浮球" })).toBeDisabled();
-    context.dispatch(FLOATING_EVENTS.layoutState, { ...expandRequest, success: true });
-    expect(screen.queryByRole("region", { name: "AirDrop 悬浮操作面板" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "展开 AirDrop 悬浮球" })).toBeDisabled();
-    act(() => context.dispatch(FLOATING_EVENTS.layoutState, { ...recoveryRequest, success: true }));
-    expect(screen.getByRole("button", { name: "展开 AirDrop 悬浮球" })).toBeEnabled();
-    expect(screen.getByRole("status")).toHaveTextContent("悬浮球已收起");
-    vi.useRealTimers();
-  });
-
-  it("bounds recovery attempts and unlocks with an accessible error", async () => {
-    vi.useFakeTimers();
-    const context = setup();
-    render(<FloatingOrbApp adapter={context.adapter} />);
-    await vi.waitFor(() => expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.ready, expect.anything()));
-    fireEvent.click(screen.getByRole("button", { name: "展开 AirDrop 悬浮球" }));
-    await act(() => vi.advanceTimersByTimeAsync(4_000));
-    expect(vi.mocked(context.adapter.emit).mock.calls.filter(([event]) => event === FLOATING_EVENTS.layout)).toHaveLength(2);
-    expect(screen.getByRole("button", { name: "展开 AirDrop 悬浮球" })).toBeEnabled();
-    expect(screen.getByRole("status")).toHaveTextContent("状态可能异常");
-    vi.useRealTimers();
-  });
-
-  it("moves focus into expanded actions and restores it to the droplet after collapse ack", async () => {
-    const context = setup();
-    render(<FloatingOrbApp adapter={context.adapter} />);
-    await waitFor(() => expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.ready, expect.anything()));
-    await expand(context);
-    await waitFor(() => expect(screen.getByRole("button", { name: "打开剪贴板" })).toHaveFocus());
-    fireEvent.keyDown(window, { key: "Escape" });
-    await waitFor(() => expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.layout, expect.objectContaining({ expanded: false })));
-    const collapse = vi.mocked(context.adapter.emit).mock.calls.filter(([event, payload]) =>
-      event === FLOATING_EVENTS.layout && !(payload as { expanded: boolean }).expanded,
-    ).at(-1)?.[1] as FloatingEventPayloads[typeof FLOATING_EVENTS.layout];
-    context.dispatch(FLOATING_EVENTS.layoutState, { ...collapse, success: true });
-    await waitFor(() => expect(screen.getByRole("button", { name: "展开 AirDrop 悬浮球" })).toHaveFocus());
-  });
-
-  it("does not update or schedule collapse when an action completes after unmount", async () => {
-    const context = setup();
-    let resolveAction!: () => void;
-    const actionCompletion = new Promise<void>((resolve) => { resolveAction = resolve; });
-    vi.mocked(context.adapter.emit).mockImplementation(((event: keyof FloatingEventPayloads) =>
-      event === FLOATING_EVENTS.action ? actionCompletion : Promise.resolve()) as FloatingOrbWindowAdapter["emit"]);
     const view = render(<FloatingOrbApp adapter={context.adapter} />);
     await waitFor(() => expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.ready, expect.anything()));
-    await expand(context);
-    vi.useFakeTimers();
-    fireEvent.click(screen.getByRole("button", { name: "打开主窗口" }));
     view.unmount();
-    resolveAction();
-    await act(async () => { await actionCompletion; await vi.advanceTimersByTimeAsync(500); });
-    expect(vi.mocked(context.adapter.emit).mock.calls.filter(([event, payload]) =>
-      event === FLOATING_EVENTS.layout && !(payload as { expanded: boolean }).expanded,
-    )).toHaveLength(0);
-    vi.useRealTimers();
-  });
-
-  it("schedules a collapse request after a successful expanded action", async () => {
-    const context = setup();
-    render(<FloatingOrbApp adapter={context.adapter} />);
-    await waitFor(() => expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.ready, expect.anything()));
-    await expand(context);
-    fireEvent.click(screen.getByRole("button", { name: "打开主窗口" }));
-    expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.action, { action: "open-main" });
-    expect(context.adapter.emit).not.toHaveBeenCalledWith(FLOATING_EVENTS.layout, expect.objectContaining({ expanded: false }));
-    await waitFor(() => expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.layout, expect.objectContaining({ expanded: false })));
-  });
-
-  it("requests collapse on Escape and focus loss and waits for ack", async () => {
-    const context = setup();
-    render(<FloatingOrbApp adapter={context.adapter} />);
-    await waitFor(() => expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.ready, expect.anything()));
-    await expand(context);
-    fireEvent.keyDown(window, { key: "Escape" });
-    await waitFor(() => expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.layout, expect.objectContaining({ expanded: false })));
-    expect(screen.getByRole("region", { name: "AirDrop 悬浮操作面板" })).toBeInTheDocument();
-    const collapse = vi.mocked(context.adapter.emit).mock.calls.filter(([event, payload]) => event === FLOATING_EVENTS.layout && !(payload as { expanded: boolean }).expanded).at(-1)?.[1] as FloatingEventPayloads[typeof FLOATING_EVENTS.layout];
-    context.dispatch(FLOATING_EVENTS.layoutState, { ...collapse, success: true });
-    await screen.findByRole("button", { name: "展开 AirDrop 悬浮球" });
-
-    await expand(context);
-    fireEvent.blur(window);
-    await waitFor(() => expect(vi.mocked(context.adapter.emit).mock.calls.filter(([event, payload]) => event === FLOATING_EVENTS.layout && !(payload as { expanded: boolean }).expanded)).toHaveLength(2));
-  });
-
-  it("removes native and browser listeners and clears timers on unmount", async () => {
-    vi.useFakeTimers();
-    const context = setup();
-    const remove = vi.spyOn(window, "removeEventListener");
-    const view = render(<FloatingOrbApp adapter={context.adapter} />);
-    await vi.waitFor(() => expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.ready, expect.anything()));
-    view.unmount();
-    expect(context.unlisteners).toHaveLength(2);
+    expect(context.unlisteners).toHaveLength(3);
     context.unlisteners.forEach((unlisten) => expect(unlisten).toHaveBeenCalledOnce());
-    expect(remove).toHaveBeenCalledWith("blur", expect.any(Function));
-    expect(remove).toHaveBeenCalledWith("keydown", expect.any(Function));
-    remove.mockRestore();
-    vi.useRealTimers();
   });
 });
