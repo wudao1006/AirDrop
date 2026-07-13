@@ -368,6 +368,7 @@ pub struct ServiceState {
     clipboard_cache: ClipboardCache,
     file_cache_root: PathBuf,
     imported_files: Mutex<Option<Arc<ReceivedFileBundle>>>,
+    accepted_file_transfers: Mutex<HashMap<String, String>>,
 }
 
 impl ServiceState {
@@ -467,6 +468,7 @@ impl ServiceState {
             clipboard_cache,
             file_cache_root,
             imported_files: Mutex::new(None),
+            accepted_file_transfers: Mutex::new(HashMap::new()),
         })
     }
 
@@ -484,6 +486,26 @@ impl ServiceState {
 
     pub(crate) fn incoming_files_root(&self) -> PathBuf {
         self.file_cache_root.join("incoming")
+    }
+
+    pub(crate) fn has_accepted_file_transfer(&self, device_id: &str, transfer_id: &str) -> bool {
+        self.accepted_file_transfers
+            .lock()
+            .ok()
+            .and_then(|transfers| transfers.get(device_id).cloned())
+            .is_some_and(|accepted| accepted == transfer_id)
+    }
+
+    pub(crate) fn mark_accepted_file_transfer(&self, device_id: &str, transfer_id: String) {
+        if let Ok(mut transfers) = self.accepted_file_transfers.lock() {
+            transfers.insert(device_id.into(), transfer_id);
+        }
+    }
+
+    fn clear_accepted_file_transfer(&self, device_id: &str) {
+        if let Ok(mut transfers) = self.accepted_file_transfers.lock() {
+            transfers.remove(device_id);
+        }
     }
 
     pub(crate) fn trusted_device(&self, device_id: &str) -> Result<Option<TrustedDevice>, String> {
@@ -1471,6 +1493,7 @@ pub(crate) fn receive_remote_text(
         return Ok(());
     }
     let slot_id = format!("device:{}", device.device_id);
+    state.clear_accepted_file_transfer(&device.device_id);
     {
         let mut bodies = state
             .remote_bodies
@@ -1587,6 +1610,7 @@ pub(crate) fn receive_remote_rich(
         }
     }
     let slot_id = format!("device:{}", device.device_id);
+    state.clear_accepted_file_transfer(&device.device_id);
     state
         .remote_bodies
         .lock()
@@ -1656,6 +1680,7 @@ pub(crate) fn receive_remote_files(
         snapshot.settings.preview_file_names
     };
     let slot_id = format!("device:{}", device.device_id);
+    state.clear_accepted_file_transfer(&device.device_id);
     state
         .remote_bodies
         .lock()
@@ -1726,6 +1751,7 @@ pub(crate) fn receive_remote_image(
         }
     }
     let slot_id = format!("device:{}", device.device_id);
+    state.clear_accepted_file_transfer(&device.device_id);
     state
         .remote_bodies
         .lock()
@@ -1895,6 +1921,7 @@ fn reconcile_group_slots(state: &ServiceState, app: &AppHandle) -> Result<(), St
         }
     }
     for (_, device_id) in &removed {
+        state.clear_accepted_file_transfer(device_id);
         if let Some(object_name) = state.store.remove_cached_slot(device_id)? {
             state.clipboard_cache.remove(&object_name);
         }
@@ -2592,6 +2619,7 @@ pub fn set_device_sync_enabled(
         }
     } else {
         transport.disable_peer(&device_id);
+        state.clear_accepted_file_transfer(&device_id);
         state
             .remote_bodies
             .lock()
@@ -2634,6 +2662,7 @@ pub fn revoke_device(
             .set_group_local_state(group_id, "left", &revoked_at)?;
     }
     transport.disable_peer(&device_id);
+    state.clear_accepted_file_transfer(&device_id);
     state
         .remote_bodies
         .lock()
@@ -2852,6 +2881,9 @@ pub fn update_settings(
     if !snapshot.settings.allow_files {
         if let Some(transport) = app.try_state::<super::transport::TransportHandle>() {
             transport.clear_latest_files();
+        }
+        if let Ok(mut transfers) = state.accepted_file_transfers.lock() {
+            transfers.clear();
         }
     }
     if !snapshot.settings.allow_text

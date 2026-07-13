@@ -358,20 +358,27 @@ pub(crate) fn prepare_file_cache(root: &Path) {
     let cutoff = std::time::SystemTime::now()
         .checked_sub(std::time::Duration::from_secs(24 * 60 * 60))
         .unwrap_or(std::time::UNIX_EPOCH);
-    for directory in [&incoming, &outgoing] {
-        let Ok(entries) = fs::read_dir(directory) else {
+    prune_expired_cache(&incoming, cutoff, 2);
+    prune_expired_cache(&outgoing, cutoff, 1);
+}
+
+fn prune_expired_cache(root: &Path, cutoff: std::time::SystemTime, depth: u8) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata() else {
             continue;
         };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with(".part-")
-                || entry
-                    .metadata()
-                    .and_then(|metadata| metadata.modified())
-                    .is_ok_and(|modified| modified < cutoff)
-            {
-                let _ = fs::remove_dir_all(entry.path());
+        if metadata.modified().is_ok_and(|modified| modified < cutoff) {
+            if metadata.is_dir() {
+                let _ = fs::remove_dir_all(path);
+            } else {
+                let _ = fs::remove_file(path);
             }
+        } else if depth > 0 && metadata.is_dir() {
+            prune_expired_cache(&path, cutoff, depth - 1);
         }
     }
 }

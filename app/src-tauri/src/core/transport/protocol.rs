@@ -137,6 +137,23 @@ pub(crate) struct FileBlobHeader {
     pub(crate) group_ids: Vec<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FileResumePlan {
+    pub(crate) schema_version: u8,
+    pub(crate) transfer_id: String,
+    pub(crate) offsets: Vec<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FileTransferAck {
+    pub(crate) schema_version: u8,
+    pub(crate) transfer_id: String,
+    pub(crate) accepted: bool,
+    pub(crate) message: Option<String>,
+}
+
 pub(crate) async fn write_frame<T: Serialize>(
     send: &mut quinn::SendStream,
     value: &T,

@@ -18,8 +18,8 @@ use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use image::{codecs::png::PngEncoder, ExtendedColorType, ImageEncoder};
 use protocol::{
-    read_frame, write_frame, FileBlobHeader, ImageBlobHeader, PairMessage, TrustedMessage,
-    PAIR_ALPN, TRUSTED_ALPN,
+    read_frame, write_frame, FileBlobHeader, FileResumePlan, FileTransferAck, ImageBlobHeader,
+    PairMessage, TrustedMessage, PAIR_ALPN, TRUSTED_ALPN,
 };
 use quinn::{crypto::rustls::QuicClientConfig, Connection, Endpoint};
 use rcgen::{CertificateParams, KeyPair};
@@ -37,7 +37,7 @@ use std::{
 };
 use tauri::{AppHandle, Manager};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -1005,6 +1005,11 @@ impl TransportHandle {
             connection.clone(),
             trusted.clone(),
         ));
+        let file_reader = tokio::spawn(receive_file_streams(
+            app.clone(),
+            connection.clone(),
+            trusted.clone(),
+        ));
         loop {
             match read_frame::<TrustedMessage>(&mut receive).await {
                 Ok(TrustedMessage::ClipboardSlotOffer {
@@ -1125,10 +1130,16 @@ impl TransportHandle {
                         tracing::warn!(device_id = %device_id, error = %error, "group tombstone rejected");
                     }
                 }
-                Ok(_) => return Err("可信连接收到意外消息".into()),
+                Ok(_) => {
+                    writer.abort();
+                    blob_reader.abort();
+                    file_reader.abort();
+                    return Err("可信连接收到意外消息".into());
+                }
                 Err(error) => {
                     writer.abort();
                     blob_reader.abort();
+                    file_reader.abort();
                     if let Ok(mut peers) = self.peers.lock() {
                         let is_current = peers.get(&device_id).is_some_and(|peer| {
                             peer.connection.stable_id() == connection.stable_id()
@@ -1183,8 +1194,8 @@ async fn send_file_blob(
     offer: LocalFileOffer,
     group_ids: Vec<String>,
 ) -> Result<(), String> {
-    let mut send = connection
-        .open_uni()
+    let (mut send, mut receive) = connection
+        .open_bi()
         .await
         .map_err(|error| format!("无法打开文件数据流：{error}"))?;
     let header = FileBlobHeader {
@@ -1200,16 +1211,32 @@ async fn send_file_blob(
         .await
         .map_err(|error| format!("文件数据流类型发送失败：{error}"))?;
     write_frame(&mut send, &header).await?;
+    let plan: FileResumePlan = read_frame(&mut receive).await?;
+    if plan.schema_version != 1
+        || plan.transfer_id != header.message_id
+        || plan.offsets.len() != header.entries.len()
+    {
+        return Err("文件续传计划无效".into());
+    }
     let mut buffer = vec![0_u8; 64 * 1024];
-    for entry in &header.entries {
+    for (entry, offset) in header.entries.iter().zip(plan.offsets) {
         if entry.is_directory {
+            if offset != 0 {
+                return Err("目录续传偏移无效".into());
+            }
             continue;
+        }
+        if offset > entry.size {
+            return Err("文件续传偏移超过声明大小".into());
         }
         let relative = safe_relative_path(&entry.relative_path)?;
         let mut file = tokio::fs::File::open(offer.bundle.root.join(relative))
             .await
             .map_err(|error| format!("无法打开暂存文件：{error}"))?;
-        let mut remaining = entry.size;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|error| format!("无法定位暂存文件续传位置：{error}"))?;
+        let mut remaining = entry.size - offset;
         while remaining > 0 {
             let limit = usize::try_from(remaining.min(buffer.len() as u64))
                 .map_err(|_| "文件分块大小溢出".to_string())?;
@@ -1227,7 +1254,17 @@ async fn send_file_blob(
         }
     }
     send.finish()
-        .map_err(|error| format!("文件数据流结束失败：{error}"))
+        .map_err(|error| format!("文件数据流结束失败：{error}"))?;
+    let acknowledgement: FileTransferAck = read_frame(&mut receive).await?;
+    if acknowledgement.schema_version != 1
+        || acknowledgement.transfer_id != header.message_id
+        || !acknowledgement.accepted
+    {
+        return Err(acknowledgement
+            .message
+            .unwrap_or_else(|| "接收端拒绝了文件快照".into()));
+    }
+    Ok(())
 }
 
 async fn send_file_blob_with_retry(
@@ -1259,12 +1296,29 @@ async fn receive_clipboard_blobs(app: AppHandle, connection: Connection, device:
         };
         let result = match receive.read_u8().await {
             Ok(IMAGE_BLOB_KIND) => receive_image_blob(&app, &device, &mut receive).await,
-            Ok(FILE_BLOB_KIND) => receive_file_blob(&app, &device, &mut receive).await,
+            Ok(FILE_BLOB_KIND) => Err("文件剪贴板必须使用可续传双向流".into()),
             Ok(_) => Err("未知剪贴板数据流类型".into()),
             Err(error) => Err(format!("无法读取剪贴板数据流类型：{error}")),
         };
         if let Err(error) = result {
             tracing::warn!(device_id = %device.device_id, error = %error, "remote clipboard blob rejected");
+        }
+    }
+}
+
+async fn receive_file_streams(app: AppHandle, connection: Connection, device: TrustedDevice) {
+    loop {
+        let (mut send, mut receive) = match connection.accept_bi().await {
+            Ok(streams) => streams,
+            Err(_) => return,
+        };
+        let result = match receive.read_u8().await {
+            Ok(FILE_BLOB_KIND) => receive_file_blob(&app, &device, &mut send, &mut receive).await,
+            Ok(_) => Err("可信连接收到未知双向数据流".into()),
+            Err(error) => Err(format!("无法读取双向数据流类型：{error}")),
+        };
+        if let Err(error) = result {
+            tracing::warn!(device_id = %device.device_id, error = %error, "remote resumable file stream rejected");
         }
     }
 }
@@ -1322,47 +1376,180 @@ async fn receive_image_blob(
 async fn receive_file_blob(
     app: &AppHandle,
     device: &TrustedDevice,
+    send: &mut quinn::SendStream,
     receive: &mut quinn::RecvStream,
 ) -> Result<(), String> {
     let header: FileBlobHeader = read_frame(receive).await?;
     validate_file_header(&header)?;
-    let incoming_root = {
-        let state = app.state::<ServiceState>();
-        state.validate_incoming_offer(&device.device_id, &header.group_ids, "files")?;
-        state.validate_incoming_sequence(&device.device_id, header.origin_sequence)?;
-        state.incoming_files_root()
-    };
-    create_private_dir_all(&incoming_root).await?;
     let transfer_id = uuid::Uuid::parse_str(&header.message_id)
         .map_err(|_| "文件数据流消息 ID 无效".to_string())?
         .simple()
         .to_string();
+    let (incoming_root, already_accepted) = {
+        let state = app.state::<ServiceState>();
+        state.validate_incoming_offer(&device.device_id, &header.group_ids, "files")?;
+        let accepted = state.has_accepted_file_transfer(&device.device_id, &transfer_id);
+        if !accepted {
+            state.validate_incoming_sequence(&device.device_id, header.origin_sequence)?;
+        }
+        let peer_key = HEXLOWER.encode(&Sha256::digest(device.device_id.as_bytes())[..12]);
+        (state.incoming_files_root().join(peer_key), accepted)
+    };
+    if already_accepted {
+        write_frame(
+            send,
+            &FileResumePlan {
+                schema_version: 1,
+                transfer_id: header.message_id.clone(),
+                offsets: header
+                    .entries
+                    .iter()
+                    .map(|entry| if entry.is_directory { 0 } else { entry.size })
+                    .collect(),
+            },
+        )
+        .await?;
+        if !receive
+            .read_to_end(1)
+            .await
+            .map_err(|error| format!("无法确认重复文件流：{error}"))?
+            .is_empty()
+        {
+            return Err("重复文件流包含未声明正文".into());
+        }
+        write_frame(
+            send,
+            &FileTransferAck {
+                schema_version: 1,
+                transfer_id: header.message_id,
+                accepted: true,
+                message: None,
+            },
+        )
+        .await?;
+        send.finish()
+            .map_err(|error| format!("无法结束重复文件确认流：{error}"))?;
+        return Ok(());
+    }
+    create_private_dir_all(&incoming_root).await?;
     let temporary = incoming_root.join(format!(".part-{transfer_id}"));
     let completed = incoming_root.join(format!("bundle-{transfer_id}"));
-    create_private_dir_all(&temporary).await?;
-    let receive_result = receive_file_entries(receive, &temporary, &header).await;
-    if let Err(error) = receive_result {
-        let _ = tokio::fs::remove_dir_all(&temporary).await;
-        return Err(error);
-    }
-    if let Err(error) = tokio::fs::rename(&temporary, &completed).await {
-        let _ = tokio::fs::remove_dir_all(&temporary).await;
-        return Err(format!("无法提交接收文件：{error}"));
-    }
-    let bundle = Arc::new(ReceivedFileBundle::new(completed, header.entries));
-    let state = app.state::<ServiceState>();
-    service::receive_remote_files(
-        &state,
-        app,
-        device,
-        service::RemoteFiles {
-            sequence: header.origin_sequence,
-            bundle,
-            captured_at: header.captured_at,
-            group_ids: header.group_ids,
-            total_size: header.total_size,
+    let partial = prepare_partial_file_bundle(&temporary, &completed, &header).await?;
+    write_frame(
+        send,
+        &FileResumePlan {
+            schema_version: 1,
+            transfer_id: header.message_id.clone(),
+            offsets: partial.offsets.clone(),
         },
     )
+    .await?;
+    let result = async {
+        receive_file_entries(receive, &partial.root, &header, &partial.offsets).await?;
+        if !partial.completed {
+            tokio::fs::rename(&temporary, &completed)
+                .await
+                .map_err(|error| format!("无法提交接收文件：{error}"))?;
+        }
+        let bundle = Arc::new(ReceivedFileBundle::new(
+            completed.clone(),
+            header.entries.clone(),
+        ));
+        let state = app.state::<ServiceState>();
+        service::receive_remote_files(
+            &state,
+            app,
+            device,
+            service::RemoteFiles {
+                sequence: header.origin_sequence,
+                bundle,
+                captured_at: header.captured_at.clone(),
+                group_ids: header.group_ids.clone(),
+                total_size: header.total_size,
+            },
+        )
+    }
+    .await;
+    if result.is_ok() {
+        let state = app.state::<ServiceState>();
+        state.mark_accepted_file_transfer(&device.device_id, transfer_id);
+    }
+    let acknowledgement = FileTransferAck {
+        schema_version: 1,
+        transfer_id: header.message_id,
+        accepted: result.is_ok(),
+        message: result.as_ref().err().cloned(),
+    };
+    write_frame(send, &acknowledgement).await?;
+    send.finish()
+        .map_err(|error| format!("无法结束文件确认流：{error}"))?;
+    result
+}
+
+struct PartialFileBundle {
+    root: std::path::PathBuf,
+    offsets: Vec<u64>,
+    completed: bool,
+}
+
+async fn prepare_partial_file_bundle(
+    temporary: &std::path::Path,
+    completed: &std::path::Path,
+    header: &FileBlobHeader,
+) -> Result<PartialFileBundle, String> {
+    let completed_exists = completed.exists();
+    let root = if completed_exists {
+        completed.to_path_buf()
+    } else {
+        temporary.to_path_buf()
+    };
+    create_private_dir_all(&root).await?;
+    let manifest_path = root.join(".localdrop-manifest.json");
+    let manifest =
+        serde_json::to_vec(&(header.origin_sequence, header.total_size, &header.entries))
+            .map_err(|error| format!("无法编码文件续传清单：{error}"))?;
+    if manifest_path.exists() {
+        let existing = tokio::fs::read(&manifest_path)
+            .await
+            .map_err(|error| format!("无法读取文件续传清单：{error}"))?;
+        if existing != manifest {
+            return Err("相同文件传输 ID 出现不同清单".into());
+        }
+    } else {
+        write_private_file(&manifest_path, &manifest).await?;
+    }
+    let mut offsets = Vec::with_capacity(header.entries.len());
+    for entry in &header.entries {
+        let destination = root.join(safe_relative_path(&entry.relative_path)?);
+        if entry.is_directory {
+            create_private_dir_all(&destination).await?;
+            offsets.push(0);
+            continue;
+        }
+        if let Some(parent) = destination.parent() {
+            create_private_dir_all(parent).await?;
+        }
+        let offset = match tokio::fs::symlink_metadata(&destination).await {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err("文件续传缓存包含不安全文件类型".into());
+            }
+            Ok(metadata) if metadata.len() <= entry.size => metadata.len(),
+            Ok(_) => {
+                tokio::fs::remove_file(&destination)
+                    .await
+                    .map_err(|error| format!("无法重置超长续传文件：{error}"))?;
+                0
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(format!("无法检查文件续传状态：{error}")),
+        };
+        offsets.push(offset);
+    }
+    Ok(PartialFileBundle {
+        root,
+        offsets,
+        completed: completed_exists,
+    })
 }
 
 fn validate_file_header(header: &FileBlobHeader) -> Result<(), String> {
@@ -1405,9 +1592,10 @@ async fn receive_file_entries(
     receive: &mut quinn::RecvStream,
     root: &std::path::Path,
     header: &FileBlobHeader,
+    offsets: &[u64],
 ) -> Result<(), String> {
     let mut buffer = vec![0_u8; 64 * 1024];
-    for entry in &header.entries {
+    for (entry, offset) in header.entries.iter().zip(offsets) {
         let relative = safe_relative_path(&entry.relative_path)?;
         let destination = root.join(relative);
         if entry.is_directory {
@@ -1418,7 +1606,7 @@ async fn receive_file_entries(
             create_private_dir_all(parent).await?;
         }
         let mut options = tokio::fs::OpenOptions::new();
-        options.create_new(true).write(true);
+        options.create(true).read(true).write(true);
         #[cfg(unix)]
         {
             options.mode(0o600);
@@ -1426,9 +1614,26 @@ async fn receive_file_entries(
         let mut file = options
             .open(&destination)
             .await
-            .map_err(|error| format!("无法创建接收文件：{error}"))?;
-        let mut remaining = entry.size;
+            .map_err(|error| format!("无法打开接收文件：{error}"))?;
         let mut hash = Sha256::new();
+        let mut prefix_remaining = *offset;
+        while prefix_remaining > 0 {
+            let limit = usize::try_from(prefix_remaining.min(buffer.len() as u64))
+                .map_err(|_| "文件续传前缀大小溢出".to_string())?;
+            let read = file
+                .read(&mut buffer[..limit])
+                .await
+                .map_err(|error| format!("无法校验文件续传前缀：{error}"))?;
+            if read == 0 {
+                return Err("文件续传前缀被意外截断".into());
+            }
+            hash.update(&buffer[..read]);
+            prefix_remaining -= read as u64;
+        }
+        file.seek(std::io::SeekFrom::Start(*offset))
+            .await
+            .map_err(|error| format!("无法定位文件续传写入位置：{error}"))?;
+        let mut remaining = entry.size - *offset;
         while remaining > 0 {
             let limit = usize::try_from(remaining.min(buffer.len() as u64))
                 .map_err(|_| "文件分块大小溢出".to_string())?;
@@ -1447,6 +1652,8 @@ async fn receive_file_entries(
             .await
             .map_err(|error| format!("文件数据提交失败：{error}"))?;
         if HEXLOWER.encode(&hash.finalize()) != entry.sha256.to_ascii_lowercase() {
+            drop(file);
+            let _ = tokio::fs::remove_file(&destination).await;
             return Err(format!("文件 {} 哈希不匹配", entry.relative_path));
         }
     }
@@ -1472,6 +1679,25 @@ async fn create_private_dir_all(path: &std::path::Path) -> Result<(), String> {
             .map_err(|error| format!("无法限制文件缓存目录权限：{error}"))?;
     }
     Ok(())
+}
+
+async fn write_private_file(path: &std::path::Path, contents: &[u8]) -> Result<(), String> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .await
+        .map_err(|error| format!("无法创建私有文件缓存对象：{error}"))?;
+    file.write_all(contents)
+        .await
+        .map_err(|error| format!("无法写入私有文件缓存对象：{error}"))?;
+    file.sync_all()
+        .await
+        .map_err(|error| format!("无法提交私有文件缓存对象：{error}"))
 }
 
 pub(crate) fn start(app: AppHandle) -> Result<TransportHandle, String> {
@@ -1916,7 +2142,7 @@ fn unix_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::identity::Identity;
+    use crate::core::{files::FileEntry, identity::Identity};
 
     #[test]
     fn sas_is_stable_and_six_digits() {
@@ -1954,6 +2180,49 @@ mod tests {
         };
         assert_eq!(issue(), issue());
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn partial_file_bundle_reports_durable_resume_offsets() {
+        let directory = std::env::temp_dir().join(format!(
+            "airdrop-resume-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let temporary = directory.join(".part-transfer");
+        let completed = directory.join("bundle-transfer");
+        let header = FileBlobHeader {
+            schema_version: 1,
+            message_id: uuid::Uuid::new_v4().simple().to_string(),
+            origin_sequence: 11,
+            captured_at: "2026-07-13T00:00:00Z".into(),
+            total_size: 10,
+            entries: vec![FileEntry {
+                relative_path: "folder/payload.txt".into(),
+                size: 10,
+                sha256: HEXLOWER.encode(&Sha256::digest(b"0123456789")),
+                is_directory: false,
+            }],
+            group_ids: vec!["00112233-4455-6677-8899-aabbccddeeff".into()],
+        };
+        let initial = prepare_partial_file_bundle(&temporary, &completed, &header)
+            .await
+            .unwrap();
+        assert_eq!(initial.offsets, vec![0]);
+        tokio::fs::write(initial.root.join("folder/payload.txt"), b"0123")
+            .await
+            .unwrap();
+        let resumed = prepare_partial_file_bundle(&temporary, &completed, &header)
+            .await
+            .unwrap();
+        assert_eq!(resumed.offsets, vec![4]);
+        let mut conflicting = header;
+        conflicting.total_size = 9;
+        assert!(
+            prepare_partial_file_bundle(&temporary, &completed, &conflicting)
+                .await
+                .is_err()
+        );
+        let _ = tokio::fs::remove_dir_all(directory).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2002,16 +2271,38 @@ mod tests {
                 .unwrap()
                 .to_rgba8();
             assert_eq!(decoded.into_raw(), vec![255, 0, 0, 255, 0, 0, 255, 255]);
-            let mut file_stream = connection.accept_uni().await.unwrap();
+            let (mut file_response, mut file_stream) = connection.accept_bi().await.unwrap();
             assert_eq!(file_stream.read_u8().await.unwrap(), FILE_BLOB_KIND);
             let file_header: FileBlobHeader = read_frame(&mut file_stream).await.unwrap();
+            write_frame(
+                &mut file_response,
+                &FileResumePlan {
+                    schema_version: 1,
+                    transfer_id: file_header.message_id.clone(),
+                    offsets: vec![5],
+                },
+            )
+            .await
+            .unwrap();
             let file_bytes = file_stream
                 .read_to_end(MAX_FILE_BUNDLE_BYTES as usize)
                 .await
                 .unwrap();
             assert_eq!(file_header.entries.len(), 1);
-            assert_eq!(file_header.total_size, file_bytes.len() as u64);
-            assert_eq!(file_bytes, b"file over quic");
+            assert_eq!(file_header.total_size, 14);
+            assert_eq!(file_bytes, b"over quic");
+            write_frame(
+                &mut file_response,
+                &FileTransferAck {
+                    schema_version: 1,
+                    transfer_id: file_header.message_id,
+                    accepted: true,
+                    message: None,
+                },
+            )
+            .await
+            .unwrap();
+            file_response.finish().unwrap();
             let mut ack = connection.open_uni().await.unwrap();
             ack.write_all(b"ok").await.unwrap();
             ack.finish().unwrap();
