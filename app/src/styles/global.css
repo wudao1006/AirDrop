@@ -134,6 +134,11 @@ button:disabled { cursor: default; opacity: .58; }
 .page-section > h2 { margin: 0 0 11px; font-size: 15px; }
 .settings-card { padding: 4px 17px; }
 .settings-card h3 { margin: 14px 0 2px; font-size: 13px; }
+.request-banner { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 12px; margin: 18px 28px 0; padding: 11px 13px; border: 1px solid color-mix(in srgb, var(--accent) 32%, var(--border)); border-radius: 16px; color: var(--accent-text); background: color-mix(in srgb, var(--accent-soft) 72%, var(--surface)); box-shadow: inset 0 1px rgba(255,255,255,.48), var(--shadow-sm); }
+.request-banner > svg { color: var(--accent); }
+.request-banner strong, .request-banner span { display: block; }
+.request-banner strong { color: var(--text); font-size: 12px; }
+.request-banner span { margin-top: 2px; color: var(--text-muted); font-size: 10px; }
 .appearance-section { margin-top: 24px; }
 .appearance-section-title { align-items: flex-end; }
 .appearance-section-title > div { min-width: 0; }

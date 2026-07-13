@@ -371,6 +371,20 @@ impl Store {
         Ok(device)
     }
 
+    pub(crate) fn remove_pending_pairing(&self, pairing_id: &str) -> Result<(), String> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "本地数据库锁已损坏".to_string())?;
+        connection
+            .execute(
+                "DELETE FROM pending_pairings WHERE pairing_id = ?1",
+                params![pairing_id],
+            )
+            .map_err(|error| format!("无法清理待确认配对：{error}"))?;
+        Ok(())
+    }
+
     pub(crate) fn trusted_device(&self, device_id: &str) -> Result<Option<TrustedDevice>, String> {
         let connection = self
             .connection
@@ -1120,6 +1134,7 @@ impl Store {
     pub(crate) fn group_invites_for_target(
         &self,
         device_id: &str,
+        now: &str,
     ) -> Result<Vec<StoredGroupInvite>, String> {
         let connection = self
             .connection
@@ -1128,11 +1143,12 @@ impl Store {
         let mut statement = connection
             .prepare(
                 "SELECT invite_id, expires_at, status, manifest_json
-                 FROM group_invites WHERE target_device_id = ?1 AND status = 'sent'",
+                 FROM group_invites
+                 WHERE target_device_id = ?1 AND status = 'sent' AND expires_at > ?2",
             )
             .map_err(|error| format!("无法查询待发送同步组邀请：{error}"))?;
         let rows = statement
-            .query_map(params![device_id], |row| {
+            .query_map(params![device_id, now], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -1154,6 +1170,50 @@ impl Store {
             })
         })
         .collect()
+    }
+
+    pub(crate) fn group_invite_responses_for_owner(
+        &self,
+        owner_device_id: &str,
+    ) -> Result<Vec<StoredGroupInvite>, String> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "本地数据库锁已损坏".to_string())?;
+        let mut statement = connection
+            .prepare(
+                "SELECT invite_id, target_device_id, expires_at, status, manifest_json
+                 FROM group_invites WHERE status IN ('accepted', 'rejected')",
+            )
+            .map_err(|error| format!("无法查询同步组邀请响应：{error}"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(|error| format!("无法读取同步组邀请响应：{error}"))?;
+        let mut invites = Vec::new();
+        for row in rows {
+            let (invite_id, target_device_id, expires_at, status, json) =
+                row.map_err(|error| format!("同步组邀请响应已损坏：{error}"))?;
+            let manifest: SignedGroupManifest = serde_json::from_str(&json)
+                .map_err(|error| format!("同步组邀请响应清单已损坏：{error}"))?;
+            if manifest.manifest.owner_device_id == owner_device_id {
+                invites.push(StoredGroupInvite {
+                    invite_id,
+                    target_device_id,
+                    expires_at,
+                    status,
+                    manifest,
+                });
+            }
+        }
+        Ok(invites)
     }
 
     pub(crate) fn has_accepted_group_invite(
@@ -1340,6 +1400,23 @@ mod tests {
         };
         store.save_group_invite(&invite).unwrap();
         store.save_group_invite(&invite).unwrap();
+        assert_eq!(
+            store
+                .group_invites_for_target(identity.device_id(), "2026-07-13T00:05:00Z")
+                .unwrap()
+                .len(),
+            1
+        );
+        store
+            .set_group_invite_status("invite-1", "accepted")
+            .unwrap();
+        assert_eq!(
+            store
+                .group_invite_responses_for_owner(identity.device_id())
+                .unwrap()[0]
+                .status,
+            "accepted"
+        );
         let conflicting_invite = StoredGroupInvite {
             expires_at: "2026-07-13T00:11:00Z".into(),
             ..invite

@@ -714,13 +714,26 @@ impl ServiceState {
         transport: &super::transport::TransportHandle,
         device_id: &str,
     ) {
-        if let Ok(invites) = self.store.group_invites_for_target(device_id) {
+        if let Ok(invites) = self
+            .store
+            .group_invites_for_target(device_id, &current_time())
+        {
             for invite in invites {
                 let _ = transport.send_group_invite(
                     device_id,
                     invite.invite_id,
                     invite.expires_at,
                     invite.manifest,
+                );
+            }
+        }
+        if let Ok(invites) = self.store.group_invite_responses_for_owner(device_id) {
+            for invite in invites {
+                let _ = transport.send_group_accept(
+                    device_id,
+                    invite.invite_id,
+                    invite.manifest.manifest.group_id,
+                    invite.status == "accepted",
                 );
             }
         }
@@ -1573,6 +1586,21 @@ pub(crate) fn pairing_completed(
     Ok(())
 }
 
+pub(crate) fn pairing_cancelled(
+    state: &ServiceState,
+    app: &AppHandle,
+    pairing_id: &str,
+) -> Result<(), String> {
+    state.store.remove_pending_pairing(pairing_id)?;
+    update(state, app, |snapshot| {
+        snapshot
+            .pending_pairings
+            .retain(|item| item.pairing_id != pairing_id);
+        Ok(())
+    })?;
+    Ok(())
+}
+
 pub(crate) fn set_trusted_online(
     state: &ServiceState,
     app: &AppHandle,
@@ -2242,7 +2270,14 @@ pub(crate) fn receive_group_invite(
         status: "pending".into(),
         manifest,
     };
+    let already_processed = state
+        .store
+        .group_invite(&invite.invite_id)?
+        .is_some_and(|existing| existing.status == "accepted" || existing.status == "rejected");
     state.store.save_group_invite(&invite)?;
+    if already_processed {
+        return Ok(());
+    }
     let view = pending_group_invite_view(&invite);
     update(state, app, |snapshot| {
         snapshot
@@ -2267,12 +2302,6 @@ pub fn confirm_group_invite(
         .group_invite(&invite_id)?
         .filter(|invite| invite.status == "pending" && invite.expires_at > current_time())
         .ok_or_else(|| "同步组邀请不存在或已过期".to_string())?;
-    transport.send_group_accept(
-        &invite.manifest.manifest.owner_device_id,
-        invite_id.clone(),
-        invite.manifest.manifest.group_id.clone(),
-        accepted,
-    )?;
     state
         .store
         .set_group_invite_status(&invite_id, if accepted { "accepted" } else { "rejected" })?;
@@ -2282,6 +2311,12 @@ pub fn confirm_group_invite(
             .retain(|item| item.invite_id != invite_id);
         Ok(())
     })?;
+    let _ = transport.send_group_accept(
+        &invite.manifest.manifest.owner_device_id,
+        invite_id,
+        invite.manifest.manifest.group_id,
+        accepted,
+    );
     Ok(())
 }
 
@@ -2294,15 +2329,25 @@ pub(crate) fn receive_group_accept(
     group_id: &str,
     accepted: bool,
 ) -> Result<(), String> {
-    let _invite = state
+    let invite = state
         .store
         .group_invite(invite_id)?
         .filter(|invite| {
-            invite.status == "sent"
-                && invite.target_device_id == sender_device_id
+            invite.target_device_id == sender_device_id
                 && invite.manifest.manifest.group_id == group_id
         })
         .ok_or_else(|| "同步组接受消息没有匹配邀请".to_string())?;
+    if (invite.status == "accepted" && accepted) || (invite.status == "rejected" && !accepted) {
+        if accepted {
+            if let Some(current) = state.store.group_manifest(group_id)? {
+                let _ = transport.send_group_manifest(sender_device_id, current);
+            }
+        }
+        return Ok(());
+    }
+    if invite.status != "sent" {
+        return Err("同步组邀请已经处理，不能修改选择".into());
+    }
     if !accepted {
         return state.store.set_group_invite_status(invite_id, "rejected");
     }
@@ -2746,8 +2791,7 @@ pub fn begin_pairing(
     if nearby.paired {
         return Err("该设备已经配对".into());
     }
-    transport.connect_pairing(app, nearby);
-    Ok(())
+    transport.connect_pairing(app, nearby)
 }
 
 #[tauri::command]

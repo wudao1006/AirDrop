@@ -6,7 +6,6 @@ import { desktopNavigation } from "../platform/desktop/navigation";
 import { androidNavigation } from "../platform/android/navigation";
 
 export function AppShell({ page, setPage, snapshot, children }: { page: PageId; setPage: (page: PageId) => void; snapshot: UiSnapshot; children: React.ReactNode }) {
-  const attentionCount = snapshot.slots.filter((slot) => slot.availability === "blocked" || slot.availability === "protocol_conflict").length;
   const navigation = snapshot.platform === "android" ? androidNavigation : desktopNavigation;
   return <div className={`app platform-${snapshot.platform}`}>
     {snapshot.platform === "desktop" && <DesktopTitlebar />}
@@ -19,7 +18,8 @@ export function AppShell({ page, setPage, snapshot, children }: { page: PageId; 
         {navigation.map((item) => <button key={item.id} type="button" className={`nav-button ${page === item.id ? "active" : ""}`} aria-current={page === item.id ? "page" : undefined} onClick={() => setPage(item.id)}>
           <Icon name={item.icon} size={18} /><span>{item.label}</span>
           {item.id === "clipboard" && snapshot.imports.some((operation) => operation.status === "awaiting_confirmation") && <span className="nav-count">!</span>}
-          {item.id === "devices" && attentionCount > 0 && <span className="nav-count">{attentionCount}</span>}
+          {item.id === "devices" && snapshot.pendingPairings.length > 0 && <span className="nav-count">{snapshot.pendingPairings.length}</span>}
+          {item.id === "groups" && snapshot.pendingGroupInvites.length > 0 && <span className="nav-count">{snapshot.pendingGroupInvites.length}</span>}
         </button>)}
       </nav>
       <div className="sidebar-footer">

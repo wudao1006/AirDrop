@@ -110,6 +110,7 @@ pub(crate) struct TransportHandle {
     certificate_der: Vec<u8>,
     pairing_allowed_until: Arc<Mutex<u64>>,
     pair_commands: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<bool>>>>,
+    pairing_connecting: Arc<Mutex<HashSet<String>>>,
     peers: Arc<Mutex<HashMap<String, PeerConnection>>>,
     connecting: Arc<Mutex<HashSet<String>>>,
     latest_offer: Arc<Mutex<Option<LocalTextOffer>>>,
@@ -518,13 +519,30 @@ impl TransportHandle {
         )
     }
 
-    pub(crate) fn connect_pairing(&self, app: AppHandle, nearby: service::NearbyDevice) {
+    pub(crate) fn connect_pairing(
+        &self,
+        app: AppHandle,
+        nearby: service::NearbyDevice,
+    ) -> Result<(), String> {
+        let device_id = nearby.device_id.clone();
+        if !self
+            .pairing_connecting
+            .lock()
+            .map_err(|_| "配对连接状态锁已损坏".to_string())?
+            .insert(device_id.clone())
+        {
+            return Err("该设备的配对请求正在进行".into());
+        }
         let handle = self.clone();
         self.runtime.spawn(async move {
             if let Err(error) = handle.connect_pairing_inner(app, nearby).await {
                 tracing::warn!(error = %error, "pairing connection failed");
             }
+            if let Ok(mut connecting) = handle.pairing_connecting.lock() {
+                connecting.remove(&device_id);
+            }
         });
+        Ok(())
     }
 
     pub(crate) fn connect_trusted(&self, app: AppHandle, nearby: service::NearbyDevice) {
@@ -726,6 +744,15 @@ impl TransportHandle {
         let expires_at = (OffsetDateTime::now_utc() + time::Duration::seconds(120))
             .format(&Rfc3339)
             .unwrap_or_else(|_| now());
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        self.pair_commands
+            .lock()
+            .map_err(|_| "配对命令锁已损坏".to_string())?
+            .insert(pairing_id.clone(), command_tx);
+        let _registration = PairCommandRegistration {
+            commands: self.pair_commands.clone(),
+            pairing_id: pairing_id.clone(),
+        };
         {
             let state = app.state::<ServiceState>();
             state.save_pending_pairing(&pairing_id, &device, &expires_at)?;
@@ -744,74 +771,87 @@ impl TransportHandle {
                 },
             )?;
         }
-        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
-        self.pair_commands
-            .lock()
-            .map_err(|_| "配对命令锁已损坏".to_string())?
-            .insert(pairing_id.clone(), command_tx);
-        let _registration = PairCommandRegistration {
-            commands: self.pair_commands.clone(),
-            pairing_id: pairing_id.clone(),
-        };
         let mut local_confirmed = false;
         let mut remote_confirmed = false;
-        let mut complete_sent = false;
-        loop {
-            tokio::select! {
-                command = command_rx.recv() => {
-                    let accepted = command.ok_or_else(|| "配对会话已取消".to_string())?;
-                    write_frame(&mut send, &PairMessage::Confirm {
-                        schema_version: 1,
-                        pairing_id: pairing_id.clone(),
-                        context_hash: context_hash.clone(),
-                        accepted,
-                    }).await?;
-                    if !accepted {
-                        return Err("用户拒绝了配对".into());
-                    }
-                    local_confirmed = true;
-                    let state = app.state::<ServiceState>();
-                    let _ = service::pairing_status(&state, &app, &pairing_id, "waiting_for_peer");
-                }
-                message = read_frame::<PairMessage>(&mut receive) => {
-                    match message? {
-                        PairMessage::Confirm { schema_version: 1, pairing_id: remote_id, context_hash: remote_hash, accepted }
-                            if remote_id == pairing_id && remote_hash == context_hash => {
-                                if !accepted { return Err("对方拒绝了配对".into()); }
-                                remote_confirmed = true;
-                            }
-                        PairMessage::Complete { schema_version: 1, pairing_id: remote_id } if remote_id == pairing_id => {
-                            let paired_at = now();
-                            let nearby = {
-                                let state = app.state::<ServiceState>();
-                                let promoted = state.promote_trusted_device(&pairing_id, &paired_at)?;
-                                service::pairing_completed(&state, &app, &pairing_id, promoted)?;
-                                state.nearby_device(&device.device_id)
-                            };
-                            connection.close(0u32.into(), b"paired");
-                            if let Some(nearby) = nearby {
-                                self.connect_trusted(app.clone(), nearby);
-                            }
-                            return Ok(());
+        let mut pairing_finalized = false;
+        let result: Result<(), String> = async {
+            loop {
+                tokio::select! {
+                    command = command_rx.recv() => {
+                        let accepted = command.ok_or_else(|| "配对会话已取消".to_string())?;
+                        if local_confirmed {
+                            continue;
                         }
-                        PairMessage::Abort { reason, .. } => return Err(reason),
-                        _ => return Err("配对确认消息无效".into()),
+                        write_frame(&mut send, &PairMessage::Confirm {
+                            schema_version: 1,
+                            pairing_id: pairing_id.clone(),
+                            context_hash: context_hash.clone(),
+                            accepted,
+                        }).await?;
+                        if !accepted {
+                            return Err("用户拒绝了配对".into());
+                        }
+                        local_confirmed = true;
+                        let state = app.state::<ServiceState>();
+                        let _ = service::pairing_status(&state, &app, &pairing_id, "waiting_for_peer");
+                    }
+                    message = read_frame::<PairMessage>(&mut receive) => {
+                        match message {
+                            Err(_) if pairing_finalized => return Ok(()),
+                            Err(error) => return Err(error),
+                            Ok(message) => match message {
+                            PairMessage::Confirm { schema_version: 1, pairing_id: remote_id, context_hash: remote_hash, accepted }
+                                if remote_id == pairing_id && remote_hash == context_hash => {
+                                    if !accepted { return Err("对方拒绝了配对".into()); }
+                                    remote_confirmed = true;
+                                    if !local_confirmed {
+                                        let state = app.state::<ServiceState>();
+                                        let _ = service::pairing_status(&state, &app, &pairing_id, "peer_confirmed");
+                                    }
+                            }
+                            PairMessage::Complete { schema_version: 1, pairing_id: remote_id }
+                                if remote_id == pairing_id && pairing_finalized => return Ok(()),
+                            PairMessage::Abort { reason, .. } => return Err(reason),
+                            _ => return Err("配对确认消息无效".into()),
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(if pairing_finalized { 3 } else { 120 })) => {
+                        if pairing_finalized { return Ok(()); }
+                        return Err("配对确认已超时".into());
+                    },
+                }
+                if local_confirmed && remote_confirmed && !pairing_finalized {
+                    let paired_at = now();
+                    let nearby = {
+                        let state = app.state::<ServiceState>();
+                        let promoted = state.promote_trusted_device(&pairing_id, &paired_at)?;
+                        service::pairing_completed(&state, &app, &pairing_id, promoted)?;
+                        state.nearby_device(&device.device_id)
+                    };
+                    pairing_finalized = true;
+                    let _ = write_frame(
+                        &mut send,
+                        &PairMessage::Complete {
+                            schema_version: 1,
+                            pairing_id: pairing_id.clone(),
+                        },
+                    )
+                    .await;
+                    let _ = send.finish();
+                    if let Some(nearby) = nearby {
+                        self.connect_trusted(app.clone(), nearby);
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_secs(120)) => return Err("配对确认已超时".into()),
-            }
-            if local_confirmed && remote_confirmed && !complete_sent {
-                write_frame(
-                    &mut send,
-                    &PairMessage::Complete {
-                        schema_version: 1,
-                        pairing_id: pairing_id.clone(),
-                    },
-                )
-                .await?;
-                complete_sent = true;
             }
         }
+        .await;
+        if result.is_err() {
+            let state = app.state::<ServiceState>();
+            let _ = service::pairing_cancelled(&state, &app, &pairing_id);
+            connection.close(1u32.into(), b"pairing cancelled");
+        }
+        result
     }
 
     async fn run_trusted(
@@ -1032,9 +1072,11 @@ impl TransportHandle {
                 }
             });
         }
+        let writer_connection = connection.clone();
         let writer = tokio::spawn(async move {
             while let Some(message) = outbound.recv().await {
                 if write_frame(&mut send, &message).await.is_err() {
+                    writer_connection.close(1u32.into(), b"trusted writer failed");
                     break;
                 }
             }
@@ -1785,6 +1827,7 @@ pub(crate) fn start(app: AppHandle) -> Result<TransportHandle, String> {
                     certificate_der: certificate_for_thread,
                     pairing_allowed_until: Arc::new(Mutex::new(0)),
                     pair_commands: Arc::new(Mutex::new(HashMap::new())),
+                    pairing_connecting: Arc::new(Mutex::new(HashSet::new())),
                     peers: Arc::new(Mutex::new(HashMap::new())),
                     connecting: Arc::new(Mutex::new(HashSet::new())),
                     latest_offer: Arc::new(Mutex::new(None)),

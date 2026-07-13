@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useState } from "react";
 import type { DesktopClient } from "../ipc/client";
 import type { PageId, UiSnapshot } from "../model";
 import { AppShell } from "./AppShell";
@@ -12,11 +12,14 @@ import { applyAppearanceSettings, subscribeToSystemAppearanceChanges } from "../
 import { useAndroidLifecycle } from "../platform/android/useAndroidLifecycle";
 import { FloatingOrbManager } from "../features/floating/FloatingOrbManager";
 import { listen } from "@tauri-apps/api/event";
+import { Icon } from "../components/Icon";
+import { ErrorToast } from "../components/ErrorToast";
 
 export function App({ client }: { client: DesktopClient }) {
   const [page, setPage] = useState<PageId>("home");
   const [snapshot, setSnapshot] = useState<UiSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const clearError = useCallback(() => setError(null), []);
   useAndroidLifecycle(client);
 
   useEffect(() => {
@@ -66,7 +69,9 @@ export function App({ client }: { client: DesktopClient }) {
 
   return <AppShell page={page} setPage={setPage} snapshot={snapshot}>
     {client.platform === "desktop" && <FloatingOrbManager client={client} snapshot={snapshot} setPage={setPage} onError={setError} />}
-    {error && <div className="toast-error" role="alert">{error}<button type="button" onClick={() => setError(null)}>关闭</button></div>}
+    {error && <ErrorToast message={error} onClose={clearError} />}
+    {page !== "devices" && snapshot.pendingPairings.length > 0 && <div className="request-banner" role="status"><Icon name="shield" size={18} /><div><strong>收到设备配对请求</strong><span>{snapshot.pendingPairings[0].deviceName} 正在等待本机核对验证码</span></div><button type="button" className="button" onClick={() => setPage("devices")}>查看请求</button></div>}
+    {page !== "groups" && snapshot.pendingGroupInvites.length > 0 && <div className="request-banner" role="status"><Icon name="groups" size={18} /><div><strong>收到同步组邀请</strong><span>{snapshot.pendingGroupInvites[0].ownerName} 邀请本机加入“{snapshot.pendingGroupInvites[0].groupName}”</span></div><button type="button" className="button primary" onClick={() => setPage("groups")}>查看并处理</button></div>}
     {content}
   </AppShell>;
 }

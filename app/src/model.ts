@@ -90,7 +90,7 @@ export interface PendingPairing {
   sas: string;
   direction: "incoming" | "outgoing";
   expiresAt: string;
-  status: "awaiting_confirmation" | "waiting_for_peer";
+  status: "awaiting_confirmation" | "peer_confirmed" | "waiting_for_peer";
 }
 
 export type GroupMemberState = "invited" | "active" | "removed";

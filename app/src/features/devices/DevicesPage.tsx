@@ -39,9 +39,9 @@ export function DevicesPage({ snapshot, client, onError }: {
     {!snapshot.daemonConnected && <div className="notice"><Icon name="alert" size={17} /><div><strong>暂时无法连接</strong><p>请重新启动 AirDrop 后再试。</p></div></div>}
 
     {snapshot.pendingPairings.map((pairing) => <section className="pairing-panel" key={pairing.pairingId}>
-      <div className="pairing-panel-copy"><StatusBadge tone="warning" icon="shield">需要双方确认</StatusBadge><h2>{pairing.deviceName}</h2><p>请在两台设备上核对这组六位验证码。不同就立即拒绝，不要继续。</p></div>
+      <div className="pairing-panel-copy"><StatusBadge tone={pairing.status === "peer_confirmed" ? "success" : "warning"} icon="shield">{pairing.status === "peer_confirmed" ? "对方已确认" : "需要双方确认"}</StatusBadge><h2>{pairing.deviceName}</h2><p>{pairing.status === "peer_confirmed" ? "对方已确认验证码一致，请在本机核对后完成配对。" : "请在两台设备上核对这组六位验证码。不同就立即拒绝，不要继续。"}</p></div>
       <div className="pairing-code" aria-label={`配对验证码 ${pairing.sas}`}>{pairing.sas.slice(0, 3)} <span>{pairing.sas.slice(3)}</span></div>
-      <div className="pairing-actions"><button type="button" className="button" onClick={() => execute(() => client.confirmPairing(pairing.pairingId, false))}>不匹配</button><button type="button" className="button primary" disabled={pairing.status === "waiting_for_peer"} onClick={() => execute(() => client.confirmPairing(pairing.pairingId, true))}>{pairing.status === "waiting_for_peer" ? "等待对方确认" : "验证码一致"}</button></div>
+      <div className="pairing-actions"><button type="button" className="button" disabled={pairing.status === "waiting_for_peer"} onClick={() => execute(() => client.confirmPairing(pairing.pairingId, false))}>{pairing.status === "waiting_for_peer" ? "本机已确认" : "不匹配"}</button><button type="button" className="button primary" disabled={pairing.status === "waiting_for_peer"} onClick={() => execute(() => client.confirmPairing(pairing.pairingId, true))}>{pairing.status === "waiting_for_peer" ? "等待对方确认" : pairing.status === "peer_confirmed" ? "确认并完成" : "验证码一致"}</button></div>
     </section>)}
 
     <section className="page-section"><h2>附近设备</h2><div className="card list-card">
