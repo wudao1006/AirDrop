@@ -49,6 +49,7 @@ dependencies = [
  "gethostname",
  "hkdf",
  "hmac",
+ "image",
  "keyring",
  "mdns-sd",
  "quinn",

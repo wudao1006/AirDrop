@@ -11,7 +11,10 @@ use data_encoding::{BASE64, HEXLOWER};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
-use protocol::{read_frame, write_frame, PairMessage, TrustedMessage, PAIR_ALPN, TRUSTED_ALPN};
+use image::{codecs::png::PngEncoder, ExtendedColorType, ImageEncoder};
+use protocol::{
+    read_frame, write_frame, ImageBlobHeader, PairMessage, TrustedMessage, PAIR_ALPN, TRUSTED_ALPN,
+};
 use quinn::{crypto::rustls::QuicClientConfig, Connection, Endpoint};
 use rcgen::{CertificateParams, KeyPair};
 use rustls::{
@@ -31,6 +34,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::sync::mpsc;
 
 type HmacSha256 = Hmac<Sha256>;
+const MAX_IMAGE_BLOB: usize = 16 * 1024 * 1024;
 
 struct PairCommandRegistration {
     commands: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<bool>>>>,
@@ -40,6 +44,15 @@ struct PairCommandRegistration {
 struct PeerConnection {
     sender: mpsc::UnboundedSender<TrustedMessage>,
     connection: Connection,
+}
+
+#[derive(Clone)]
+struct LocalImageOffer {
+    sequence: u64,
+    captured_at: String,
+    width: u32,
+    height: u32,
+    png: Arc<Vec<u8>>,
 }
 
 impl Drop for PairCommandRegistration {
@@ -60,6 +73,7 @@ pub(crate) struct TransportHandle {
     peers: Arc<Mutex<HashMap<String, PeerConnection>>>,
     connecting: Arc<Mutex<HashSet<String>>>,
     latest_offer: Arc<Mutex<Option<TrustedMessage>>>,
+    latest_image: Arc<Mutex<Option<LocalImageOffer>>>,
 }
 
 impl TransportHandle {
@@ -110,6 +124,59 @@ impl TransportHandle {
         }
     }
 
+    pub(crate) fn broadcast_image(
+        &self,
+        sequence: u64,
+        rgba: Vec<u8>,
+        width: u32,
+        height: u32,
+        captured_at: String,
+        enabled_devices: &HashSet<String>,
+    ) {
+        let mut png = Vec::new();
+        if PngEncoder::new(&mut png)
+            .write_image(&rgba, width, height, ExtendedColorType::Rgba8)
+            .is_err()
+            || png.len() > MAX_IMAGE_BLOB
+        {
+            tracing::warn!(
+                width,
+                height,
+                "clipboard image could not be encoded within limit"
+            );
+            return;
+        }
+        let offer = LocalImageOffer {
+            sequence,
+            captured_at,
+            width,
+            height,
+            png: Arc::new(png),
+        };
+        if let Ok(mut latest) = self.latest_image.lock() {
+            *latest = Some(offer.clone());
+        }
+        let connections = self
+            .peers
+            .lock()
+            .map(|peers| {
+                peers
+                    .iter()
+                    .filter(|(device_id, _)| enabled_devices.contains(*device_id))
+                    .map(|(_, peer)| peer.connection.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for connection in connections {
+            let offer = offer.clone();
+            self.runtime.spawn(async move {
+                if let Err(error) = send_image_blob(connection, offer).await {
+                    tracing::debug!(error = %error, "clipboard image send failed");
+                }
+            });
+        }
+    }
+
     pub(crate) fn disable_peer(&self, device_id: &str) {
         if let Ok(mut peers) = self.peers.lock() {
             if let Some(peer) = peers.remove(device_id) {
@@ -122,8 +189,14 @@ impl TransportHandle {
         }
     }
 
-    pub(crate) fn clear_latest_offer(&self) {
+    pub(crate) fn clear_latest_text(&self) {
         if let Ok(mut latest) = self.latest_offer.lock() {
+            *latest = None;
+        }
+    }
+
+    pub(crate) fn clear_latest_image(&self) {
+        if let Ok(mut latest) = self.latest_image.lock() {
             *latest = None;
         }
     }
@@ -501,6 +574,19 @@ impl TransportHandle {
                 }
             }
         }
+        if let Some(image) = self
+            .latest_image
+            .lock()
+            .ok()
+            .and_then(|latest| latest.clone())
+        {
+            let connection = connection.clone();
+            self.runtime.spawn(async move {
+                if let Err(error) = send_image_blob(connection, image).await {
+                    tracing::debug!(error = %error, "cached clipboard image send failed");
+                }
+            });
+        }
         let writer = tokio::spawn(async move {
             while let Some(message) = outbound.recv().await {
                 if write_frame(&mut send, &message).await.is_err() {
@@ -508,6 +594,11 @@ impl TransportHandle {
                 }
             }
         });
+        let blob_reader = tokio::spawn(receive_image_blobs(
+            app.clone(),
+            connection.clone(),
+            trusted.clone(),
+        ));
         loop {
             match read_frame::<TrustedMessage>(&mut receive).await {
                 Ok(TrustedMessage::ClipboardSlotOffer {
@@ -532,6 +623,7 @@ impl TransportHandle {
                 Ok(_) => return Err("可信连接收到意外消息".into()),
                 Err(error) => {
                     writer.abort();
+                    blob_reader.abort();
                     if let Ok(mut peers) = self.peers.lock() {
                         let is_current = peers.get(&device_id).is_some_and(|peer| {
                             peer.connection.stable_id() == connection.stable_id()
@@ -546,6 +638,81 @@ impl TransportHandle {
                     return Err(error);
                 }
             }
+        }
+    }
+}
+
+async fn send_image_blob(connection: Connection, offer: LocalImageOffer) -> Result<(), String> {
+    let mut send = connection
+        .open_uni()
+        .await
+        .map_err(|error| format!("无法打开图片数据流：{error}"))?;
+    let header = ImageBlobHeader {
+        schema_version: 1,
+        message_id: uuid::Uuid::new_v4().simple().to_string(),
+        origin_sequence: offer.sequence,
+        captured_at: offer.captured_at,
+        width: offer.width,
+        height: offer.height,
+        png_length: offer.png.len() as u64,
+        sha256: HEXLOWER.encode(&Sha256::digest(offer.png.as_slice())),
+    };
+    write_frame(&mut send, &header).await?;
+    send.write_all(offer.png.as_slice())
+        .await
+        .map_err(|error| format!("图片数据发送失败：{error}"))?;
+    send.finish()
+        .map_err(|error| format!("图片数据流结束失败：{error}"))
+}
+
+async fn receive_image_blobs(app: AppHandle, connection: Connection, device: TrustedDevice) {
+    loop {
+        let mut receive = match connection.accept_uni().await {
+            Ok(receive) => receive,
+            Err(_) => return,
+        };
+        let result = async {
+            let header: ImageBlobHeader = read_frame(&mut receive).await?;
+            if header.schema_version != 1
+                || header.png_length == 0
+                || header.png_length as usize > MAX_IMAGE_BLOB
+                || header.width == 0
+                || header.height == 0
+            {
+                return Err("图片数据流头无效".to_string());
+            }
+            let png = receive
+                .read_to_end(MAX_IMAGE_BLOB)
+                .await
+                .map_err(|error| format!("图片数据读取失败：{error}"))?;
+            if png.len() as u64 != header.png_length
+                || HEXLOWER.encode(&Sha256::digest(&png)) != header.sha256
+            {
+                return Err("图片数据长度或哈希不匹配".into());
+            }
+            let decoded = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+                .map_err(|error| format!("图片数据解码失败：{error}"))?
+                .to_rgba8();
+            if decoded.width() != header.width || decoded.height() != header.height {
+                return Err("图片数据尺寸与声明不匹配".into());
+            }
+            let state = app.state::<ServiceState>();
+            service::receive_remote_image(
+                &state,
+                &app,
+                &device,
+                service::RemoteImage {
+                    sequence: header.origin_sequence,
+                    rgba: decoded.into_raw(),
+                    width: header.width,
+                    height: header.height,
+                    captured_at: header.captured_at,
+                },
+            )
+        }
+        .await;
+        if let Err(error) = result {
+            tracing::warn!(device_id = %device.device_id, error = %error, "remote clipboard image rejected");
         }
     }
 }
@@ -599,6 +766,7 @@ pub(crate) fn start(app: AppHandle) -> Result<TransportHandle, String> {
                     peers: Arc::new(Mutex::new(HashMap::new())),
                     connecting: Arc::new(Mutex::new(HashSet::new())),
                     latest_offer: Arc::new(Mutex::new(None)),
+                    latest_image: Arc::new(Mutex::new(None)),
                 };
                 let _ = ready_tx.send(Ok(handle.clone()));
                 while let Some(incoming) = endpoint.accept().await {
@@ -1064,6 +1232,19 @@ mod tests {
             ));
             write_frame(&mut send, &message).await.unwrap();
             send.finish().unwrap();
+            let mut image_stream = connection.accept_uni().await.unwrap();
+            let header: ImageBlobHeader = read_frame(&mut image_stream).await.unwrap();
+            let png = image_stream.read_to_end(MAX_IMAGE_BLOB).await.unwrap();
+            assert_eq!(header.width, 2);
+            assert_eq!(header.height, 1);
+            assert_eq!(header.png_length, png.len() as u64);
+            let decoded = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+                .unwrap()
+                .to_rgba8();
+            assert_eq!(decoded.into_raw(), vec![255, 0, 0, 255, 0, 0, 255, 255]);
+            let mut ack = connection.open_uni().await.unwrap();
+            ack.write_all(b"ok").await.unwrap();
+            ack.finish().unwrap();
             connection.closed().await;
         });
 
@@ -1092,6 +1273,25 @@ mod tests {
                 ..
             } if text == "hello over quic"
         ));
+        let rgba = vec![255, 0, 0, 255, 0, 0, 255, 255];
+        let mut png = Vec::new();
+        PngEncoder::new(&mut png)
+            .write_image(&rgba, 2, 1, ExtendedColorType::Rgba8)
+            .unwrap();
+        send_image_blob(
+            connection.clone(),
+            LocalImageOffer {
+                sequence: 8,
+                captured_at: "2026-07-13T00:00:01Z".into(),
+                width: 2,
+                height: 1,
+                png: Arc::new(png),
+            },
+        )
+        .await
+        .unwrap();
+        let mut ack = connection.accept_uni().await.unwrap();
+        assert_eq!(ack.read_to_end(2).await.unwrap(), b"ok");
         client.close(0u32.into(), b"done");
         server_task.await.unwrap();
         let _ = std::fs::remove_dir_all(directory);

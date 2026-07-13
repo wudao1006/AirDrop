@@ -5,6 +5,7 @@ use super::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{collections::HashMap, path::Path, sync::Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_clipboard_manager::ClipboardExt;
@@ -116,6 +117,24 @@ pub struct PendingPairing {
     pub(crate) direction: String,
     pub(crate) expires_at: String,
     pub(crate) status: String,
+}
+
+#[derive(Clone)]
+enum RemoteClipboardBody {
+    Text(String),
+    Image {
+        rgba: Vec<u8>,
+        width: u32,
+        height: u32,
+    },
+}
+
+pub(crate) struct RemoteImage {
+    pub(crate) sequence: u64,
+    pub(crate) rgba: Vec<u8>,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) captured_at: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -249,8 +268,9 @@ pub struct ServiceState {
     snapshot: Mutex<UiSnapshot>,
     store: Store,
     identity: Identity,
-    remote_bodies: Mutex<HashMap<String, String>>,
+    remote_bodies: Mutex<HashMap<String, RemoteClipboardBody>>,
     suppress_next_capture: Mutex<Option<String>>,
+    suppress_next_image: Mutex<Option<[u8; 32]>>,
     clipboard_cache: ClipboardCache,
 }
 
@@ -290,7 +310,8 @@ impl ServiceState {
                             false,
                             "stale",
                         );
-                        remote_bodies.insert(slot.id.clone(), cached.text);
+                        remote_bodies
+                            .insert(slot.id.clone(), RemoteClipboardBody::Text(cached.text));
                         snapshot.slots.push(slot);
                     }
                     Ok(_) => {
@@ -308,6 +329,7 @@ impl ServiceState {
             identity,
             remote_bodies: Mutex::new(remote_bodies),
             suppress_next_capture: Mutex::new(None),
+            suppress_next_image: Mutex::new(None),
             clipboard_cache,
         })
     }
@@ -440,6 +462,52 @@ fn text_slot(
     }
 }
 
+fn image_slot(
+    device: &TrustedDevice,
+    sequence: u64,
+    rgba_len: usize,
+    width: u32,
+    height: u32,
+    captured_at: String,
+) -> DeviceSlot {
+    DeviceSlot {
+        id: format!("device:{}", device.device_id),
+        revision: sequence,
+        device_id: device.device_id.clone(),
+        device_name: device.device_name.clone(),
+        platform: device.platform.clone(),
+        online: true,
+        pinned: None,
+        availability: "ready".into(),
+        preview: format!("图片 · {width} × {height}"),
+        captured_at,
+        age_label: "刚刚".into(),
+        groups: vec!["直接配对".into()],
+        sequence,
+        size: rgba_len as u64,
+        representations: vec![ClipboardRepresentation {
+            id: "image/rgba".into(),
+            kind: "image".into(),
+            label: "图片".into(),
+            mime: "image/png".into(),
+            size: rgba_len as u64,
+            status: "ready".into(),
+            enabled: true,
+        }],
+        blocked_reason: None,
+        progress: None,
+    }
+}
+
+pub(crate) fn image_hash(rgba: &[u8], width: u32, height: u32) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"localdrop-clipboard-image-v1\0");
+    hash.update(width.to_be_bytes());
+    hash.update(height.to_be_bytes());
+    hash.update(rgba);
+    hash.finalize().into()
+}
+
 fn unix_seconds() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -496,6 +564,63 @@ pub fn capture_local_clipboard(
         if let Some(transport) = app.try_state::<super::transport::TransportHandle>() {
             let enabled_devices = state.enabled_device_ids()?;
             transport.broadcast_text(sequence, text, now, &enabled_devices);
+        }
+    }
+    Ok(())
+}
+
+pub fn capture_local_image(
+    state: &ServiceState,
+    app: &AppHandle,
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+    now: String,
+) -> Result<(), String> {
+    let expected_length = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| "图片尺寸溢出".to_string())?;
+    if width == 0 || height == 0 || rgba.len() != expected_length {
+        return Err("系统剪贴板图片格式无效".into());
+    }
+    if rgba.len() > 64 * 1024 * 1024 {
+        return Err("剪贴板图片超过 64 MiB，已跳过同步".into());
+    }
+    let hash = image_hash(&rgba, width, height);
+    let suppress_publish = {
+        let mut suppressed = state
+            .suppress_next_image
+            .lock()
+            .map_err(|_| "图片剪贴板回环抑制锁已损坏".to_string())?;
+        if suppressed.as_ref() == Some(&hash) {
+            *suppressed = None;
+            true
+        } else {
+            false
+        }
+    };
+    let snapshot = update(state, app, |snapshot| {
+        if !suppress_publish {
+            snapshot.current_clipboard = CurrentClipboard {
+                source: "local".into(),
+                source_label: "来自本机系统剪贴板".into(),
+                preview: format!("图片 · {width} × {height}"),
+                types: vec!["图片".into()],
+                changed_at: now.clone(),
+            };
+        }
+        if !snapshot.publish_paused && snapshot.settings.allow_images && !suppress_publish {
+            snapshot.last_published_preview = format!("本机最近捕获：图片 {width} × {height}");
+        }
+        snapshot.last_synchronized_at = now.clone();
+        Ok(())
+    })?;
+    if !snapshot.publish_paused && snapshot.settings.allow_images && !suppress_publish {
+        let sequence = state.store.next_origin_sequence()?;
+        if let Some(transport) = app.try_state::<super::transport::TransportHandle>() {
+            let enabled_devices = state.enabled_device_ids()?;
+            transport.broadcast_image(sequence, rgba, width, height, now, &enabled_devices);
         }
     }
     Ok(())
@@ -683,7 +808,7 @@ pub(crate) fn receive_remote_text(
             .remote_bodies
             .lock()
             .map_err(|_| "远端正文缓存锁已损坏".to_string())?;
-        bodies.insert(slot_id.clone(), text.clone());
+        bodies.insert(slot_id.clone(), RemoteClipboardBody::Text(text.clone()));
     }
     match state.clipboard_cache.store(&CachedText {
         device_id: device.device_id.clone(),
@@ -730,6 +855,80 @@ pub(crate) fn receive_remote_text(
             .retain(|item| item.device_id != device.device_id);
         snapshot.slots.push(slot);
         snapshot.last_synchronized_at = captured_at;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+pub(crate) fn receive_remote_image(
+    state: &ServiceState,
+    app: &AppHandle,
+    device: &TrustedDevice,
+    image: RemoteImage,
+) -> Result<(), String> {
+    let expected_length = (image.width as usize)
+        .checked_mul(image.height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| "远端图片尺寸溢出".to_string())?;
+    if image.width == 0
+        || image.height == 0
+        || image.rgba.len() != expected_length
+        || image.rgba.len() > 64 * 1024 * 1024
+    {
+        return Err("远端图片格式或大小无效".into());
+    }
+    if !state
+        .trusted_device(&device.device_id)?
+        .is_some_and(|trusted| trusted.sync_enabled)
+    {
+        return Err("该设备的剪贴板同步已停用".into());
+    }
+    {
+        let snapshot = state
+            .snapshot
+            .lock()
+            .map_err(|_| "Rust 服务状态锁已损坏".to_string())?;
+        if snapshot.subscribe_paused || !snapshot.settings.allow_images {
+            return Err("本机策略已停用图片同步".into());
+        }
+        if snapshot
+            .slots
+            .iter()
+            .find(|slot| slot.device_id == device.device_id)
+            .is_some_and(|slot| image.sequence <= slot.sequence)
+        {
+            return Ok(());
+        }
+    }
+    let slot_id = format!("device:{}", device.device_id);
+    state
+        .remote_bodies
+        .lock()
+        .map_err(|_| "远端正文缓存锁已损坏".to_string())?
+        .insert(
+            slot_id,
+            RemoteClipboardBody::Image {
+                rgba: image.rgba.clone(),
+                width: image.width,
+                height: image.height,
+            },
+        );
+    if let Some(object_name) = state.store.remove_cached_slot(&device.device_id)? {
+        state.clipboard_cache.remove(&object_name);
+    }
+    update(state, app, |snapshot| {
+        snapshot
+            .slots
+            .retain(|slot| slot.device_id != device.device_id);
+        snapshot.slots.push(image_slot(
+            device,
+            image.sequence,
+            image.rgba.len(),
+            image.width,
+            image.height,
+            image.captured_at.clone(),
+        ));
+        snapshot.last_synchronized_at = image.captured_at;
         Ok(())
     })?;
     Ok(())
@@ -1000,23 +1199,42 @@ pub fn update_settings(
             });
             snapshot.imports.clear();
         }
+        if !snapshot.settings.allow_images {
+            snapshot.slots.retain(|slot| {
+                !slot
+                    .representations
+                    .iter()
+                    .any(|representation| representation.kind == "image")
+            });
+            snapshot.imports.clear();
+        }
         Ok(())
     })?;
     state.store.save_settings(&snapshot.settings)?;
     if !snapshot.settings.allow_text {
         if let Some(transport) = app.try_state::<super::transport::TransportHandle>() {
-            transport.clear_latest_offer();
+            transport.clear_latest_text();
         }
-        state
-            .remote_bodies
-            .lock()
-            .map_err(|_| "远端正文缓存锁已损坏".to_string())?
-            .clear();
         for device in state.store.trusted_devices()? {
             if let Some(object_name) = state.store.remove_cached_slot(&device.device_id)? {
                 state.clipboard_cache.remove(&object_name);
             }
         }
+    }
+    if !snapshot.settings.allow_images {
+        if let Some(transport) = app.try_state::<super::transport::TransportHandle>() {
+            transport.clear_latest_image();
+        }
+    }
+    if !snapshot.settings.allow_text || !snapshot.settings.allow_images {
+        state
+            .remote_bodies
+            .lock()
+            .map_err(|_| "远端正文缓存锁已损坏".to_string())?
+            .retain(|_, body| match body {
+                RemoteClipboardBody::Text(_) => snapshot.settings.allow_text,
+                RemoteClipboardBody::Image { .. } => snapshot.settings.allow_images,
+            });
     }
     Ok(())
 }
@@ -1038,8 +1256,13 @@ pub fn create_import_intent(
         .find(|slot| slot.id == slot_id && slot.revision == revision)
         .cloned()
         .ok_or_else(|| "设备槽位不存在或已经更新".to_string())?;
-    if !snapshot.settings.allow_text {
-        return Err("本机策略已停用纯文本取用".into());
+    let is_image = slot
+        .representations
+        .iter()
+        .any(|representation| representation.kind == "image");
+    if (is_image && !snapshot.settings.allow_images) || (!is_image && !snapshot.settings.allow_text)
+    {
+        return Err("本机策略已停用此内容类型的取用".into());
     }
     let bodies = state
         .remote_bodies
@@ -1072,7 +1295,7 @@ pub fn confirm_import(
     app: AppHandle,
     import_id: String,
 ) -> Result<(), String> {
-    let (slot_id, text) = {
+    let (slot_id, body) = {
         let snapshot = state
             .snapshot
             .lock()
@@ -1086,25 +1309,48 @@ pub fn confirm_import(
             .remote_bodies
             .lock()
             .map_err(|_| "远端正文缓存锁已损坏".to_string())?;
-        let text = bodies
+        let body = bodies
             .get(&operation.slot_id)
             .cloned()
             .ok_or_else(|| "远端正文已经不可用".to_string())?;
-        (operation.slot_id.clone(), text)
+        (operation.slot_id.clone(), body)
     };
-    {
-        *state
-            .suppress_next_capture
-            .lock()
-            .map_err(|_| "剪贴板回环抑制锁已损坏".to_string())? = Some(text.clone());
-    }
-    if let Err(error) = app.clipboard().write_text(&text) {
-        *state
-            .suppress_next_capture
-            .lock()
-            .map_err(|_| "剪贴板回环抑制锁已损坏".to_string())? = None;
-        return Err(format!("无法写入本机系统剪贴板：{error}"));
-    }
+    let (preview, types) = match &body {
+        RemoteClipboardBody::Text(text) => {
+            *state
+                .suppress_next_capture
+                .lock()
+                .map_err(|_| "剪贴板回环抑制锁已损坏".to_string())? = Some(text.clone());
+            if let Err(error) = app.clipboard().write_text(text) {
+                *state
+                    .suppress_next_capture
+                    .lock()
+                    .map_err(|_| "剪贴板回环抑制锁已损坏".to_string())? = None;
+                return Err(format!("无法写入本机系统剪贴板：{error}"));
+            }
+            (truncate_text(text, 4096), vec!["纯文本".into()])
+        }
+        RemoteClipboardBody::Image {
+            rgba,
+            width,
+            height,
+        } => {
+            *state
+                .suppress_next_image
+                .lock()
+                .map_err(|_| "图片剪贴板回环抑制锁已损坏".to_string())? =
+                Some(image_hash(rgba, *width, *height));
+            let image = tauri::image::Image::new_owned(rgba.clone(), *width, *height);
+            if let Err(error) = app.clipboard().write_image(&image) {
+                *state
+                    .suppress_next_image
+                    .lock()
+                    .map_err(|_| "图片剪贴板回环抑制锁已损坏".to_string())? = None;
+                return Err(format!("无法写入本机图片剪贴板：{error}"));
+            }
+            (format!("图片 · {width} × {height}"), vec!["图片".into()])
+        }
+    };
     update(&state, &app, |snapshot| {
         if let Some(operation) = snapshot
             .imports
@@ -1116,8 +1362,8 @@ pub fn confirm_import(
             snapshot.current_clipboard = CurrentClipboard {
                 source: "remote".into(),
                 source_label: format!("取自 {}", operation.device_name),
-                preview: truncate_text(&text, 4096),
-                types: vec!["纯文本".into()],
+                preview: preview.clone(),
+                types: types.clone(),
                 changed_at: time::OffsetDateTime::now_utc()
                     .format(&time::format_description::well_known::Rfc3339)
                     .unwrap_or_else(|_| "1970-01-01T00:00:00Z".into()),

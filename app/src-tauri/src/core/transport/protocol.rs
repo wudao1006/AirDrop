@@ -67,6 +67,19 @@ pub(crate) enum TrustedMessage {
     },
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ImageBlobHeader {
+    pub(crate) schema_version: u8,
+    pub(crate) message_id: String,
+    pub(crate) origin_sequence: u64,
+    pub(crate) captured_at: String,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) png_length: u64,
+    pub(crate) sha256: String,
+}
+
 pub(crate) async fn write_frame<T: Serialize>(
     send: &mut quinn::SendStream,
     value: &T,
