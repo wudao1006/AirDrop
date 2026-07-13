@@ -1,5 +1,6 @@
 pub(crate) mod cache;
 pub(crate) mod discovery;
+pub(crate) mod files;
 pub(crate) mod group;
 pub(crate) mod identity;
 pub(crate) mod logging;

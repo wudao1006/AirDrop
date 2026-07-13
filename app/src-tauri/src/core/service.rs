@@ -1,5 +1,6 @@
 use super::{
     cache::{CachedText, ClipboardCache},
+    files::{prepare_file_cache, stage_file_bundle, ReceivedFileBundle},
     group::{
         GroupManifest, GroupMember, GroupPolicy, GroupTombstone, MemberState, SignedGroupManifest,
         SignedGroupTombstone, SyncDirection, GROUP_ENCODING_VERSION, MAX_GROUP_MEMBERS,
@@ -14,7 +15,11 @@ use data_encoding::BASE64;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, path::Path, sync::Mutex};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
@@ -176,6 +181,12 @@ pub struct UpdateGroupPolicyInput {
 #[derive(Clone)]
 enum RemoteClipboardBody {
     Text(String),
+    Rich {
+        text: String,
+        html: Option<String>,
+        rtf: Option<String>,
+    },
+    Files(Arc<ReceivedFileBundle>),
     Image {
         rgba: Vec<u8>,
         width: u32,
@@ -190,6 +201,23 @@ pub(crate) struct RemoteImage {
     pub(crate) height: u32,
     pub(crate) captured_at: String,
     pub(crate) group_ids: Vec<String>,
+}
+
+pub(crate) struct RemoteRich {
+    pub(crate) sequence: u64,
+    pub(crate) text: String,
+    pub(crate) html: Option<String>,
+    pub(crate) rtf: Option<String>,
+    pub(crate) captured_at: String,
+    pub(crate) group_ids: Vec<String>,
+}
+
+pub(crate) struct RemoteFiles {
+    pub(crate) sequence: u64,
+    pub(crate) bundle: Arc<ReceivedFileBundle>,
+    pub(crate) captured_at: String,
+    pub(crate) group_ids: Vec<String>,
+    pub(crate) total_size: u64,
 }
 
 struct SlotGroups {
@@ -334,8 +362,12 @@ pub struct ServiceState {
     identity: Identity,
     remote_bodies: Mutex<HashMap<String, RemoteClipboardBody>>,
     suppress_next_capture: Mutex<Option<String>>,
+    suppress_next_rich: Mutex<Option<[u8; 32]>>,
     suppress_next_image: Mutex<Option<[u8; 32]>>,
+    suppress_next_files: Mutex<Option<[u8; 32]>>,
     clipboard_cache: ClipboardCache,
+    file_cache_root: PathBuf,
+    imported_files: Mutex<Option<Arc<ReceivedFileBundle>>>,
 }
 
 impl ServiceState {
@@ -346,6 +378,8 @@ impl ServiceState {
         let runtime = store.load_runtime()?;
         let trusted_devices = store.trusted_devices()?;
         let clipboard_cache = ClipboardCache::open(data_dir);
+        let file_cache_root = data_dir.join("cache").join("files");
+        prepare_file_cache(&file_cache_root);
         let mut snapshot = UiSnapshot::initial(settings, runtime, trusted_devices.clone());
         snapshot.cache_persistent = clipboard_cache.available();
         let manifests = store.group_manifests()?;
@@ -427,8 +461,12 @@ impl ServiceState {
             identity,
             remote_bodies: Mutex::new(remote_bodies),
             suppress_next_capture: Mutex::new(None),
+            suppress_next_rich: Mutex::new(None),
             suppress_next_image: Mutex::new(None),
+            suppress_next_files: Mutex::new(None),
             clipboard_cache,
+            file_cache_root,
+            imported_files: Mutex::new(None),
         })
     }
 
@@ -442,6 +480,10 @@ impl ServiceState {
 
     pub(crate) fn identity(&self) -> &Identity {
         &self.identity
+    }
+
+    pub(crate) fn incoming_files_root(&self) -> PathBuf {
+        self.file_cache_root.join("incoming")
     }
 
     pub(crate) fn trusted_device(&self, device_id: &str) -> Result<Option<TrustedDevice>, String> {
@@ -544,6 +586,63 @@ impl ServiceState {
             group_ids,
             content_type,
         )
+    }
+
+    pub(crate) fn validate_incoming_offer(
+        &self,
+        origin_device_id: &str,
+        group_ids: &[String],
+        content_type: &str,
+    ) -> Result<(), String> {
+        self.validate_group_delivery(origin_device_id, group_ids, content_type)?;
+        let snapshot = self
+            .snapshot
+            .lock()
+            .map_err(|_| "Rust 服务状态锁已损坏".to_string())?;
+        let enabled = match content_type {
+            "text" => snapshot.settings.allow_text,
+            "image" => snapshot.settings.allow_images,
+            "html" => snapshot.settings.allow_html,
+            "files" => snapshot.settings.allow_files,
+            _ => false,
+        };
+        if snapshot.subscribe_paused || !enabled {
+            return Err("本机策略已停用此内容类型的接收".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_incoming_sequence(
+        &self,
+        origin_device_id: &str,
+        sequence: u64,
+    ) -> Result<(), String> {
+        let snapshot = self
+            .snapshot
+            .lock()
+            .map_err(|_| "Rust 服务状态锁已损坏".to_string())?;
+        if snapshot
+            .slots
+            .iter()
+            .find(|slot| slot.device_id == origin_device_id)
+            .is_some_and(|slot| sequence <= slot.sequence)
+        {
+            return Err("远端剪贴板数据流已经过期".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn can_publish_content(&self, content_type: &str) -> bool {
+        self.snapshot.lock().ok().is_some_and(|snapshot| {
+            !snapshot.publish_paused
+                && match content_type {
+                    "text" => snapshot.settings.allow_text,
+                    "image" => snapshot.settings.allow_images,
+                    "html" => snapshot.settings.allow_html,
+                    "files" => snapshot.settings.allow_files,
+                    _ => false,
+                }
+        })
     }
 
     pub(crate) fn replay_group_state(
@@ -754,12 +853,137 @@ fn image_slot(
     }
 }
 
+fn rich_slot(device: &TrustedDevice, rich: &RemoteRich, groups: SlotGroups) -> DeviceSlot {
+    let mut representations = vec![ClipboardRepresentation {
+        id: "text/plain".into(),
+        kind: "text".into(),
+        label: "纯文本降级".into(),
+        mime: "text/plain;charset=utf-8".into(),
+        size: rich.text.len() as u64,
+        status: "ready".into(),
+        enabled: true,
+    }];
+    if let Some(html) = &rich.html {
+        representations.push(ClipboardRepresentation {
+            id: "text/html".into(),
+            kind: "html".into(),
+            label: "HTML".into(),
+            mime: "text/html;charset=utf-8".into(),
+            size: html.len() as u64,
+            status: "ready".into(),
+            enabled: true,
+        });
+    }
+    if let Some(rtf) = &rich.rtf {
+        representations.push(ClipboardRepresentation {
+            id: "text/rtf".into(),
+            kind: "html".into(),
+            label: "RTF".into(),
+            mime: "text/rtf".into(),
+            size: rtf.len() as u64,
+            status: "ready".into(),
+            enabled: true,
+        });
+    }
+    DeviceSlot {
+        id: format!("device:{}", device.device_id),
+        revision: rich.sequence,
+        device_id: device.device_id.clone(),
+        device_name: device.device_name.clone(),
+        platform: device.platform.clone(),
+        online: true,
+        pinned: None,
+        availability: "ready".into(),
+        preview: truncate_text(&rich.text, 4096),
+        captured_at: rich.captured_at.clone(),
+        age_label: "刚刚".into(),
+        groups: groups.names,
+        group_ids: groups.ids,
+        sequence: rich.sequence,
+        size: representations.iter().map(|item| item.size).sum(),
+        representations,
+        blocked_reason: None,
+        progress: None,
+    }
+}
+
+fn file_slot(
+    device: &TrustedDevice,
+    files: &RemoteFiles,
+    preview_names: bool,
+    groups: SlotGroups,
+) -> DeviceSlot {
+    let names = files.bundle.display_names();
+    let count = names.len();
+    let preview = if preview_names && !names.is_empty() {
+        truncate_text(&names.join("、"), 4096)
+    } else {
+        format!("{count} 个文件或目录")
+    };
+    DeviceSlot {
+        id: format!("device:{}", device.device_id),
+        revision: files.sequence,
+        device_id: device.device_id.clone(),
+        device_name: device.device_name.clone(),
+        platform: device.platform.clone(),
+        online: true,
+        pinned: None,
+        availability: "ready".into(),
+        preview,
+        captured_at: files.captured_at.clone(),
+        age_label: "刚刚".into(),
+        groups: groups.names,
+        group_ids: groups.ids,
+        sequence: files.sequence,
+        size: files.total_size,
+        representations: vec![ClipboardRepresentation {
+            id: "application/x-localdrop-files".into(),
+            kind: "files".into(),
+            label: format!("{count} 个文件或目录"),
+            mime: "application/x-localdrop-files".into(),
+            size: files.total_size,
+            status: "ready".into(),
+            enabled: true,
+        }],
+        blocked_reason: None,
+        progress: None,
+    }
+}
+
 pub(crate) fn image_hash(rgba: &[u8], width: u32, height: u32) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(b"localdrop-clipboard-image-v1\0");
     hash.update(width.to_be_bytes());
     hash.update(height.to_be_bytes());
     hash.update(rgba);
+    hash.finalize().into()
+}
+
+pub(crate) fn rich_hash(text: &str, html: Option<&str>, rtf: Option<&str>) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"localdrop-rich-clipboard-v1\0");
+    hash.update((text.len() as u64).to_be_bytes());
+    hash.update(text.as_bytes());
+    for value in [html, rtf] {
+        match value {
+            Some(value) => {
+                hash.update([1]);
+                hash.update((value.len() as u64).to_be_bytes());
+                hash.update(value.as_bytes());
+            }
+            None => hash.update([0]),
+        }
+    }
+    hash.finalize().into()
+}
+
+pub(crate) fn file_list_hash(files: &[String]) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"localdrop-file-list-v1\0");
+    for file in files {
+        hash.update((file.len() as u64).to_be_bytes());
+        hash.update(file.as_bytes());
+    }
     hash.finalize().into()
 }
 
@@ -860,6 +1084,144 @@ pub fn capture_local_clipboard(
     Ok(())
 }
 
+pub fn capture_local_rich(
+    state: &ServiceState,
+    app: &AppHandle,
+    text: String,
+    html: Option<String>,
+    rtf: Option<String>,
+    now: String,
+) -> Result<(), String> {
+    let total_size = text
+        .len()
+        .saturating_add(html.as_ref().map_or(0, String::len))
+        .saturating_add(rtf.as_ref().map_or(0, String::len));
+    if html.is_none() && rtf.is_none() {
+        return capture_local_clipboard(state, app, text, now);
+    }
+    if total_size > 1024 * 1024 {
+        return report_clipboard_failure(state, app, "富文本剪贴板超过 1 MiB，已跳过同步".into());
+    }
+    let hash = rich_hash(&text, html.as_deref(), rtf.as_deref());
+    let suppress_publish = {
+        let mut suppressed = state
+            .suppress_next_rich
+            .lock()
+            .map_err(|_| "富文本剪贴板回环抑制锁已损坏".to_string())?;
+        if suppressed.as_ref() == Some(&hash) {
+            *suppressed = None;
+            true
+        } else {
+            false
+        }
+    };
+    let snapshot = update(state, app, |snapshot| {
+        if !suppress_publish {
+            snapshot.current_clipboard = CurrentClipboard {
+                source: "local".into(),
+                source_label: "来自本机系统剪贴板".into(),
+                preview: truncate_text(&text, 4096),
+                types: vec!["富文本 / HTML".into(), "纯文本降级".into()],
+                changed_at: now.clone(),
+            };
+        }
+        if !snapshot.publish_paused
+            && (snapshot.settings.allow_html || snapshot.settings.allow_text)
+            && !suppress_publish
+        {
+            snapshot.last_published_preview = format!("本机最近捕获：{}", truncate_text(&text, 80));
+        }
+        snapshot.last_synchronized_at = now.clone();
+        Ok(())
+    })?;
+    if !snapshot.publish_paused
+        && (snapshot.settings.allow_html || snapshot.settings.allow_text)
+        && !suppress_publish
+    {
+        let sequence = state.store.next_origin_sequence()?;
+        if let Some(transport) = app.try_state::<super::transport::TransportHandle>() {
+            if snapshot.settings.allow_html {
+                let rich_targets = state.delivery_targets("html")?;
+                let text_targets = if snapshot.settings.allow_text {
+                    state.delivery_targets("text")?
+                } else {
+                    HashMap::new()
+                };
+                transport.broadcast_rich(
+                    sequence,
+                    text,
+                    html,
+                    rtf,
+                    now,
+                    super::transport::RichDeliveryTargets {
+                        rich: &rich_targets,
+                        text: &text_targets,
+                    },
+                );
+            } else {
+                let targets = state.delivery_targets("text")?;
+                transport.broadcast_text(sequence, text, now, &targets);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn capture_local_files(
+    state: &ServiceState,
+    app: &AppHandle,
+    files: Vec<String>,
+    now: String,
+) -> Result<(), String> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    let hash = file_list_hash(&files);
+    let suppress_publish = {
+        let mut suppressed = state
+            .suppress_next_files
+            .lock()
+            .map_err(|_| "文件剪贴板回环抑制锁已损坏".to_string())?;
+        if suppressed.as_ref() == Some(&hash) {
+            *suppressed = None;
+            true
+        } else {
+            false
+        }
+    };
+    let snapshot = update(state, app, |snapshot| {
+        if !suppress_publish {
+            snapshot.current_clipboard = CurrentClipboard {
+                source: "local".into(),
+                source_label: "来自本机系统剪贴板".into(),
+                preview: format!("{} 个文件或目录", files.len()),
+                types: vec!["文件与目录".into()],
+                changed_at: now.clone(),
+            };
+        }
+        snapshot.last_synchronized_at = now.clone();
+        Ok(())
+    })?;
+    if snapshot.publish_paused || !snapshot.settings.allow_files || suppress_publish {
+        return Ok(());
+    }
+    let Some(transport) = app.try_state::<super::transport::TransportHandle>() else {
+        return Ok(());
+    };
+    let targets = state.delivery_targets("files")?;
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let sequence = state.store.next_origin_sequence()?;
+    let bundle = stage_file_bundle(&files, &state.file_cache_root.join("outgoing"), sequence)?;
+    update(state, app, |snapshot| {
+        snapshot.last_published_preview = format!("本机最近捕获：{} 个文件或目录", files.len());
+        Ok(())
+    })?;
+    transport.broadcast_files(sequence, bundle, now, &targets);
+    Ok(())
+}
+
 pub fn capture_local_image(
     state: &ServiceState,
     app: &AppHandle,
@@ -937,6 +1299,19 @@ pub fn report_clipboard_recovered(state: &ServiceState, app: &AppHandle) -> Resu
         snapshot.clipboard_capability.can_read_text = true;
         snapshot.clipboard_capability.foreground_capture = true;
         snapshot.clipboard_capability.limitation = None;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+pub fn report_clipboard_limitation(
+    state: &ServiceState,
+    app: &AppHandle,
+    message: String,
+) -> Result<(), String> {
+    tracing::warn!(limitation = %message, "extended clipboard capability unavailable");
+    update(state, app, |snapshot| {
+        snapshot.clipboard_capability.limitation = Some(message);
         Ok(())
     })?;
     Ok(())
@@ -1165,6 +1540,149 @@ pub(crate) fn receive_remote_text(
     Ok(())
 }
 
+pub(crate) fn receive_remote_rich(
+    state: &ServiceState,
+    app: &AppHandle,
+    device: &TrustedDevice,
+    rich: RemoteRich,
+) -> Result<(), String> {
+    let total_size = rich
+        .text
+        .len()
+        .saturating_add(rich.html.as_ref().map_or(0, String::len))
+        .saturating_add(rich.rtf.as_ref().map_or(0, String::len));
+    if (rich.html.is_none() && rich.rtf.is_none()) || total_size > 1024 * 1024 {
+        return Err("远端富文本格式或大小无效".into());
+    }
+    if !state
+        .authorized_device(&device.device_id)?
+        .is_some_and(|trusted| trusted.sync_enabled)
+    {
+        return Err("该设备的剪贴板同步已停用".into());
+    }
+    let mut group_names =
+        state.validate_group_delivery(&device.device_id, &rich.group_ids, "html")?;
+    if let Ok(text_group_names) =
+        state.validate_group_delivery(&device.device_id, &rich.group_ids, "text")
+    {
+        group_names.extend(text_group_names);
+        group_names.sort();
+        group_names.dedup();
+    }
+    {
+        let snapshot = state
+            .snapshot
+            .lock()
+            .map_err(|_| "Rust 服务状态锁已损坏".to_string())?;
+        if snapshot.subscribe_paused || !snapshot.settings.allow_html {
+            return Err("本机策略已停用富文本同步".into());
+        }
+        if snapshot
+            .slots
+            .iter()
+            .find(|slot| slot.device_id == device.device_id)
+            .is_some_and(|slot| rich.sequence <= slot.sequence)
+        {
+            return Ok(());
+        }
+    }
+    let slot_id = format!("device:{}", device.device_id);
+    state
+        .remote_bodies
+        .lock()
+        .map_err(|_| "远端正文缓存锁已损坏".to_string())?
+        .insert(
+            slot_id,
+            RemoteClipboardBody::Rich {
+                text: rich.text.clone(),
+                html: rich.html.clone(),
+                rtf: rich.rtf.clone(),
+            },
+        );
+    if let Some(object_name) = state.store.remove_cached_slot(&device.device_id)? {
+        state.clipboard_cache.remove(&object_name);
+    }
+    update(state, app, |snapshot| {
+        snapshot
+            .slots
+            .retain(|slot| slot.device_id != device.device_id);
+        snapshot.slots.push(rich_slot(
+            device,
+            &rich,
+            SlotGroups {
+                names: group_names,
+                ids: rich.group_ids.clone(),
+            },
+        ));
+        snapshot.last_synchronized_at = rich.captured_at;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+pub(crate) fn receive_remote_files(
+    state: &ServiceState,
+    app: &AppHandle,
+    device: &TrustedDevice,
+    files: RemoteFiles,
+) -> Result<(), String> {
+    if files.bundle.clipboard_paths().is_empty() {
+        return Err("远端文件清单为空".into());
+    }
+    if !state
+        .authorized_device(&device.device_id)?
+        .is_some_and(|trusted| trusted.sync_enabled)
+    {
+        return Err("该设备的剪贴板同步已停用".into());
+    }
+    let group_names =
+        state.validate_group_delivery(&device.device_id, &files.group_ids, "files")?;
+    let preview_names = {
+        let snapshot = state
+            .snapshot
+            .lock()
+            .map_err(|_| "Rust 服务状态锁已损坏".to_string())?;
+        if snapshot.subscribe_paused || !snapshot.settings.allow_files {
+            return Err("本机策略已停用文件同步".into());
+        }
+        if snapshot
+            .slots
+            .iter()
+            .find(|slot| slot.device_id == device.device_id)
+            .is_some_and(|slot| files.sequence <= slot.sequence)
+        {
+            return Ok(());
+        }
+        snapshot.settings.preview_file_names
+    };
+    let slot_id = format!("device:{}", device.device_id);
+    state
+        .remote_bodies
+        .lock()
+        .map_err(|_| "远端正文缓存锁已损坏".to_string())?
+        .insert(slot_id, RemoteClipboardBody::Files(files.bundle.clone()));
+    if let Some(object_name) = state.store.remove_cached_slot(&device.device_id)? {
+        state.clipboard_cache.remove(&object_name);
+    }
+    update(state, app, |snapshot| {
+        snapshot
+            .slots
+            .retain(|slot| slot.device_id != device.device_id);
+        snapshot.slots.push(file_slot(
+            device,
+            &files,
+            preview_names,
+            SlotGroups {
+                names: group_names,
+                ids: files.group_ids.clone(),
+            },
+        ));
+        snapshot.last_synchronized_at = files.captured_at;
+        Ok(())
+    })?;
+    Ok(())
+}
+
 pub(crate) fn receive_remote_image(
     state: &ServiceState,
     app: &AppHandle,
@@ -1285,19 +1803,33 @@ fn reconcile_group_slots(state: &ServiceState, app: &AppHandle) -> Result<(), St
         .map_err(|_| "Rust 服务状态锁已损坏".to_string())?
         .slots
         .clone();
-    let mut retained = HashMap::<String, (Vec<String>, Vec<String>)>::new();
+    let mut retained = HashMap::<String, (Vec<String>, Vec<String>, bool)>::new();
     for slot in &slots {
+        let is_rich = slot
+            .representations
+            .iter()
+            .any(|representation| representation.kind == "html");
         let content_type = if slot
+            .representations
+            .iter()
+            .any(|representation| representation.kind == "files")
+        {
+            "files"
+        } else if slot
             .representations
             .iter()
             .any(|representation| representation.kind == "image")
         {
             "image"
+        } else if is_rich {
+            "html"
         } else {
             "text"
         };
         let mut valid_ids = Vec::new();
         let mut valid_names = Vec::new();
+        let mut text_ids = Vec::new();
+        let mut text_names = Vec::new();
         for group_id in &slot.group_ids {
             if let Ok(names) = state.validate_group_delivery(
                 &slot.device_id,
@@ -1307,11 +1839,33 @@ fn reconcile_group_slots(state: &ServiceState, app: &AppHandle) -> Result<(), St
                 valid_ids.push(group_id.clone());
                 valid_names.extend(names);
             }
+            if is_rich {
+                if let Ok(names) = state.validate_group_delivery(
+                    &slot.device_id,
+                    std::slice::from_ref(group_id),
+                    "text",
+                ) {
+                    text_ids.push(group_id.clone());
+                    text_names.extend(names);
+                }
+            }
+        }
+        let downgrade_to_text = is_rich && valid_ids.is_empty() && !text_ids.is_empty();
+        if is_rich {
+            if downgrade_to_text {
+                valid_ids = text_ids;
+                valid_names = text_names;
+            } else {
+                valid_ids.extend(text_ids);
+                valid_names.extend(text_names);
+                valid_ids.sort();
+                valid_ids.dedup();
+            }
         }
         valid_names.sort();
         valid_names.dedup();
         if !valid_ids.is_empty() {
-            retained.insert(slot.id.clone(), (valid_ids, valid_names));
+            retained.insert(slot.id.clone(), (valid_ids, valid_names, downgrade_to_text));
         }
     }
     let removed = slots
@@ -1319,12 +1873,28 @@ fn reconcile_group_slots(state: &ServiceState, app: &AppHandle) -> Result<(), St
         .filter(|slot| !retained.contains_key(&slot.id))
         .map(|slot| (slot.id.clone(), slot.device_id.clone()))
         .collect::<Vec<_>>();
-    for (slot_id, device_id) in &removed {
-        state
+    let mut downgraded_sizes = HashMap::<String, u64>::new();
+    {
+        let mut bodies = state
             .remote_bodies
             .lock()
-            .map_err(|_| "远端正文缓存锁已损坏".to_string())?
-            .remove(slot_id);
+            .map_err(|_| "远端正文缓存锁已损坏".to_string())?;
+        let downgrade_ids = retained
+            .iter()
+            .filter(|(_, (_, _, downgrade))| *downgrade)
+            .map(|(slot_id, _)| slot_id.clone())
+            .collect::<Vec<_>>();
+        for slot_id in downgrade_ids {
+            if let Some(RemoteClipboardBody::Rich { text, .. }) = bodies.get(&slot_id).cloned() {
+                downgraded_sizes.insert(slot_id.clone(), text.len() as u64);
+                bodies.insert(slot_id, RemoteClipboardBody::Text(text));
+            }
+        }
+        for (slot_id, _) in &removed {
+            bodies.remove(slot_id);
+        }
+    }
+    for (_, device_id) in &removed {
         if let Some(object_name) = state.store.remove_cached_slot(device_id)? {
             state.clipboard_cache.remove(&object_name);
         }
@@ -1334,9 +1904,22 @@ fn reconcile_group_slots(state: &ServiceState, app: &AppHandle) -> Result<(), St
             .slots
             .retain(|slot| retained.contains_key(&slot.id));
         for slot in &mut snapshot.slots {
-            if let Some((group_ids, names)) = retained.get(&slot.id) {
+            if let Some((group_ids, names, downgrade_to_text)) = retained.get(&slot.id) {
                 slot.group_ids = group_ids.clone();
                 slot.groups = names.clone();
+                if *downgrade_to_text {
+                    let size = downgraded_sizes.get(&slot.id).copied().unwrap_or(slot.size);
+                    slot.size = size;
+                    slot.representations = vec![ClipboardRepresentation {
+                        id: "text/plain".into(),
+                        kind: "text".into(),
+                        label: "纯文本".into(),
+                        mime: "text/plain;charset=utf-8".into(),
+                        size,
+                        status: "ready".into(),
+                        enabled: true,
+                    }];
+                }
             }
         }
         Ok(())
@@ -2204,10 +2787,15 @@ pub fn update_settings(
             serde_json::from_value(current).map_err(|error| format!("设置值无效：{error}"))?;
         if !snapshot.settings.allow_text {
             snapshot.slots.retain(|slot| {
-                !slot
+                let has_text = slot
                     .representations
                     .iter()
-                    .any(|representation| representation.kind == "text")
+                    .any(|representation| representation.kind == "text");
+                let has_rich = slot
+                    .representations
+                    .iter()
+                    .any(|representation| representation.kind == "html");
+                !has_text || has_rich
             });
             snapshot.imports.clear();
         }
@@ -2217,6 +2805,24 @@ pub fn update_settings(
                     .representations
                     .iter()
                     .any(|representation| representation.kind == "image")
+            });
+            snapshot.imports.clear();
+        }
+        if !snapshot.settings.allow_html {
+            snapshot.slots.retain(|slot| {
+                !slot
+                    .representations
+                    .iter()
+                    .any(|representation| representation.kind == "html")
+            });
+            snapshot.imports.clear();
+        }
+        if !snapshot.settings.allow_files {
+            snapshot.slots.retain(|slot| {
+                !slot
+                    .representations
+                    .iter()
+                    .any(|representation| representation.kind == "files")
             });
             snapshot.imports.clear();
         }
@@ -2238,13 +2844,29 @@ pub fn update_settings(
             transport.clear_latest_image();
         }
     }
-    if !snapshot.settings.allow_text || !snapshot.settings.allow_images {
+    if !snapshot.settings.allow_html {
+        if let Some(transport) = app.try_state::<super::transport::TransportHandle>() {
+            transport.clear_latest_rich();
+        }
+    }
+    if !snapshot.settings.allow_files {
+        if let Some(transport) = app.try_state::<super::transport::TransportHandle>() {
+            transport.clear_latest_files();
+        }
+    }
+    if !snapshot.settings.allow_text
+        || !snapshot.settings.allow_images
+        || !snapshot.settings.allow_html
+        || !snapshot.settings.allow_files
+    {
         state
             .remote_bodies
             .lock()
             .map_err(|_| "远端正文缓存锁已损坏".to_string())?
             .retain(|_, body| match body {
                 RemoteClipboardBody::Text(_) => snapshot.settings.allow_text,
+                RemoteClipboardBody::Rich { .. } => snapshot.settings.allow_html,
+                RemoteClipboardBody::Files(_) => snapshot.settings.allow_files,
                 RemoteClipboardBody::Image { .. } => snapshot.settings.allow_images,
             });
     }
@@ -2268,17 +2890,35 @@ pub fn create_import_intent(
         .find(|slot| slot.id == slot_id && slot.revision == revision)
         .cloned()
         .ok_or_else(|| "设备槽位不存在或已经更新".to_string())?;
-    let is_image = slot
+    let content_type = if slot
         .representations
         .iter()
-        .any(|representation| representation.kind == "image");
-    state.validate_group_delivery(
-        &slot.device_id,
-        &slot.group_ids,
-        if is_image { "image" } else { "text" },
-    )?;
-    if (is_image && !snapshot.settings.allow_images) || (!is_image && !snapshot.settings.allow_text)
+        .any(|representation| representation.kind == "files")
     {
+        "files"
+    } else if slot
+        .representations
+        .iter()
+        .any(|representation| representation.kind == "image")
+    {
+        "image"
+    } else if slot
+        .representations
+        .iter()
+        .any(|representation| representation.kind == "html")
+    {
+        "html"
+    } else {
+        "text"
+    };
+    state.validate_group_delivery(&slot.device_id, &slot.group_ids, content_type)?;
+    let allowed = match content_type {
+        "image" => snapshot.settings.allow_images,
+        "html" => snapshot.settings.allow_html,
+        "files" => snapshot.settings.allow_files,
+        _ => snapshot.settings.allow_text,
+    };
+    if !allowed {
         return Err("本机策略已停用此内容类型的取用".into());
     }
     let bodies = state
@@ -2346,6 +2986,57 @@ pub fn confirm_import(
                 return Err(format!("无法写入本机系统剪贴板：{error}"));
             }
             (truncate_text(text, 4096), vec!["纯文本".into()])
+        }
+        RemoteClipboardBody::Rich { text, html, rtf } => {
+            *state
+                .suppress_next_rich
+                .lock()
+                .map_err(|_| "富文本剪贴板回环抑制锁已损坏".to_string())? =
+                Some(rich_hash(text, html.as_deref(), rtf.as_deref()));
+            *state
+                .suppress_next_capture
+                .lock()
+                .map_err(|_| "剪贴板回环抑制锁已损坏".to_string())? = Some(text.clone());
+            if let Err(error) =
+                crate::platform::write_rich_clipboard(text.clone(), html.clone(), rtf.clone())
+            {
+                *state
+                    .suppress_next_rich
+                    .lock()
+                    .map_err(|_| "富文本剪贴板回环抑制锁已损坏".to_string())? = None;
+                *state
+                    .suppress_next_capture
+                    .lock()
+                    .map_err(|_| "剪贴板回环抑制锁已损坏".to_string())? = None;
+                return Err(error);
+            }
+            (
+                truncate_text(text, 4096),
+                vec!["富文本 / HTML".into(), "纯文本降级".into()],
+            )
+        }
+        RemoteClipboardBody::Files(bundle) => {
+            let paths = bundle.clipboard_paths();
+            *state
+                .suppress_next_files
+                .lock()
+                .map_err(|_| "文件剪贴板回环抑制锁已损坏".to_string())? =
+                Some(file_list_hash(&paths));
+            if let Err(error) = crate::platform::write_file_clipboard(paths) {
+                *state
+                    .suppress_next_files
+                    .lock()
+                    .map_err(|_| "文件剪贴板回环抑制锁已损坏".to_string())? = None;
+                return Err(error);
+            }
+            *state
+                .imported_files
+                .lock()
+                .map_err(|_| "已导入文件保留锁已损坏".to_string())? = Some(bundle.clone());
+            (
+                format!("{} 个文件或目录", bundle.clipboard_paths().len()),
+                vec!["文件与目录".into()],
+            )
         }
         RemoteClipboardBody::Image {
             rgba,

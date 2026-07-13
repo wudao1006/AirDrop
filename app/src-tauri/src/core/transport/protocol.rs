@@ -1,3 +1,4 @@
+use crate::core::files::FileEntry;
 use crate::core::group::{SignedGroupManifest, SignedGroupTombstone};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -67,6 +68,16 @@ pub(crate) enum TrustedMessage {
         text: String,
         group_ids: Vec<String>,
     },
+    RichClipboardSlotOffer {
+        schema_version: u8,
+        message_id: String,
+        origin_sequence: u64,
+        captured_at: String,
+        text: String,
+        html: Option<String>,
+        rtf: Option<String>,
+        group_ids: Vec<String>,
+    },
     GroupInvite {
         schema_version: u8,
         message_id: String,
@@ -111,6 +122,18 @@ pub(crate) struct ImageBlobHeader {
     pub(crate) height: u32,
     pub(crate) png_length: u64,
     pub(crate) sha256: String,
+    pub(crate) group_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FileBlobHeader {
+    pub(crate) schema_version: u8,
+    pub(crate) message_id: String,
+    pub(crate) origin_sequence: u64,
+    pub(crate) captured_at: String,
+    pub(crate) total_size: u64,
+    pub(crate) entries: Vec<FileEntry>,
     pub(crate) group_ids: Vec<String>,
 }
 

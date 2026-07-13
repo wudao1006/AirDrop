@@ -2,6 +2,10 @@ mod protocol;
 
 use super::{
     discovery::TRANSPORT_PORT,
+    files::{
+        safe_relative_path, ReceivedFileBundle, StagedFileBundle, MAX_FILE_BUNDLE_BYTES,
+        MAX_FILE_ENTRIES,
+    },
     group::{SignedGroupManifest, SignedGroupTombstone},
     identity::device_id_for_key,
     service::{self, PendingPairing, ServiceState},
@@ -14,7 +18,8 @@ use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use image::{codecs::png::PngEncoder, ExtendedColorType, ImageEncoder};
 use protocol::{
-    read_frame, write_frame, ImageBlobHeader, PairMessage, TrustedMessage, PAIR_ALPN, TRUSTED_ALPN,
+    read_frame, write_frame, FileBlobHeader, ImageBlobHeader, PairMessage, TrustedMessage,
+    PAIR_ALPN, TRUSTED_ALPN,
 };
 use quinn::{crypto::rustls::QuicClientConfig, Connection, Endpoint};
 use rcgen::{CertificateParams, KeyPair};
@@ -32,10 +37,13 @@ use std::{
 };
 use tauri::{AppHandle, Manager};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 type HmacSha256 = Hmac<Sha256>;
 const MAX_IMAGE_BLOB: usize = 16 * 1024 * 1024;
+const IMAGE_BLOB_KIND: u8 = 1;
+const FILE_BLOB_KIND: u8 = 2;
 
 struct PairCommandRegistration {
     commands: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<bool>>>>,
@@ -63,6 +71,28 @@ struct LocalTextOffer {
     text: String,
 }
 
+#[derive(Clone)]
+struct LocalRichOffer {
+    sequence: u64,
+    captured_at: String,
+    text: String,
+    html: Option<String>,
+    rtf: Option<String>,
+}
+
+#[derive(Clone)]
+struct LocalFileOffer {
+    transfer_id: String,
+    sequence: u64,
+    captured_at: String,
+    bundle: Arc<StagedFileBundle>,
+}
+
+pub(crate) struct RichDeliveryTargets<'a> {
+    pub(crate) rich: &'a HashMap<String, Vec<String>>,
+    pub(crate) text: &'a HashMap<String, Vec<String>>,
+}
+
 impl Drop for PairCommandRegistration {
     fn drop(&mut self) {
         if let Ok(mut commands) = self.commands.lock() {
@@ -81,7 +111,9 @@ pub(crate) struct TransportHandle {
     peers: Arc<Mutex<HashMap<String, PeerConnection>>>,
     connecting: Arc<Mutex<HashSet<String>>>,
     latest_offer: Arc<Mutex<Option<LocalTextOffer>>>,
+    latest_rich: Arc<Mutex<Option<LocalRichOffer>>>,
     latest_image: Arc<Mutex<Option<LocalImageOffer>>>,
+    latest_files: Arc<Mutex<Option<LocalFileOffer>>>,
 }
 
 impl TransportHandle {
@@ -121,9 +153,78 @@ impl TransportHandle {
         if let Ok(mut latest) = self.latest_offer.lock() {
             *latest = Some(offer.clone());
         }
+        self.clear_latest_rich();
+        self.clear_latest_image();
+        self.clear_latest_files();
         if let Ok(peers) = self.peers.lock() {
             for (device_id, peer) in peers.iter() {
                 if let Some(group_ids) = targets.get(device_id) {
+                    let _ = peer.sender.send(TrustedMessage::ClipboardSlotOffer {
+                        schema_version: 1,
+                        message_id: uuid::Uuid::new_v4().simple().to_string(),
+                        origin_sequence: offer.sequence,
+                        captured_at: offer.captured_at.clone(),
+                        text: offer.text.clone(),
+                        group_ids: group_ids.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    pub(crate) fn broadcast_rich(
+        &self,
+        sequence: u64,
+        text: String,
+        html: Option<String>,
+        rtf: Option<String>,
+        captured_at: String,
+        targets: RichDeliveryTargets<'_>,
+    ) {
+        let RichDeliveryTargets {
+            rich: rich_targets,
+            text: text_targets,
+        } = targets;
+        let total_size = text
+            .len()
+            .saturating_add(html.as_ref().map_or(0, String::len))
+            .saturating_add(rtf.as_ref().map_or(0, String::len));
+        if (html.is_none() && rtf.is_none()) || total_size > 1024 * 1024 {
+            return;
+        }
+        let offer = LocalRichOffer {
+            sequence,
+            captured_at,
+            text,
+            html,
+            rtf,
+        };
+        if let Ok(mut latest) = self.latest_rich.lock() {
+            *latest = Some(offer.clone());
+        }
+        self.clear_latest_text();
+        self.clear_latest_image();
+        self.clear_latest_files();
+        if let Ok(peers) = self.peers.lock() {
+            for (device_id, peer) in peers.iter() {
+                if let Some(group_ids) = rich_targets.get(device_id) {
+                    let mut group_ids = group_ids.clone();
+                    if let Some(text_group_ids) = text_targets.get(device_id) {
+                        group_ids.extend(text_group_ids.iter().cloned());
+                        group_ids.sort();
+                        group_ids.dedup();
+                    }
+                    let _ = peer.sender.send(TrustedMessage::RichClipboardSlotOffer {
+                        schema_version: 1,
+                        message_id: uuid::Uuid::new_v4().simple().to_string(),
+                        origin_sequence: offer.sequence,
+                        captured_at: offer.captured_at.clone(),
+                        text: offer.text.clone(),
+                        html: offer.html.clone(),
+                        rtf: offer.rtf.clone(),
+                        group_ids,
+                    });
+                } else if let Some(group_ids) = text_targets.get(device_id) {
                     let _ = peer.sender.send(TrustedMessage::ClipboardSlotOffer {
                         schema_version: 1,
                         message_id: uuid::Uuid::new_v4().simple().to_string(),
@@ -169,6 +270,9 @@ impl TransportHandle {
         if let Ok(mut latest) = self.latest_image.lock() {
             *latest = Some(offer.clone());
         }
+        self.clear_latest_text();
+        self.clear_latest_rich();
+        self.clear_latest_files();
         let connections = self
             .peers
             .lock()
@@ -205,6 +309,49 @@ impl TransportHandle {
         }
     }
 
+    pub(crate) fn broadcast_files(
+        &self,
+        sequence: u64,
+        bundle: StagedFileBundle,
+        captured_at: String,
+        targets: &HashMap<String, Vec<String>>,
+    ) {
+        let offer = LocalFileOffer {
+            transfer_id: uuid::Uuid::new_v4().simple().to_string(),
+            sequence,
+            captured_at,
+            bundle: Arc::new(bundle),
+        };
+        if let Ok(mut latest) = self.latest_files.lock() {
+            *latest = Some(offer.clone());
+        }
+        self.clear_latest_text();
+        self.clear_latest_rich();
+        self.clear_latest_image();
+        let connections = self
+            .peers
+            .lock()
+            .map(|peers| {
+                peers
+                    .iter()
+                    .filter_map(|(device_id, peer)| {
+                        targets
+                            .get(device_id)
+                            .map(|groups| (peer.connection.clone(), groups.clone()))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for (connection, group_ids) in connections {
+            let offer = offer.clone();
+            self.runtime.spawn(async move {
+                if let Err(error) = send_file_blob_with_retry(connection, offer, group_ids).await {
+                    tracing::warn!(error = %error, "clipboard file send failed");
+                }
+            });
+        }
+    }
+
     pub(crate) fn clear_latest_text(&self) {
         if let Ok(mut latest) = self.latest_offer.lock() {
             *latest = None;
@@ -213,6 +360,18 @@ impl TransportHandle {
 
     pub(crate) fn clear_latest_image(&self) {
         if let Ok(mut latest) = self.latest_image.lock() {
+            *latest = None;
+        }
+    }
+
+    pub(crate) fn clear_latest_rich(&self) {
+        if let Ok(mut latest) = self.latest_rich.lock() {
+            *latest = None;
+        }
+    }
+
+    pub(crate) fn clear_latest_files(&self) {
+        if let Ok(mut latest) = self.latest_files.lock() {
             *latest = None;
         }
     }
@@ -694,13 +853,78 @@ impl TransportHandle {
             let groups = {
                 let state = app.state::<ServiceState>();
                 state
-                    .delivery_targets("text")
-                    .ok()
-                    .and_then(|targets| targets.get(&device_id).cloned())
+                    .can_publish_content("text")
+                    .then(|| {
+                        state
+                            .delivery_targets("text")
+                            .ok()
+                            .and_then(|targets| targets.get(&device_id).cloned())
+                    })
+                    .flatten()
             };
             if let Some(group_ids) = groups {
                 if let Ok(peers) = self.peers.lock() {
                     if let Some(peer) = peers.get(&device_id) {
+                        let _ = peer.sender.send(TrustedMessage::ClipboardSlotOffer {
+                            schema_version: 1,
+                            message_id: uuid::Uuid::new_v4().simple().to_string(),
+                            origin_sequence: latest.sequence,
+                            captured_at: latest.captured_at,
+                            text: latest.text,
+                            group_ids,
+                        });
+                    }
+                }
+            }
+        }
+        if let Some(latest) = self
+            .latest_rich
+            .lock()
+            .ok()
+            .and_then(|latest| latest.clone())
+        {
+            let (rich_groups, text_groups) = {
+                let state = app.state::<ServiceState>();
+                let rich = state
+                    .can_publish_content("html")
+                    .then(|| {
+                        state
+                            .delivery_targets("html")
+                            .ok()
+                            .and_then(|targets| targets.get(&device_id).cloned())
+                    })
+                    .flatten();
+                let text = state
+                    .can_publish_content("text")
+                    .then(|| {
+                        state
+                            .delivery_targets("text")
+                            .ok()
+                            .and_then(|targets| targets.get(&device_id).cloned())
+                    })
+                    .flatten();
+                (rich, text)
+            };
+            if let Ok(peers) = self.peers.lock() {
+                if let Some(peer) = peers.get(&device_id) {
+                    if let Some(group_ids) = rich_groups {
+                        let mut group_ids = group_ids;
+                        if let Some(text_group_ids) = &text_groups {
+                            group_ids.extend(text_group_ids.iter().cloned());
+                            group_ids.sort();
+                            group_ids.dedup();
+                        }
+                        let _ = peer.sender.send(TrustedMessage::RichClipboardSlotOffer {
+                            schema_version: 1,
+                            message_id: uuid::Uuid::new_v4().simple().to_string(),
+                            origin_sequence: latest.sequence,
+                            captured_at: latest.captured_at,
+                            text: latest.text,
+                            html: latest.html,
+                            rtf: latest.rtf,
+                            group_ids,
+                        });
+                    } else if let Some(group_ids) = text_groups {
                         let _ = peer.sender.send(TrustedMessage::ClipboardSlotOffer {
                             schema_version: 1,
                             message_id: uuid::Uuid::new_v4().simple().to_string(),
@@ -723,14 +947,48 @@ impl TransportHandle {
             let groups = {
                 let state = app.state::<ServiceState>();
                 state
-                    .delivery_targets("image")
-                    .ok()
-                    .and_then(|targets| targets.get(&device_id).cloned())
+                    .can_publish_content("image")
+                    .then(|| {
+                        state
+                            .delivery_targets("image")
+                            .ok()
+                            .and_then(|targets| targets.get(&device_id).cloned())
+                    })
+                    .flatten()
             };
             self.runtime.spawn(async move {
                 if let Some(group_ids) = groups {
                     if let Err(error) = send_image_blob(connection, image, group_ids).await {
                         tracing::debug!(error = %error, "cached clipboard image send failed");
+                    }
+                }
+            });
+        }
+        if let Some(files) = self
+            .latest_files
+            .lock()
+            .ok()
+            .and_then(|latest| latest.clone())
+        {
+            let connection = connection.clone();
+            let groups = {
+                let state = app.state::<ServiceState>();
+                state
+                    .can_publish_content("files")
+                    .then(|| {
+                        state
+                            .delivery_targets("files")
+                            .ok()
+                            .and_then(|targets| targets.get(&device_id).cloned())
+                    })
+                    .flatten()
+            };
+            self.runtime.spawn(async move {
+                if let Some(group_ids) = groups {
+                    if let Err(error) =
+                        send_file_blob_with_retry(connection, files, group_ids).await
+                    {
+                        tracing::warn!(error = %error, "cached clipboard file send failed");
                     }
                 }
             });
@@ -742,7 +1000,7 @@ impl TransportHandle {
                 }
             }
         });
-        let blob_reader = tokio::spawn(receive_image_blobs(
+        let blob_reader = tokio::spawn(receive_clipboard_blobs(
             app.clone(),
             connection.clone(),
             trusted.clone(),
@@ -768,6 +1026,33 @@ impl TransportHandle {
                         group_ids,
                     ) {
                         tracing::warn!(device_id = %device_id, error = %error, "remote clipboard rejected");
+                    }
+                }
+                Ok(TrustedMessage::RichClipboardSlotOffer {
+                    schema_version: 1,
+                    origin_sequence,
+                    captured_at,
+                    text,
+                    html,
+                    rtf,
+                    group_ids,
+                    ..
+                }) => {
+                    let state = app.state::<ServiceState>();
+                    if let Err(error) = service::receive_remote_rich(
+                        &state,
+                        &app,
+                        &trusted,
+                        service::RemoteRich {
+                            sequence: origin_sequence,
+                            text,
+                            html,
+                            rtf,
+                            captured_at,
+                            group_ids,
+                        },
+                    ) {
+                        tracing::warn!(device_id = %device_id, error = %error, "remote rich clipboard rejected");
                     }
                 }
                 Ok(TrustedMessage::GroupInvite {
@@ -882,6 +1167,9 @@ async fn send_image_blob(
         sha256: HEXLOWER.encode(&Sha256::digest(offer.png.as_slice())),
         group_ids,
     };
+    send.write_u8(IMAGE_BLOB_KIND)
+        .await
+        .map_err(|error| format!("图片数据流类型发送失败：{error}"))?;
     write_frame(&mut send, &header).await?;
     send.write_all(offer.png.as_slice())
         .await
@@ -890,57 +1178,300 @@ async fn send_image_blob(
         .map_err(|error| format!("图片数据流结束失败：{error}"))
 }
 
-async fn receive_image_blobs(app: AppHandle, connection: Connection, device: TrustedDevice) {
+async fn send_file_blob(
+    connection: Connection,
+    offer: LocalFileOffer,
+    group_ids: Vec<String>,
+) -> Result<(), String> {
+    let mut send = connection
+        .open_uni()
+        .await
+        .map_err(|error| format!("无法打开文件数据流：{error}"))?;
+    let header = FileBlobHeader {
+        schema_version: 1,
+        message_id: offer.transfer_id.clone(),
+        origin_sequence: offer.sequence,
+        captured_at: offer.captured_at,
+        total_size: offer.bundle.total_size,
+        entries: offer.bundle.entries.clone(),
+        group_ids,
+    };
+    send.write_u8(FILE_BLOB_KIND)
+        .await
+        .map_err(|error| format!("文件数据流类型发送失败：{error}"))?;
+    write_frame(&mut send, &header).await?;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    for entry in &header.entries {
+        if entry.is_directory {
+            continue;
+        }
+        let relative = safe_relative_path(&entry.relative_path)?;
+        let mut file = tokio::fs::File::open(offer.bundle.root.join(relative))
+            .await
+            .map_err(|error| format!("无法打开暂存文件：{error}"))?;
+        let mut remaining = entry.size;
+        while remaining > 0 {
+            let limit = usize::try_from(remaining.min(buffer.len() as u64))
+                .map_err(|_| "文件分块大小溢出".to_string())?;
+            let read = file
+                .read(&mut buffer[..limit])
+                .await
+                .map_err(|error| format!("无法读取暂存文件：{error}"))?;
+            if read == 0 {
+                return Err("暂存文件在发送时被截断".into());
+            }
+            send.write_all(&buffer[..read])
+                .await
+                .map_err(|error| format!("文件数据发送失败：{error}"))?;
+            remaining -= read as u64;
+        }
+    }
+    send.finish()
+        .map_err(|error| format!("文件数据流结束失败：{error}"))
+}
+
+async fn send_file_blob_with_retry(
+    connection: Connection,
+    offer: LocalFileOffer,
+    group_ids: Vec<String>,
+) -> Result<(), String> {
+    match send_file_blob(connection.clone(), offer.clone(), group_ids.clone()).await {
+        Ok(()) => Ok(()),
+        Err(first_error) => {
+            if connection.close_reason().is_some() {
+                return Err(first_error);
+            }
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            send_file_blob(connection, offer, group_ids)
+                .await
+                .map_err(|second_error| {
+                    format!("文件流首次发送失败：{first_error}；重试失败：{second_error}")
+                })
+        }
+    }
+}
+
+async fn receive_clipboard_blobs(app: AppHandle, connection: Connection, device: TrustedDevice) {
     loop {
         let mut receive = match connection.accept_uni().await {
             Ok(receive) => receive,
             Err(_) => return,
         };
-        let result = async {
-            let header: ImageBlobHeader = read_frame(&mut receive).await?;
-            if header.schema_version != 1
-                || header.png_length == 0
-                || header.png_length as usize > MAX_IMAGE_BLOB
-                || header.width == 0
-                || header.height == 0
-            {
-                return Err("图片数据流头无效".to_string());
-            }
-            let png = receive
-                .read_to_end(MAX_IMAGE_BLOB)
-                .await
-                .map_err(|error| format!("图片数据读取失败：{error}"))?;
-            if png.len() as u64 != header.png_length
-                || HEXLOWER.encode(&Sha256::digest(&png)) != header.sha256
-            {
-                return Err("图片数据长度或哈希不匹配".into());
-            }
-            let decoded = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
-                .map_err(|error| format!("图片数据解码失败：{error}"))?
-                .to_rgba8();
-            if decoded.width() != header.width || decoded.height() != header.height {
-                return Err("图片数据尺寸与声明不匹配".into());
-            }
-            let state = app.state::<ServiceState>();
-            service::receive_remote_image(
-                &state,
-                &app,
-                &device,
-                service::RemoteImage {
-                    sequence: header.origin_sequence,
-                    rgba: decoded.into_raw(),
-                    width: header.width,
-                    height: header.height,
-                    captured_at: header.captured_at,
-                    group_ids: header.group_ids,
-                },
-            )
-        }
-        .await;
+        let result = match receive.read_u8().await {
+            Ok(IMAGE_BLOB_KIND) => receive_image_blob(&app, &device, &mut receive).await,
+            Ok(FILE_BLOB_KIND) => receive_file_blob(&app, &device, &mut receive).await,
+            Ok(_) => Err("未知剪贴板数据流类型".into()),
+            Err(error) => Err(format!("无法读取剪贴板数据流类型：{error}")),
+        };
         if let Err(error) = result {
-            tracing::warn!(device_id = %device.device_id, error = %error, "remote clipboard image rejected");
+            tracing::warn!(device_id = %device.device_id, error = %error, "remote clipboard blob rejected");
         }
     }
+}
+
+async fn receive_image_blob(
+    app: &AppHandle,
+    device: &TrustedDevice,
+    receive: &mut quinn::RecvStream,
+) -> Result<(), String> {
+    let header: ImageBlobHeader = read_frame(receive).await?;
+    if header.schema_version != 1
+        || header.png_length == 0
+        || header.png_length as usize > MAX_IMAGE_BLOB
+        || header.width == 0
+        || header.height == 0
+    {
+        return Err("图片数据流头无效".to_string());
+    }
+    {
+        let state = app.state::<ServiceState>();
+        state.validate_incoming_offer(&device.device_id, &header.group_ids, "image")?;
+        state.validate_incoming_sequence(&device.device_id, header.origin_sequence)?;
+    }
+    let png = receive
+        .read_to_end(MAX_IMAGE_BLOB)
+        .await
+        .map_err(|error| format!("图片数据读取失败：{error}"))?;
+    if png.len() as u64 != header.png_length
+        || HEXLOWER.encode(&Sha256::digest(&png)) != header.sha256
+    {
+        return Err("图片数据长度或哈希不匹配".into());
+    }
+    let decoded = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+        .map_err(|error| format!("图片数据解码失败：{error}"))?
+        .to_rgba8();
+    if decoded.width() != header.width || decoded.height() != header.height {
+        return Err("图片数据尺寸与声明不匹配".into());
+    }
+    let state = app.state::<ServiceState>();
+    service::receive_remote_image(
+        &state,
+        app,
+        device,
+        service::RemoteImage {
+            sequence: header.origin_sequence,
+            rgba: decoded.into_raw(),
+            width: header.width,
+            height: header.height,
+            captured_at: header.captured_at,
+            group_ids: header.group_ids,
+        },
+    )
+}
+
+async fn receive_file_blob(
+    app: &AppHandle,
+    device: &TrustedDevice,
+    receive: &mut quinn::RecvStream,
+) -> Result<(), String> {
+    let header: FileBlobHeader = read_frame(receive).await?;
+    validate_file_header(&header)?;
+    let incoming_root = {
+        let state = app.state::<ServiceState>();
+        state.validate_incoming_offer(&device.device_id, &header.group_ids, "files")?;
+        state.validate_incoming_sequence(&device.device_id, header.origin_sequence)?;
+        state.incoming_files_root()
+    };
+    create_private_dir_all(&incoming_root).await?;
+    let transfer_id = uuid::Uuid::parse_str(&header.message_id)
+        .map_err(|_| "文件数据流消息 ID 无效".to_string())?
+        .simple()
+        .to_string();
+    let temporary = incoming_root.join(format!(".part-{transfer_id}"));
+    let completed = incoming_root.join(format!("bundle-{transfer_id}"));
+    create_private_dir_all(&temporary).await?;
+    let receive_result = receive_file_entries(receive, &temporary, &header).await;
+    if let Err(error) = receive_result {
+        let _ = tokio::fs::remove_dir_all(&temporary).await;
+        return Err(error);
+    }
+    if let Err(error) = tokio::fs::rename(&temporary, &completed).await {
+        let _ = tokio::fs::remove_dir_all(&temporary).await;
+        return Err(format!("无法提交接收文件：{error}"));
+    }
+    let bundle = Arc::new(ReceivedFileBundle::new(completed, header.entries));
+    let state = app.state::<ServiceState>();
+    service::receive_remote_files(
+        &state,
+        app,
+        device,
+        service::RemoteFiles {
+            sequence: header.origin_sequence,
+            bundle,
+            captured_at: header.captured_at,
+            group_ids: header.group_ids,
+            total_size: header.total_size,
+        },
+    )
+}
+
+fn validate_file_header(header: &FileBlobHeader) -> Result<(), String> {
+    if header.schema_version != 1
+        || header.entries.is_empty()
+        || header.entries.len() > MAX_FILE_ENTRIES
+        || header.total_size > MAX_FILE_BUNDLE_BYTES
+    {
+        return Err("文件数据流头无效".into());
+    }
+    let mut paths = HashSet::new();
+    let mut total_size = 0_u64;
+    for entry in &header.entries {
+        safe_relative_path(&entry.relative_path)?;
+        if !paths.insert(entry.relative_path.clone()) {
+            return Err("文件清单包含重复路径".into());
+        }
+        if entry.is_directory {
+            if entry.size != 0 || !entry.sha256.is_empty() {
+                return Err("目录清单字段无效".into());
+            }
+        } else {
+            if entry.sha256.len() != 64
+                || !entry.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err("文件哈希格式无效".into());
+            }
+            total_size = total_size
+                .checked_add(entry.size)
+                .ok_or_else(|| "文件总大小溢出".to_string())?;
+        }
+    }
+    if total_size != header.total_size {
+        return Err("文件清单总大小不匹配".into());
+    }
+    Ok(())
+}
+
+async fn receive_file_entries(
+    receive: &mut quinn::RecvStream,
+    root: &std::path::Path,
+    header: &FileBlobHeader,
+) -> Result<(), String> {
+    let mut buffer = vec![0_u8; 64 * 1024];
+    for entry in &header.entries {
+        let relative = safe_relative_path(&entry.relative_path)?;
+        let destination = root.join(relative);
+        if entry.is_directory {
+            create_private_dir_all(&destination).await?;
+            continue;
+        }
+        if let Some(parent) = destination.parent() {
+            create_private_dir_all(parent).await?;
+        }
+        let mut options = tokio::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&destination)
+            .await
+            .map_err(|error| format!("无法创建接收文件：{error}"))?;
+        let mut remaining = entry.size;
+        let mut hash = Sha256::new();
+        while remaining > 0 {
+            let limit = usize::try_from(remaining.min(buffer.len() as u64))
+                .map_err(|_| "文件分块大小溢出".to_string())?;
+            let read = receive
+                .read(&mut buffer[..limit])
+                .await
+                .map_err(|error| format!("文件数据读取失败：{error}"))?
+                .ok_or_else(|| "文件数据流提前结束".to_string())?;
+            hash.update(&buffer[..read]);
+            file.write_all(&buffer[..read])
+                .await
+                .map_err(|error| format!("文件数据写入失败：{error}"))?;
+            remaining -= read as u64;
+        }
+        file.sync_all()
+            .await
+            .map_err(|error| format!("文件数据提交失败：{error}"))?;
+        if HEXLOWER.encode(&hash.finalize()) != entry.sha256.to_ascii_lowercase() {
+            return Err(format!("文件 {} 哈希不匹配", entry.relative_path));
+        }
+    }
+    let trailing = receive
+        .read_to_end(1)
+        .await
+        .map_err(|error| format!("文件数据流尾部无效：{error}"))?;
+    if !trailing.is_empty() {
+        return Err("文件数据流包含未声明内容".into());
+    }
+    Ok(())
+}
+
+async fn create_private_dir_all(path: &std::path::Path) -> Result<(), String> {
+    tokio::fs::create_dir_all(path)
+        .await
+        .map_err(|error| format!("无法创建私有文件缓存目录：{error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .await
+            .map_err(|error| format!("无法限制文件缓存目录权限：{error}"))?;
+    }
+    Ok(())
 }
 
 pub(crate) fn start(app: AppHandle) -> Result<TransportHandle, String> {
@@ -992,7 +1523,9 @@ pub(crate) fn start(app: AppHandle) -> Result<TransportHandle, String> {
                     peers: Arc::new(Mutex::new(HashMap::new())),
                     connecting: Arc::new(Mutex::new(HashSet::new())),
                     latest_offer: Arc::new(Mutex::new(None)),
+                    latest_rich: Arc::new(Mutex::new(None)),
                     latest_image: Arc::new(Mutex::new(None)),
+                    latest_files: Arc::new(Mutex::new(None)),
                 };
                 let _ = ready_tx.send(Ok(handle.clone()));
                 while let Some(incoming) = endpoint.accept().await {
@@ -1459,6 +1992,7 @@ mod tests {
             write_frame(&mut send, &message).await.unwrap();
             send.finish().unwrap();
             let mut image_stream = connection.accept_uni().await.unwrap();
+            assert_eq!(image_stream.read_u8().await.unwrap(), IMAGE_BLOB_KIND);
             let header: ImageBlobHeader = read_frame(&mut image_stream).await.unwrap();
             let png = image_stream.read_to_end(MAX_IMAGE_BLOB).await.unwrap();
             assert_eq!(header.width, 2);
@@ -1468,6 +2002,16 @@ mod tests {
                 .unwrap()
                 .to_rgba8();
             assert_eq!(decoded.into_raw(), vec![255, 0, 0, 255, 0, 0, 255, 255]);
+            let mut file_stream = connection.accept_uni().await.unwrap();
+            assert_eq!(file_stream.read_u8().await.unwrap(), FILE_BLOB_KIND);
+            let file_header: FileBlobHeader = read_frame(&mut file_stream).await.unwrap();
+            let file_bytes = file_stream
+                .read_to_end(MAX_FILE_BUNDLE_BYTES as usize)
+                .await
+                .unwrap();
+            assert_eq!(file_header.entries.len(), 1);
+            assert_eq!(file_header.total_size, file_bytes.len() as u64);
+            assert_eq!(file_bytes, b"file over quic");
             let mut ack = connection.open_uni().await.unwrap();
             ack.write_all(b"ok").await.unwrap();
             ack.finish().unwrap();
@@ -1513,6 +2057,26 @@ mod tests {
                 width: 2,
                 height: 1,
                 png: Arc::new(png),
+            },
+            vec!["00112233-4455-6677-8899-aabbccddeeff".into()],
+        )
+        .await
+        .unwrap();
+        let source = directory.join("payload.txt");
+        std::fs::write(&source, b"file over quic").unwrap();
+        let bundle = crate::core::files::stage_file_bundle(
+            &[source.to_string_lossy().into_owned()],
+            &directory.join("staged"),
+            9,
+        )
+        .unwrap();
+        send_file_blob(
+            connection.clone(),
+            LocalFileOffer {
+                transfer_id: uuid::Uuid::new_v4().simple().to_string(),
+                sequence: 9,
+                captured_at: "2026-07-13T00:00:02Z".into(),
+                bundle: Arc::new(bundle),
             },
             vec!["00112233-4455-6677-8899-aabbccddeeff".into()],
         )
