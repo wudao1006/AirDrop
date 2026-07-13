@@ -76,6 +76,7 @@ export interface TrustedDevice {
   platform: "macos" | "windows" | "linux" | "android" | "unknown";
   pairedAt: string;
   online: boolean;
+  syncEnabled: boolean;
 }
 
 export interface PendingPairing {
@@ -143,6 +144,7 @@ export interface UiSnapshot {
   nearbyDevices: NearbyDevice[];
   trustedDevices: TrustedDevice[];
   pendingPairings: PendingPairing[];
+  cachePersistent: boolean;
   imports: ImportOperation[];
   settings: AppSettings;
 }

@@ -18,6 +18,7 @@ jobs:
           - os: windows-latest
             args: "--bundles nsis,msi"
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -33,6 +34,13 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
       - run: npm ci
         working-directory: app
+      - name: Validate release tag
+        run: node -e "const v=require('./app/src-tauri/tauri.conf.json').version; if(process.env.GITHUB_REF_NAME !== 'v'+v){throw new Error('Tag must equal v'+v)}"
+      - run: npm run typecheck
+        working-directory: app
+      - run: npm test -- --run
+        working-directory: app
+      - run: cargo test --manifest-path app/src-tauri/Cargo.toml
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

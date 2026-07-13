@@ -1,6 +1,7 @@
 use super::{
+    cache::{CachedText, ClipboardCache},
     identity::Identity,
-    storage::{Store, StoredRuntime, TrustedDevice},
+    storage::{CachedSlotMetadata, Store, StoredRuntime, TrustedDevice},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -101,6 +102,7 @@ pub struct TrustedDeviceView {
     platform: String,
     paired_at: String,
     online: bool,
+    sync_enabled: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -180,6 +182,7 @@ pub struct UiSnapshot {
     nearby_devices: Vec<NearbyDevice>,
     trusted_devices: Vec<TrustedDeviceView>,
     pending_pairings: Vec<PendingPairing>,
+    cache_persistent: bool,
     imports: Vec<ImportOperation>,
     settings: AppSettings,
 }
@@ -227,9 +230,11 @@ impl UiSnapshot {
                     platform: device.platform,
                     paired_at: device.paired_at,
                     online: false,
+                    sync_enabled: device.sync_enabled,
                 })
                 .collect(),
             pending_pairings: Vec::new(),
+            cache_persistent: false,
             imports: Vec::new(),
             settings,
         }
@@ -246,6 +251,7 @@ pub struct ServiceState {
     identity: Identity,
     remote_bodies: Mutex<HashMap<String, String>>,
     suppress_next_capture: Mutex<Option<String>>,
+    clipboard_cache: ClipboardCache,
 }
 
 impl ServiceState {
@@ -255,12 +261,54 @@ impl ServiceState {
         let settings = store.load_settings()?.unwrap_or_default();
         let runtime = store.load_runtime()?;
         let trusted_devices = store.trusted_devices()?;
+        let clipboard_cache = ClipboardCache::open(data_dir);
+        let mut snapshot = UiSnapshot::initial(settings, runtime, trusted_devices.clone());
+        snapshot.cache_persistent = clipboard_cache.available();
+        let mut remote_bodies = HashMap::new();
+        if clipboard_cache.available() {
+            let cached_slots = store.cached_slots(unix_seconds())?;
+            clipboard_cache.prune_except(
+                &cached_slots
+                    .iter()
+                    .map(|metadata| metadata.object_name.clone())
+                    .collect(),
+            );
+            for metadata in cached_slots {
+                let Some(device) = trusted_devices
+                    .iter()
+                    .find(|device| device.device_id == metadata.device_id && device.sync_enabled)
+                else {
+                    continue;
+                };
+                match clipboard_cache.load(&metadata.device_id, &metadata.object_name) {
+                    Ok(cached) if cached.sequence == metadata.sequence => {
+                        let slot = text_slot(
+                            device,
+                            cached.sequence,
+                            &cached.text,
+                            cached.captured_at,
+                            false,
+                            "stale",
+                        );
+                        remote_bodies.insert(slot.id.clone(), cached.text);
+                        snapshot.slots.push(slot);
+                    }
+                    Ok(_) => {
+                        tracing::warn!(device_id = %metadata.device_id, "cached clipboard sequence mismatch")
+                    }
+                    Err(error) => {
+                        tracing::warn!(device_id = %metadata.device_id, error = %error, "cached clipboard rejected")
+                    }
+                }
+            }
+        }
         Ok(Self {
-            snapshot: Mutex::new(UiSnapshot::initial(settings, runtime, trusted_devices)),
+            snapshot: Mutex::new(snapshot),
             store,
             identity,
-            remote_bodies: Mutex::new(HashMap::new()),
+            remote_bodies: Mutex::new(remote_bodies),
             suppress_next_capture: Mutex::new(None),
+            clipboard_cache,
         })
     }
 
@@ -307,6 +355,16 @@ impl ServiceState {
                 .cloned()
         })
     }
+
+    pub(crate) fn enabled_device_ids(&self) -> Result<std::collections::HashSet<String>, String> {
+        Ok(self
+            .store
+            .trusted_devices()?
+            .into_iter()
+            .filter(|device| device.sync_enabled)
+            .map(|device| device.device_id)
+            .collect())
+    }
 }
 
 fn emit_snapshot(app: &AppHandle, snapshot: &UiSnapshot) -> Result<(), String> {
@@ -339,6 +397,54 @@ fn truncate_text(text: &str, maximum_chars: usize) -> String {
     } else {
         preview
     }
+}
+
+fn text_slot(
+    device: &TrustedDevice,
+    sequence: u64,
+    text: &str,
+    captured_at: String,
+    online: bool,
+    availability: &str,
+) -> DeviceSlot {
+    DeviceSlot {
+        id: format!("device:{}", device.device_id),
+        revision: sequence,
+        device_id: device.device_id.clone(),
+        device_name: device.device_name.clone(),
+        platform: device.platform.clone(),
+        online,
+        pinned: None,
+        availability: availability.into(),
+        preview: truncate_text(text, 4096),
+        captured_at,
+        age_label: if online {
+            "刚刚".into()
+        } else {
+            "本机缓存".into()
+        },
+        groups: vec!["直接配对".into()],
+        sequence,
+        size: text.len() as u64,
+        representations: vec![ClipboardRepresentation {
+            id: "text/plain".into(),
+            kind: "text".into(),
+            label: "纯文本".into(),
+            mime: "text/plain;charset=utf-8".into(),
+            size: text.len() as u64,
+            status: "ready".into(),
+            enabled: true,
+        }],
+        blocked_reason: None,
+        progress: None,
+    }
+}
+
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 pub fn capture_local_clipboard(
@@ -375,7 +481,7 @@ pub fn capture_local_clipboard(
                 changed_at: now.clone(),
             };
         }
-        if !snapshot.publish_paused && !suppress_publish {
+        if !snapshot.publish_paused && snapshot.settings.allow_text && !suppress_publish {
             let preview = truncate_text(&text, 80);
             snapshot.last_published_preview = format!("本机最近捕获：{preview}");
         }
@@ -385,10 +491,11 @@ pub fn capture_local_clipboard(
         snapshot.clipboard_capability.limitation = None;
         Ok(())
     })?;
-    if !snapshot.publish_paused && !suppress_publish {
+    if !snapshot.publish_paused && snapshot.settings.allow_text && !suppress_publish {
         let sequence = state.store.next_origin_sequence()?;
         if let Some(transport) = app.try_state::<super::transport::TransportHandle>() {
-            transport.broadcast_text(sequence, text, now);
+            let enabled_devices = state.enabled_device_ids()?;
+            transport.broadcast_text(sequence, text, now, &enabled_devices);
         }
     }
     Ok(())
@@ -496,6 +603,7 @@ pub(crate) fn pairing_completed(
             platform: device.platform.clone(),
             paired_at: device.paired_at.clone(),
             online: true,
+            sync_enabled: device.sync_enabled,
         });
         if let Some(nearby) = snapshot
             .nearby_devices
@@ -546,6 +654,21 @@ pub(crate) fn receive_remote_text(
     if text.len() > 1024 * 1024 {
         return Err("远端文本超过 1 MiB".into());
     }
+    if !state
+        .trusted_device(&device.device_id)?
+        .is_some_and(|trusted| trusted.sync_enabled)
+    {
+        return Err("该设备的剪贴板同步已停用".into());
+    }
+    if !state
+        .snapshot
+        .lock()
+        .map_err(|_| "Rust 服务状态锁已损坏".to_string())?
+        .settings
+        .allow_text
+    {
+        return Err("本机策略已停用纯文本同步".into());
+    }
     if state
         .snapshot
         .lock()
@@ -562,6 +685,35 @@ pub(crate) fn receive_remote_text(
             .map_err(|_| "远端正文缓存锁已损坏".to_string())?;
         bodies.insert(slot_id.clone(), text.clone());
     }
+    match state.clipboard_cache.store(&CachedText {
+        device_id: device.device_id.clone(),
+        sequence,
+        text: text.clone(),
+        captured_at: captured_at.clone(),
+    }) {
+        Ok(Some(object_name)) => {
+            let metadata = CachedSlotMetadata {
+                device_id: device.device_id.clone(),
+                sequence,
+                object_name,
+                expires_at_unix: unix_seconds().saturating_add(24 * 60 * 60),
+            };
+            match state.store.save_cached_slot(&metadata) {
+                Ok(Some(previous)) if previous != metadata.object_name => {
+                    state.clipboard_cache.remove(&previous);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    state.clipboard_cache.remove(&metadata.object_name);
+                    tracing::warn!(device_id = %device.device_id, error = %error, "clipboard cache metadata unavailable")
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(device_id = %device.device_id, error = %error, "clipboard cache unavailable")
+        }
+    }
     update(state, app, |snapshot| {
         if let Some(existing) = snapshot
             .slots
@@ -572,33 +724,7 @@ pub(crate) fn receive_remote_text(
                 return Ok(());
             }
         }
-        let slot = DeviceSlot {
-            id: slot_id.clone(),
-            revision: sequence,
-            device_id: device.device_id.clone(),
-            device_name: device.device_name.clone(),
-            platform: device.platform.clone(),
-            online: true,
-            pinned: None,
-            availability: "ready".into(),
-            preview: truncate_text(&text, 4096),
-            captured_at: captured_at.clone(),
-            age_label: "刚刚".into(),
-            groups: vec!["直接配对".into()],
-            sequence,
-            size: text.len() as u64,
-            representations: vec![ClipboardRepresentation {
-                id: "text/plain".into(),
-                kind: "text".into(),
-                label: "纯文本".into(),
-                mime: "text/plain;charset=utf-8".into(),
-                size: text.len() as u64,
-                status: "ready".into(),
-                enabled: true,
-            }],
-            blocked_reason: None,
-            progress: None,
-        };
+        let slot = text_slot(device, sequence, &text, captured_at.clone(), true, "ready");
         snapshot
             .slots
             .retain(|item| item.device_id != device.device_id);
@@ -661,6 +787,86 @@ pub fn confirm_pairing(
     accepted: bool,
 ) -> Result<(), String> {
     transport.confirm_pairing(&pairing_id, accepted)
+}
+
+#[tauri::command]
+pub fn set_device_sync_enabled(
+    state: State<'_, ServiceState>,
+    transport: State<'_, super::transport::TransportHandle>,
+    app: AppHandle,
+    device_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    state.store.set_device_sync_enabled(&device_id, enabled)?;
+    update(&state, &app, |snapshot| {
+        let device = snapshot
+            .trusted_devices
+            .iter_mut()
+            .find(|device| device.device_id == device_id)
+            .ok_or_else(|| "可信设备不存在".to_string())?;
+        device.sync_enabled = enabled;
+        if !enabled {
+            device.online = false;
+            snapshot.slots.retain(|slot| slot.device_id != device_id);
+        }
+        Ok(())
+    })?;
+    if enabled {
+        if let Some(nearby) = state.nearby_device(&device_id) {
+            transport.connect_trusted(app, nearby);
+        }
+    } else {
+        transport.disable_peer(&device_id);
+        state
+            .remote_bodies
+            .lock()
+            .map_err(|_| "远端正文缓存锁已损坏".to_string())?
+            .remove(&format!("device:{device_id}"));
+        if let Some(object_name) = state.store.remove_cached_slot(&device_id)? {
+            state.clipboard_cache.remove(&object_name);
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn revoke_device(
+    state: State<'_, ServiceState>,
+    transport: State<'_, super::transport::TransportHandle>,
+    app: AppHandle,
+    device_id: String,
+) -> Result<(), String> {
+    let revoked_at = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".into());
+    if let Some(object_name) = state.store.remove_cached_slot(&device_id)? {
+        state.clipboard_cache.remove(&object_name);
+    }
+    state.store.revoke_device(&device_id, &revoked_at)?;
+    transport.disable_peer(&device_id);
+    state
+        .remote_bodies
+        .lock()
+        .map_err(|_| "远端正文缓存锁已损坏".to_string())?
+        .remove(&format!("device:{device_id}"));
+    update(&state, &app, |snapshot| {
+        snapshot
+            .trusted_devices
+            .retain(|device| device.device_id != device_id);
+        snapshot.slots.retain(|slot| slot.device_id != device_id);
+        snapshot
+            .pending_pairings
+            .retain(|pairing| pairing.device_id != device_id);
+        if let Some(nearby) = snapshot
+            .nearby_devices
+            .iter_mut()
+            .find(|device| device.device_id == device_id)
+        {
+            nearby.paired = false;
+        }
+        Ok(())
+    })?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -785,9 +991,34 @@ pub fn update_settings(
         }
         snapshot.settings =
             serde_json::from_value(current).map_err(|error| format!("设置值无效：{error}"))?;
+        if !snapshot.settings.allow_text {
+            snapshot.slots.retain(|slot| {
+                !slot
+                    .representations
+                    .iter()
+                    .any(|representation| representation.kind == "text")
+            });
+            snapshot.imports.clear();
+        }
         Ok(())
     })?;
-    state.store.save_settings(&snapshot.settings)
+    state.store.save_settings(&snapshot.settings)?;
+    if !snapshot.settings.allow_text {
+        if let Some(transport) = app.try_state::<super::transport::TransportHandle>() {
+            transport.clear_latest_offer();
+        }
+        state
+            .remote_bodies
+            .lock()
+            .map_err(|_| "远端正文缓存锁已损坏".to_string())?
+            .clear();
+        for device in state.store.trusted_devices()? {
+            if let Some(object_name) = state.store.remove_cached_slot(&device.device_id)? {
+                state.clipboard_cache.remove(&object_name);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -807,6 +1038,9 @@ pub fn create_import_intent(
         .find(|slot| slot.id == slot_id && slot.revision == revision)
         .cloned()
         .ok_or_else(|| "设备槽位不存在或已经更新".to_string())?;
+    if !snapshot.settings.allow_text {
+        return Err("本机策略已停用纯文本取用".into());
+    }
     let bodies = state
         .remote_bodies
         .lock()

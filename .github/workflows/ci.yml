@@ -1,5 +1,8 @@
 name: CI
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
@@ -12,6 +15,7 @@ concurrency:
 jobs:
   frontend:
     runs-on: ubuntu-22.04
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: app
@@ -34,6 +38,7 @@ jobs:
       matrix:
         os: [ubuntu-22.04, windows-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -43,7 +48,7 @@ jobs:
           cache-dependency-path: app/package-lock.json
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
         run: |
@@ -54,3 +59,4 @@ jobs:
       - run: cargo fmt --manifest-path app/src-tauri/Cargo.toml -- --check
       - run: cargo test --manifest-path app/src-tauri/Cargo.toml
       - run: cargo check --manifest-path app/src-tauri/Cargo.toml
+      - run: cargo clippy --manifest-path app/src-tauri/Cargo.toml --all-targets -- -D warnings

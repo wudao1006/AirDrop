@@ -101,6 +101,14 @@ class TauriAppClient implements DesktopClient {
   confirmPairing(pairingId: string, accepted: boolean): Promise<void> {
     return invoke("confirm_pairing", { pairingId, accepted });
   }
+
+  setDeviceSyncEnabled(deviceId: string, enabled: boolean): Promise<void> {
+    return invoke("set_device_sync_enabled", { deviceId, enabled });
+  }
+
+  revokeDevice(deviceId: string): Promise<void> {
+    return invoke("revoke_device", { deviceId });
+  }
 }
 
 export const createDesktopClient = (): DesktopClient => {

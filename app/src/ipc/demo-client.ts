@@ -114,6 +114,7 @@ const initialSnapshot: UiSnapshot = {
   nearbyDevices: [],
   trustedDevices: [],
   pendingPairings: [],
+  cachePersistent: false,
   imports: [],
   settings: {
     ...DEFAULT_APPEARANCE_SETTINGS,
@@ -332,6 +333,20 @@ export class DemoDesktopClient implements DesktopClient {
 
   async confirmPairing(_pairingId: string, _accepted: boolean): Promise<void> {
     throw new Error("浏览器预览没有真实配对会话");
+  }
+
+  async setDeviceSyncEnabled(deviceId: string, enabled: boolean): Promise<void> {
+    const device = this.snapshot.trustedDevices.find((item) => item.deviceId === deviceId);
+    if (!device) throw new Error("可信设备不存在");
+    device.syncEnabled = enabled;
+    if (!enabled) device.online = false;
+    this.bump();
+  }
+
+  async revokeDevice(deviceId: string): Promise<void> {
+    this.snapshot.trustedDevices = this.snapshot.trustedDevices.filter((item) => item.deviceId !== deviceId);
+    this.snapshot.slots = this.snapshot.slots.filter((item) => item.deviceId !== deviceId);
+    this.bump();
   }
 
   private bump(): void {

@@ -9,10 +9,13 @@ const SERVICE_TYPE: &str = "_localdrop._udp.local.";
 pub(crate) const TRANSPORT_PORT: u16 = 43_721;
 
 pub(crate) fn start(app: AppHandle) -> Result<(), String> {
-    let state = app.state::<service::ServiceState>();
-    let device_id = state.device_id().to_string();
-    let device_name = state.device_name().to_string();
-    drop(state);
+    let (device_id, device_name) = {
+        let state = app.state::<service::ServiceState>();
+        (
+            state.device_id().to_string(),
+            state.device_name().to_string(),
+        )
+    };
 
     let daemon = ServiceDaemon::new().map_err(|error| format!("无法启动局域网发现：{error}"))?;
     let service_instance_id = Uuid::new_v4().simple().to_string();
@@ -86,9 +89,10 @@ pub(crate) fn start(app: AppHandle) -> Result<(), String> {
                         last_seen_at: now(),
                         paired: false,
                     };
-                    let state = app.state::<service::ServiceState>();
-                    let _ = service::upsert_nearby_device(&state, &app, nearby.clone());
-                    drop(state);
+                    {
+                        let state = app.state::<service::ServiceState>();
+                        let _ = service::upsert_nearby_device(&state, &app, nearby.clone());
+                    }
                     if app
                         .state::<service::ServiceState>()
                         .trusted_device(&nearby.device_id)

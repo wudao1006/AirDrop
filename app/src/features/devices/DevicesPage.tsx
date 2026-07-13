@@ -19,6 +19,7 @@ export function DevicesPage({ snapshot, client, onError }: {
   onError: (message: string) => void;
 }) {
   const [pairingWindowOpen, setPairingWindowOpen] = useState(false);
+  const [revokingId, setRevokingId] = useState<string | null>(null);
   const execute = async (operation: () => Promise<void>) => {
     try {
       await operation();
@@ -55,7 +56,11 @@ export function DevicesPage({ snapshot, client, onError }: {
       {snapshot.trustedDevices.length === 0 ? <EmptyState icon="devices" title="尚未配对设备" description="完成双方验证码确认后，可信设备会保存在本机。" /> : snapshot.trustedDevices.map((device) => <div className="list-row" key={device.deviceId}>
         <div className="device-avatar"><Icon name={platformIcon[device.platform]} size={20} /><i className={`online-dot ${device.online ? "" : "offline"}`} /></div>
         <div className="list-row-main"><strong>{device.deviceName}</strong><span>{device.platform} · 身份已固定 · {new Date(device.pairedAt).toLocaleDateString()}</span></div>
-        <StatusBadge tone={device.online ? "success" : "neutral"} icon={device.online ? "check" : "clock"}>{device.online ? "安全连接中" : "离线"}</StatusBadge>
+        <StatusBadge tone={!device.syncEnabled ? "warning" : device.online ? "success" : "neutral"} icon={!device.syncEnabled ? "pause" : device.online ? "check" : "clock"}>{!device.syncEnabled ? "同步已停用" : device.online ? "安全连接中" : "离线"}</StatusBadge>
+        <div className="device-row-actions">
+          <button type="button" className="button" onClick={() => execute(() => client.setDeviceSyncEnabled(device.deviceId, !device.syncEnabled))}>{device.syncEnabled ? "停用同步" : "恢复同步"}</button>
+          {revokingId === device.deviceId ? <><button type="button" className="button" onClick={() => setRevokingId(null)}>取消</button><button type="button" className="button danger" onClick={() => execute(async () => { await client.revokeDevice(device.deviceId); setRevokingId(null); })}>确认解除</button></> : <button type="button" className="icon-button" aria-label={`解除与 ${device.deviceName} 的配对`} title="解除配对" onClick={() => setRevokingId(device.deviceId)}><Icon name="x" size={16} /></button>}
+        </div>
       </div>)}
     </div></section>
   </div>;

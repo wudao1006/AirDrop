@@ -198,6 +198,9 @@ button:disabled { cursor: default; opacity: .58; }
 .pairing-code { padding: 12px 16px; border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--border)); border-radius: 16px; background: color-mix(in srgb, var(--surface-solid) 64%, transparent); font: 700 25px/1 ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .12em; color: var(--text); }
 .pairing-code span { color: var(--accent); }
 .pairing-actions { display: flex; gap: 8px; }
+.device-row-actions { display: flex; align-items: center; gap: 7px; }
+.button.danger { border-color: color-mix(in srgb, var(--danger) 38%, var(--border)); color: var(--danger); background: color-mix(in srgb, var(--danger-soft) 76%, transparent); }
+.button.danger:hover { border-color: color-mix(in srgb, var(--danger) 58%, var(--border)); background: var(--danger-soft); }
 @media (max-width: 900px) { .pairing-panel { grid-template-columns: 1fr auto; } .pairing-actions { grid-column: 1 / -1; justify-content: flex-end; } }
 .activity-banner { display: flex; align-items: center; gap: 11px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 13px; background: var(--surface); }
 .activity-banner .activity-icon { display: grid; place-items: center; width: 35px; height: 35px; border-radius: 11px; }

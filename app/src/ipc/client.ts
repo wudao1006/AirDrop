@@ -17,6 +17,8 @@ export interface AppClient {
   allowPairing(): Promise<void>;
   beginPairing(instanceId: string): Promise<void>;
   confirmPairing(pairingId: string, accepted: boolean): Promise<void>;
+  setDeviceSyncEnabled(deviceId: string, enabled: boolean): Promise<void>;
+  revokeDevice(deviceId: string): Promise<void>;
 }
 
 export type DesktopClient = AppClient;

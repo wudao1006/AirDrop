@@ -37,6 +37,11 @@ struct PairCommandRegistration {
     pairing_id: String,
 }
 
+struct PeerConnection {
+    sender: mpsc::UnboundedSender<TrustedMessage>,
+    connection: Connection,
+}
+
 impl Drop for PairCommandRegistration {
     fn drop(&mut self) {
         if let Ok(mut commands) = self.commands.lock() {
@@ -52,7 +57,7 @@ pub(crate) struct TransportHandle {
     certificate_der: Vec<u8>,
     pairing_allowed_until: Arc<Mutex<u64>>,
     pair_commands: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<bool>>>>,
-    peers: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<TrustedMessage>>>>,
+    peers: Arc<Mutex<HashMap<String, PeerConnection>>>,
     connecting: Arc<Mutex<HashSet<String>>>,
     latest_offer: Arc<Mutex<Option<TrustedMessage>>>,
 }
@@ -76,7 +81,13 @@ impl TransportHandle {
             .map_err(|_| "配对连接已断开".to_string())
     }
 
-    pub(crate) fn broadcast_text(&self, sequence: u64, text: String, captured_at: String) {
+    pub(crate) fn broadcast_text(
+        &self,
+        sequence: u64,
+        text: String,
+        captured_at: String,
+        enabled_devices: &HashSet<String>,
+    ) {
         if text.len() > 1024 * 1024 {
             return;
         }
@@ -91,9 +102,29 @@ impl TransportHandle {
             *latest = Some(message.clone());
         }
         if let Ok(peers) = self.peers.lock() {
-            for sender in peers.values() {
-                let _ = sender.send(message.clone());
+            for (device_id, peer) in peers.iter() {
+                if enabled_devices.contains(device_id) {
+                    let _ = peer.sender.send(message.clone());
+                }
             }
+        }
+    }
+
+    pub(crate) fn disable_peer(&self, device_id: &str) {
+        if let Ok(mut peers) = self.peers.lock() {
+            if let Some(peer) = peers.remove(device_id) {
+                peer.connection
+                    .close(3u32.into(), b"device synchronization disabled");
+            }
+        }
+        if let Ok(mut connecting) = self.connecting.lock() {
+            connecting.remove(device_id);
+        }
+    }
+
+    pub(crate) fn clear_latest_offer(&self) {
+        if let Ok(mut latest) = self.latest_offer.lock() {
+            *latest = None;
         }
     }
 
@@ -111,6 +142,11 @@ impl TransportHandle {
         let local_should_dial = {
             let state = app.state::<ServiceState>();
             state.device_id() < device_id.as_str()
+                && state
+                    .trusted_device(&device_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|device| device.sync_enabled)
         };
         if !local_should_dial {
             return;
@@ -138,7 +174,16 @@ impl TransportHandle {
                 }
                 let current = {
                     let state = app.state::<ServiceState>();
-                    state.nearby_device(&device_id)
+                    if !state
+                        .trusted_device(&device_id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|device| device.sync_enabled)
+                    {
+                        None
+                    } else {
+                        state.nearby_device(&device_id)
+                    }
                 };
                 let Some(current) = current else {
                     break;
@@ -176,23 +221,25 @@ impl TransportHandle {
             .open_bi()
             .await
             .map_err(|error| format!("无法打开配对控制流：{error}"))?;
-        let state = app.state::<ServiceState>();
         let pairing_id = uuid::Uuid::new_v4().simple().to_string();
         let initiator_nonce = random_bytes(32);
-        write_frame(
-            &mut send,
-            &PairMessage::Init {
-                schema_version: 1,
-                pairing_id: pairing_id.clone(),
-                nonce: BASE64.encode(&initiator_nonce),
-                device_id: state.device_id().to_string(),
-                device_name: state.device_name().to_string(),
-                platform: platform::platform_name().to_string(),
-                public_key: BASE64.encode(&state.identity().public_key_bytes()),
-                certificate: BASE64.encode(&self.certificate_der),
-            },
-        )
-        .await?;
+        let (init, local_device_id) = {
+            let state = app.state::<ServiceState>();
+            (
+                PairMessage::Init {
+                    schema_version: 1,
+                    pairing_id: pairing_id.clone(),
+                    nonce: BASE64.encode(&initiator_nonce),
+                    device_id: state.device_id().to_string(),
+                    device_name: state.device_name().to_string(),
+                    platform: platform::platform_name().to_string(),
+                    public_key: BASE64.encode(&state.identity().public_key_bytes()),
+                    certificate: BASE64.encode(&self.certificate_der),
+                },
+                state.device_id().to_string(),
+            )
+        };
+        write_frame(&mut send, &init).await?;
         let hello: PairMessage = read_frame(&mut receive).await?;
         let PairMessage::Hello {
             schema_version: 1,
@@ -224,15 +271,15 @@ impl TransportHandle {
             public_key,
             certificate_der,
             paired_at: now(),
+            sync_enabled: true,
         };
         let context = pairing_context(
             &pairing_id,
             &initiator_nonce,
             &responder_nonce,
-            state.device_id(),
+            &local_device_id,
             &device.device_id,
         );
-        drop(state);
         self.run_pair_confirmation(
             app, connection, send, receive, device, pairing_id, context, "outgoing",
         )
@@ -244,11 +291,15 @@ impl TransportHandle {
         app: AppHandle,
         nearby: service::NearbyDevice,
     ) -> Result<(), String> {
-        let state = app.state::<ServiceState>();
-        let trusted = state
-            .trusted_device(&nearby.device_id)?
-            .ok_or_else(|| "设备尚未配对".to_string())?;
-        drop(state);
+        let trusted = {
+            let state = app.state::<ServiceState>();
+            state
+                .trusted_device(&nearby.device_id)?
+                .ok_or_else(|| "设备尚未配对".to_string())?
+        };
+        if !trusted.sync_enabled {
+            return Err("该设备的剪贴板同步已停用".into());
+        }
         let config = client_config(Some(trusted.certificate_der.clone()), TRUSTED_ALPN)?;
         let connection = self
             .endpoint
@@ -285,23 +336,24 @@ impl TransportHandle {
         let expires_at = (OffsetDateTime::now_utc() + time::Duration::seconds(120))
             .format(&Rfc3339)
             .unwrap_or_else(|_| now());
-        let state = app.state::<ServiceState>();
-        state.save_pending_pairing(&pairing_id, &device, &expires_at)?;
-        service::show_pending_pairing(
-            &state,
-            &app,
-            PendingPairing {
-                pairing_id: pairing_id.clone(),
-                device_id: device.device_id.clone(),
-                device_name: device.device_name.clone(),
-                platform: device.platform.clone(),
-                sas,
-                direction: direction.into(),
-                expires_at,
-                status: "awaiting_confirmation".into(),
-            },
-        )?;
-        drop(state);
+        {
+            let state = app.state::<ServiceState>();
+            state.save_pending_pairing(&pairing_id, &device, &expires_at)?;
+            service::show_pending_pairing(
+                &state,
+                &app,
+                PendingPairing {
+                    pairing_id: pairing_id.clone(),
+                    device_id: device.device_id.clone(),
+                    device_name: device.device_name.clone(),
+                    platform: device.platform.clone(),
+                    sas,
+                    direction: direction.into(),
+                    expires_at,
+                    status: "awaiting_confirmation".into(),
+                },
+            )?;
+        }
         let (command_tx, mut command_rx) = mpsc::unbounded_channel();
         self.pair_commands
             .lock()
@@ -340,11 +392,12 @@ impl TransportHandle {
                             }
                         PairMessage::Complete { schema_version: 1, pairing_id: remote_id } if remote_id == pairing_id => {
                             let paired_at = now();
-                            let state = app.state::<ServiceState>();
-                            let promoted = state.promote_trusted_device(&pairing_id, &paired_at)?;
-                            service::pairing_completed(&state, &app, &pairing_id, promoted)?;
-                            let nearby = state.nearby_device(&device.device_id);
-                            drop(state);
+                            let nearby = {
+                                let state = app.state::<ServiceState>();
+                                let promoted = state.promote_trusted_device(&pairing_id, &paired_at)?;
+                                service::pairing_completed(&state, &app, &pairing_id, promoted)?;
+                                state.nearby_device(&device.device_id)
+                            };
                             connection.close(0u32.into(), b"paired");
                             if let Some(nearby) = nearby {
                                 self.connect_trusted(app.clone(), nearby);
@@ -379,19 +432,20 @@ impl TransportHandle {
         mut receive: quinn::RecvStream,
         expected: Option<TrustedDevice>,
     ) -> Result<(), String> {
-        let state = app.state::<ServiceState>();
         let nonce = uuid::Uuid::new_v4().simple().to_string();
-        let payload = hello_payload(state.device_id(), &nonce);
-        let hello = TrustedMessage::Hello {
-            schema_version: 1,
-            device_id: state.device_id().to_string(),
-            device_name: state.device_name().to_string(),
-            platform: platform::platform_name().to_string(),
-            nonce,
-            public_key: BASE64.encode(&state.identity().public_key_bytes()),
-            signature: BASE64.encode(&state.identity().sign(&payload).to_bytes()),
+        let hello = {
+            let state = app.state::<ServiceState>();
+            let payload = hello_payload(state.device_id(), &nonce);
+            TrustedMessage::Hello {
+                schema_version: 1,
+                device_id: state.device_id().to_string(),
+                device_name: state.device_name().to_string(),
+                platform: platform::platform_name().to_string(),
+                nonce,
+                public_key: BASE64.encode(&state.identity().public_key_bytes()),
+                signature: BASE64.encode(&state.identity().sign(&payload).to_bytes()),
+            }
         };
-        drop(state);
         write_frame(&mut send, &hello).await?;
         let remote: TrustedMessage = read_frame(&mut receive).await?;
         let TrustedMessage::Hello {
@@ -412,18 +466,29 @@ impl TransportHandle {
         {
             return Err("可信连接返回了不同设备身份".into());
         }
-        let state = app.state::<ServiceState>();
-        let trusted = state
-            .trusted_device(&device_id)?
-            .ok_or_else(|| "对端身份不在可信设备中".to_string())?;
-        verify_hello(&trusted, &nonce, &public_key, &signature)?;
-        service::set_trusted_online(&state, &app, &device_id, true)?;
-        drop(state);
+        let trusted = {
+            let state = app.state::<ServiceState>();
+            let trusted = state
+                .trusted_device(&device_id)?
+                .ok_or_else(|| "对端身份不在可信设备中".to_string())?;
+            if !trusted.sync_enabled {
+                return Err("该设备的剪贴板同步已停用".into());
+            }
+            verify_hello(&trusted, &nonce, &public_key, &signature)?;
+            service::set_trusted_online(&state, &app, &device_id, true)?;
+            trusted
+        };
         let (sender, mut outbound) = mpsc::unbounded_channel::<TrustedMessage>();
         self.peers
             .lock()
             .map_err(|_| "可信连接表锁已损坏".to_string())?
-            .insert(device_id.clone(), sender);
+            .insert(
+                device_id.clone(),
+                PeerConnection {
+                    sender,
+                    connection: connection.clone(),
+                },
+            );
         if let Some(latest) = self
             .latest_offer
             .lock()
@@ -431,8 +496,8 @@ impl TransportHandle {
             .and_then(|latest| latest.clone())
         {
             if let Ok(peers) = self.peers.lock() {
-                if let Some(sender) = peers.get(&device_id) {
-                    let _ = sender.send(latest);
+                if let Some(peer) = peers.get(&device_id) {
+                    let _ = peer.sender.send(latest);
                 }
             }
         }
@@ -468,7 +533,12 @@ impl TransportHandle {
                 Err(error) => {
                     writer.abort();
                     if let Ok(mut peers) = self.peers.lock() {
-                        peers.remove(&device_id);
+                        let is_current = peers.get(&device_id).is_some_and(|peer| {
+                            peer.connection.stable_id() == connection.stable_id()
+                        });
+                        if is_current {
+                            peers.remove(&device_id);
+                        }
                     }
                     let state = app.state::<ServiceState>();
                     let _ = service::set_trusted_online(&state, &app, &device_id, false);
@@ -481,16 +551,19 @@ impl TransportHandle {
 }
 
 pub(crate) fn start(app: AppHandle) -> Result<TransportHandle, String> {
-    let state = app.state::<ServiceState>();
-    let key_pair = KeyPair::try_from(state.identity().pkcs8_der())
-        .map_err(|error| format!("无法载入 TLS 身份密钥：{error}"))?;
-    let certificate = CertificateParams::new(vec![state.device_id().to_string()])
-        .map_err(|error| format!("无法创建 TLS 证书参数：{error}"))?
-        .self_signed(&key_pair)
-        .map_err(|error| format!("无法签发 TLS 证书：{error}"))?;
-    let certificate_der = certificate.der().to_vec();
-    let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
-    drop(state);
+    let (certificate_der, private_key) = {
+        let state = app.state::<ServiceState>();
+        let key_pair = KeyPair::try_from(state.identity().pkcs8_der())
+            .map_err(|error| format!("无法载入 TLS 身份密钥：{error}"))?;
+        let certificate = CertificateParams::new(vec![state.device_id().to_string()])
+            .map_err(|error| format!("无法创建 TLS 证书参数：{error}"))?
+            .self_signed(&key_pair)
+            .map_err(|error| format!("无法签发 TLS 证书：{error}"))?;
+        (
+            certificate.der().to_vec(),
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der())),
+        )
+    };
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     let app_for_thread = app.clone();
     let certificate_for_thread = certificate_der.clone();
@@ -616,30 +689,31 @@ async fn accept_pairing(
     let public_key = validate_identity(&device_id, &public_key)?;
     let certificate_der = decode(&certificate, "设备证书")?;
     let responder_nonce = random_bytes(32);
-    let state = app.state::<ServiceState>();
-    write_frame(
-        &mut send,
-        &PairMessage::Hello {
-            schema_version: 1,
-            pairing_id: pairing_id.clone(),
-            initiator_nonce: nonce,
-            responder_nonce: BASE64.encode(&responder_nonce),
-            device_id: state.device_id().to_string(),
-            device_name: state.device_name().to_string(),
-            platform: platform::platform_name().to_string(),
-            public_key: BASE64.encode(&state.identity().public_key_bytes()),
-            certificate: BASE64.encode(&handle.certificate_der),
-        },
-    )
-    .await?;
+    let (hello, local_device_id) = {
+        let state = app.state::<ServiceState>();
+        (
+            PairMessage::Hello {
+                schema_version: 1,
+                pairing_id: pairing_id.clone(),
+                initiator_nonce: nonce,
+                responder_nonce: BASE64.encode(&responder_nonce),
+                device_id: state.device_id().to_string(),
+                device_name: state.device_name().to_string(),
+                platform: platform::platform_name().to_string(),
+                public_key: BASE64.encode(&state.identity().public_key_bytes()),
+                certificate: BASE64.encode(&handle.certificate_der),
+            },
+            state.device_id().to_string(),
+        )
+    };
+    write_frame(&mut send, &hello).await?;
     let context = pairing_context(
         &pairing_id,
         &initiator_nonce,
         &responder_nonce,
         &device_id,
-        state.device_id(),
+        &local_device_id,
     );
-    drop(state);
     let device = TrustedDevice {
         device_id,
         device_name,
@@ -647,6 +721,7 @@ async fn accept_pairing(
         public_key,
         certificate_der,
         paired_at: now(),
+        sync_enabled: true,
     };
     handle
         .run_pair_confirmation(
@@ -659,6 +734,18 @@ fn create_endpoint(
     certificate_der: Vec<u8>,
     private_key: PrivateKeyDer<'static>,
 ) -> Result<Endpoint, String> {
+    let server = server_config(certificate_der, private_key)?;
+    Endpoint::server(
+        server,
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), TRANSPORT_PORT),
+    )
+    .map_err(|error| format!("无法监听 QUIC 端口 {TRANSPORT_PORT}：{error}"))
+}
+
+fn server_config(
+    certificate_der: Vec<u8>,
+    private_key: PrivateKeyDer<'static>,
+) -> Result<quinn::ServerConfig, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut crypto = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
@@ -670,12 +757,7 @@ fn create_endpoint(
     crypto.max_early_data_size = 0;
     let quic = quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
         .map_err(|error| format!("无法配置 QUIC TLS：{error}"))?;
-    let server = quinn::ServerConfig::with_crypto(Arc::new(quic));
-    Endpoint::server(
-        server,
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), TRANSPORT_PORT),
-    )
-    .map_err(|error| format!("无法监听 QUIC 端口 {TRANSPORT_PORT}：{error}"))
+    Ok(quinn::ServerConfig::with_crypto(Arc::new(quic)))
 }
 
 fn client_config(
@@ -944,6 +1026,74 @@ mod tests {
                 .to_vec()
         };
         assert_eq!(issue(), issue());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pinned_quic_connection_exchanges_framed_messages() {
+        let directory = std::env::temp_dir().join(format!(
+            "airdrop-quic-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let identity = Identity::load_or_create(&directory).unwrap();
+        let key_pair = KeyPair::try_from(identity.pkcs8_der()).unwrap();
+        let certificate = CertificateParams::new(vec![identity.device_id().to_string()])
+            .unwrap()
+            .self_signed(&key_pair)
+            .unwrap()
+            .der()
+            .to_vec();
+        let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
+        let server = Endpoint::server(
+            server_config(certificate.clone(), private_key).unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let server_address = server.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let connection = server.accept().await.unwrap().await.unwrap();
+            let (mut send, mut receive) = connection.accept_bi().await.unwrap();
+            let message: TrustedMessage = read_frame(&mut receive).await.unwrap();
+            assert!(matches!(
+                message,
+                TrustedMessage::ClipboardSlotOffer {
+                    origin_sequence: 7,
+                    ref text,
+                    ..
+                } if text == "hello over quic"
+            ));
+            write_frame(&mut send, &message).await.unwrap();
+            send.finish().unwrap();
+            connection.closed().await;
+        });
+
+        let mut client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(client_config(Some(certificate), TRUSTED_ALPN).unwrap());
+        let connection = client
+            .connect(server_address, "localdrop")
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut send, mut receive) = connection.open_bi().await.unwrap();
+        let offer = TrustedMessage::ClipboardSlotOffer {
+            schema_version: 1,
+            message_id: uuid::Uuid::new_v4().simple().to_string(),
+            origin_sequence: 7,
+            captured_at: "2026-07-13T00:00:00Z".into(),
+            text: "hello over quic".into(),
+        };
+        write_frame(&mut send, &offer).await.unwrap();
+        let echoed: TrustedMessage = read_frame(&mut receive).await.unwrap();
+        assert!(matches!(
+            echoed,
+            TrustedMessage::ClipboardSlotOffer {
+                origin_sequence: 7,
+                text,
+                ..
+            } if text == "hello over quic"
+        ));
+        client.close(0u32.into(), b"done");
+        server_task.await.unwrap();
         let _ = std::fs::remove_dir_all(directory);
     }
 }
