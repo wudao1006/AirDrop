@@ -12,6 +12,7 @@ export interface FloatingRect {
 
 export interface FloatingPlacement {
   side: FloatingOrbSide;
+  horizontalFraction?: number;
   verticalFraction: number;
 }
 
@@ -26,6 +27,28 @@ export const verticalFractionForRect = (rect: FloatingRect, workArea: FloatingRe
   return travel === 0 ? 0 : clamp((rect.y - workArea.y) / travel, 0, 1);
 };
 
+export const horizontalFractionForRect = (rect: FloatingRect, workArea: FloatingRect): number => {
+  const travel = Math.max(0, workArea.width - rect.width);
+  return travel === 0 ? 0 : clamp((rect.x - workArea.x) / travel, 0, 1);
+};
+
+export const clampedRect = (rect: FloatingRect, workArea: FloatingRect): FloatingRect => {
+  const width = Math.min(rect.width, workArea.width);
+  const height = Math.min(rect.height, workArea.height);
+  return {
+    x: clamp(rect.x, workArea.x, workArea.x + workArea.width - width),
+    y: clamp(rect.y, workArea.y, workArea.y + workArea.height - height),
+    width,
+    height,
+  };
+};
+
+export const sameRect = (left: FloatingRect, right: FloatingRect, tolerance = 0.5): boolean =>
+  Math.abs(left.x - right.x) <= tolerance
+  && Math.abs(left.y - right.y) <= tolerance
+  && Math.abs(left.width - right.width) <= tolerance
+  && Math.abs(left.height - right.height) <= tolerance;
+
 export const snappedRect = (
   workArea: FloatingRect,
   size: Pick<FloatingRect, "width" | "height">,
@@ -34,7 +57,7 @@ export const snappedRect = (
   const width = Math.min(size.width, workArea.width);
   const height = Math.min(size.height, workArea.height);
   return {
-    x: placement.side === "left" ? workArea.x : workArea.x + workArea.width - width,
+    x: workArea.x + clamp(placement.horizontalFraction ?? (placement.side === "left" ? 0 : 1), 0, 1) * Math.max(0, workArea.width - width),
     y: workArea.y + clamp(placement.verticalFraction, 0, 1) * Math.max(0, workArea.height - height),
     width,
     height,

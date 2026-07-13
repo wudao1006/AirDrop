@@ -7,6 +7,7 @@ import type { FloatingAdapter } from "./floating-adapter";
 import { FLOATING_EVENTS } from "./floating-events";
 import {
   FLOATING_SIDE_STORAGE_KEY,
+  FLOATING_HORIZONTAL_STORAGE_KEY,
   FLOATING_VERTICAL_STORAGE_KEY,
   FloatingOrbManager,
   readFloatingPlacement,
@@ -39,8 +40,22 @@ const setup = async (overrides: Partial<FloatingAdapter> = {}) => {
 describe("FloatingOrbManager", () => {
   it("defaults an absent stored vertical fraction to the middle", () => {
     localStorage.removeItem(FLOATING_SIDE_STORAGE_KEY);
+    localStorage.removeItem(FLOATING_HORIZONTAL_STORAGE_KEY);
     localStorage.removeItem(FLOATING_VERTICAL_STORAGE_KEY);
-    expect(readFloatingPlacement()).toEqual({ side: "right", verticalFraction: 0.5 });
+    expect(readFloatingPlacement()).toEqual({ side: "right", horizontalFraction: 1, verticalFraction: 0.5 });
+  });
+
+  it("does not create a programmatic move loop when dragged bounds are already valid", async () => {
+    let moved: (() => void) | undefined;
+    const { demo, snapshot, adapter } = await setup({
+      onOrbMoved: vi.fn(async (handler) => { moved = handler; return () => undefined; }),
+    });
+    render(<FloatingOrbManager client={demo} snapshot={snapshot} setPage={vi.fn()} onError={vi.fn()} adapter={adapter} />);
+    await waitFor(() => expect(moved).toBeTypeOf("function"));
+    vi.mocked(adapter.setOrbBounds).mockClear();
+    moved?.();
+    await new Promise((resolve) => window.setTimeout(resolve, 220));
+    expect(adapter.setOrbBounds).not.toHaveBeenCalled();
   });
 
   it("broadcasts state only after the ready handshake and dispatches actions", async () => {

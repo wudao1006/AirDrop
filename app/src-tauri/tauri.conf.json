@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "AirDrop",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "identifier": "io.github.wudao1006.airdrop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -34,6 +34,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": "all",
     "category": "Utility",
     "shortDescription": "Local-first multi-device clipboard switcher",
@@ -45,5 +46,13 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDIwMkNDRUE3MzQ0MDA1M0IKUldRN0JVQTBwODRzSUxnRHBtU1J2QTk0Wi8yNTJPOUpDaTU0MTZmU2FVcDk2d25BaFdxWkRvaGsK",
+      "endpoints": [
+        "https://github.com/wudao1006/AirDrop/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

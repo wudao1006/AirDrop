@@ -93,6 +93,7 @@ const containsCenter = (area: FloatingRect, bounds: FloatingRect): boolean => {
 export class TauriFloatingAdapter implements FloatingAdapter {
   readonly supported = true;
   private orb: FloatingNativeWindow | null = null;
+  private ignoreMoveEventsUntil = 0;
 
   constructor(private readonly tauri: FloatingTauriBoundary) {}
 
@@ -161,7 +162,9 @@ export class TauriFloatingAdapter implements FloatingAdapter {
 
   async onOrbMoved(handler: () => void): Promise<UnlistenFn> {
     const orb = await this.requireOrb();
-    return orb.onMoved(handler);
+    return orb.onMoved(() => {
+      if (Date.now() >= this.ignoreMoveEventsUntil) handler();
+    });
   }
 
   async getOrbBounds(): Promise<FloatingRect> {
@@ -190,9 +193,21 @@ export class TauriFloatingAdapter implements FloatingAdapter {
 
   async setOrbBounds(bounds: FloatingRect): Promise<void> {
     const orb = await this.requireOrb();
-    // Keep the anchored edge stable by moving before resizing when growing left.
-    await orb.setPosition(new LogicalPosition(Math.round(bounds.x), Math.round(bounds.y)));
-    await orb.setSize(new LogicalSize(Math.round(bounds.width), Math.round(bounds.height)));
+    const current = await this.getOrbBounds();
+    const x = Math.round(bounds.x);
+    const y = Math.round(bounds.y);
+    const width = Math.round(bounds.width);
+    const height = Math.round(bounds.height);
+    const positionChanged = Math.abs(current.x - x) > 0.5 || Math.abs(current.y - y) > 0.5;
+    const sizeChanged = Math.abs(current.width - width) > 0.5 || Math.abs(current.height - height) > 0.5;
+    if (!positionChanged && !sizeChanged) return;
+
+    this.ignoreMoveEventsUntil = Date.now() + 350;
+    const growing = width * height > current.width * current.height;
+    if (growing && positionChanged) await orb.setPosition(new LogicalPosition(x, y));
+    if (sizeChanged) await orb.setSize(new LogicalSize(width, height));
+    if (!growing && positionChanged) await orb.setPosition(new LogicalPosition(x, y));
+    this.ignoreMoveEventsUntil = Date.now() + 350;
   }
 
   private async requireOrb(): Promise<FloatingNativeWindow> {

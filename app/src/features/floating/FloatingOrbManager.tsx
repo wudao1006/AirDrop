@@ -15,7 +15,10 @@ import {
 } from "./floating-events";
 import {
   COLLAPSED_ORB_SIZE,
+  clampedRect,
+  horizontalFractionForRect,
   resizedRect,
+  sameRect,
   sideForRect,
   snappedRect,
   verticalFractionForRect,
@@ -23,26 +26,32 @@ import {
 } from "./floating-geometry";
 
 export const FLOATING_SIDE_STORAGE_KEY = "airdrop.floating.side.v1";
+export const FLOATING_HORIZONTAL_STORAGE_KEY = "airdrop.floating.horizontal.v1";
 export const FLOATING_VERTICAL_STORAGE_KEY = "airdrop.floating.vertical.v1";
 
 export const readFloatingPlacement = (): FloatingPlacement => {
-  if (typeof window === "undefined") return { side: "right", verticalFraction: 0.5 };
+  if (typeof window === "undefined") return { side: "right", horizontalFraction: 1, verticalFraction: 0.5 };
   try {
     const side = window.localStorage.getItem(FLOATING_SIDE_STORAGE_KEY);
+    const storedHorizontalFraction = window.localStorage.getItem(FLOATING_HORIZONTAL_STORAGE_KEY);
     const storedFraction = window.localStorage.getItem(FLOATING_VERTICAL_STORAGE_KEY);
+    const horizontalFraction = storedHorizontalFraction === null ? Number.NaN : Number(storedHorizontalFraction);
     const fraction = storedFraction === null ? Number.NaN : Number(storedFraction);
+    const normalizedSide = side === "left" ? "left" : "right";
     return {
-      side: side === "left" ? "left" : "right",
+      side: normalizedSide,
+      horizontalFraction: Number.isFinite(horizontalFraction) ? Math.min(1, Math.max(0, horizontalFraction)) : normalizedSide === "left" ? 0 : 1,
       verticalFraction: Number.isFinite(fraction) ? Math.min(1, Math.max(0, fraction)) : 0.5,
     };
   } catch {
-    return { side: "right", verticalFraction: 0.5 };
+    return { side: "right", horizontalFraction: 1, verticalFraction: 0.5 };
   }
 };
 
 const savePlacement = (placement: FloatingPlacement): void => {
   try {
     window.localStorage.setItem(FLOATING_SIDE_STORAGE_KEY, placement.side);
+    window.localStorage.setItem(FLOATING_HORIZONTAL_STORAGE_KEY, String(placement.horizontalFraction ?? (placement.side === "left" ? 0 : 1)));
     window.localStorage.setItem(FLOATING_VERTICAL_STORAGE_KEY, String(placement.verticalFraction));
   } catch {
     // Window placement persistence is best-effort.
@@ -145,18 +154,19 @@ export function FloatingOrbManager({ client, snapshot, setPage, onError, adapter
       });
     };
 
-    const snapAfterMove = () => {
+    const persistAfterMove = () => {
       window.clearTimeout(moveTimerRef.current);
       moveTimerRef.current = window.setTimeout(() => {
         void transactGeometry(async () => {
           const [current, workArea] = await Promise.all([adapter.getOrbBounds(), adapter.getOrbWorkArea()]);
+          const bounds = clampedRect(current, workArea);
           const placement = {
-            side: sideForRect(current, workArea),
-            verticalFraction: verticalFractionForRect(current, workArea),
+            side: sideForRect(bounds, workArea),
+            horizontalFraction: horizontalFractionForRect(bounds, workArea),
+            verticalFraction: verticalFractionForRect(bounds, workArea),
           };
-          const bounds = snappedRect(workArea, { width: current.width, height: current.height }, placement);
           savePlacement(placement);
-          await adapter.setOrbBounds(bounds);
+          if (!sameRect(current, bounds)) await adapter.setOrbBounds(bounds);
         }).catch((error: unknown) => onError(errorMessage(error)));
       }, 180);
     };
@@ -196,7 +206,7 @@ export function FloatingOrbManager({ client, snapshot, setPage, onError, adapter
 
       if (!isCurrent() || !snapshot.settings.floatingOrbEnabled) return;
       try {
-        const unlistenMoved = await adapter.onOrbMoved(snapAfterMove);
+        const unlistenMoved = await adapter.onOrbMoved(persistAfterMove);
         if (disposed) unlistenMoved(); else unlisteners.push(unlistenMoved);
       } catch (error) {
         onError(errorMessage(error));

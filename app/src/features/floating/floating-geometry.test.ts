@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   EXPANDED_ORB_SIZE,
+  clampedRect,
+  horizontalFractionForRect,
   resizedRect,
   sideForRect,
   snappedRect,
@@ -33,5 +35,12 @@ describe("floating geometry", () => {
       width: 180,
       height: 60,
     });
+  });
+
+  it("keeps a freely placed orb still unless it crosses the work area", () => {
+    const current = { x: 460, y: 210, width: 72, height: 68 };
+    expect(clampedRect(current, workArea)).toEqual(current);
+    expect(horizontalFractionForRect(current, workArea)).toBeCloseTo(360 / 928);
+    expect(clampedRect({ ...current, x: 1200 }, workArea)).toEqual({ ...current, x: 1028 });
   });
 });

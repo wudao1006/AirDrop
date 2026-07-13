@@ -44,11 +44,13 @@ jobs:
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         with:
           projectPath: app
           tagName: ${{ github.ref_name }}
           releaseName: "AirDrop ${{ github.ref_name }}"
-          releaseBody: "Windows and Linux preview builds. Device synchronization remains local-network only."
-          releaseDraft: true
-          prerelease: true
+          releaseBody: "Windows and Linux release builds with signed in-app update metadata. Device synchronization remains local-network only."
+          releaseDraft: false
+          prerelease: false
+          updaterJsonPreferNsis: true
           args: ${{ matrix.args }}
