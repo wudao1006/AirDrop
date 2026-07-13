@@ -19,6 +19,8 @@ pub(crate) struct CachedText {
     pub(crate) sequence: u64,
     pub(crate) text: String,
     pub(crate) captured_at: String,
+    #[serde(default)]
+    pub(crate) group_ids: Vec<String>,
 }
 
 pub(crate) struct ClipboardCache {
@@ -192,6 +194,7 @@ mod tests {
                 sequence: 4,
                 text: "secret text".into(),
                 captured_at: "2026-07-13T00:00:00Z".into(),
+                group_ids: vec!["group-a".into()],
             })
             .unwrap()
             .unwrap();

@@ -201,6 +201,34 @@ button:disabled { cursor: default; opacity: .58; }
 .device-row-actions { display: flex; align-items: center; gap: 7px; }
 .button.danger { border-color: color-mix(in srgb, var(--danger) 38%, var(--border)); color: var(--danger); background: color-mix(in srgb, var(--danger-soft) 76%, transparent); }
 .button.danger:hover { border-color: color-mix(in srgb, var(--danger) 58%, var(--border)); background: var(--danger-soft); }
+.group-create-panel { margin-bottom: 22px; padding: 22px; }
+.group-create-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 18px; }
+.group-create-head h2 { margin: 0 0 4px; font-size: 18px; }
+.group-create-head p { margin: 0; color: var(--text-muted); font-size: 12px; }
+.field-label { display: grid; gap: 7px; color: var(--text-muted); font-size: 12px; }
+.text-field { width: 100%; box-sizing: border-box; padding: 11px 13px; border: 1px solid var(--border); border-radius: 13px; outline: none; color: var(--text); background: color-mix(in srgb, var(--surface-solid) 72%, transparent); }
+.text-field:focus { border-color: color-mix(in srgb, var(--accent) 62%, var(--border)); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent); }
+.group-create-grid { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(200px, .8fr); gap: 20px; margin-top: 18px; }
+.field-title { display: block; margin-bottom: 9px; font-size: 12px; }
+.group-device-list, .group-policy-list { display: grid; gap: 8px; }
+.group-device-option { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 14px; background: color-mix(in srgb, var(--surface-solid) 58%, transparent); }
+.group-device-option.selected { border-color: color-mix(in srgb, var(--accent) 46%, var(--border)); background: var(--glass-selected); }
+.group-device-option span { display: grid; gap: 2px; }
+.group-device-option b { font-size: 12px; }
+.group-device-option small { color: var(--text-muted); font-size: 11px; }
+.group-policy-list label { display: flex; align-items: center; gap: 8px; min-height: 30px; color: var(--text-muted); font-size: 12px; }
+.group-create-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
+.mini-avatar.pending { opacity: .46; border-style: dashed; }
+.group-member-policy { display: grid; gap: 6px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
+.group-policy-editor { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 12px; color: var(--text-muted); font-size: 11px; }
+.group-policy-editor label { display: flex; align-items: center; gap: 5px; }
+.group-member-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 8px; }
+.group-member-row > span { display: grid; gap: 1px; }
+.group-member-row b { font-size: 11px; }
+.group-member-row small { color: var(--text-muted); font-size: 10px; }
+.group-member-row select { padding: 6px 24px 6px 8px; border: 1px solid var(--border); border-radius: 9px; color: var(--text); background: color-mix(in srgb, var(--surface-solid) 72%, transparent); font-size: 11px; }
+.group-card-status { display: flex; align-items: center; gap: 8px; }
+.button.compact { padding: 6px 9px; min-height: 0; font-size: 10px; }
 @media (max-width: 900px) { .pairing-panel { grid-template-columns: 1fr auto; } .pairing-actions { grid-column: 1 / -1; justify-content: flex-end; } }
 .activity-banner { display: flex; align-items: center; gap: 11px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 13px; background: var(--surface); }
 .activity-banner .activity-icon { display: grid; place-items: center; width: 35px; height: 35px; border-radius: 11px; }

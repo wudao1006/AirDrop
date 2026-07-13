@@ -1,8 +1,16 @@
 use super::{
     cache::{CachedText, ClipboardCache},
+    group::{
+        GroupManifest, GroupMember, GroupPolicy, GroupTombstone, MemberState, SignedGroupManifest,
+        SignedGroupTombstone, SyncDirection, GROUP_ENCODING_VERSION, MAX_GROUP_MEMBERS,
+    },
     identity::Identity,
-    storage::{CachedSlotMetadata, Store, StoredRuntime, TrustedDevice},
+    storage::{
+        CachedSlotMetadata, Store, StoredGroupInvite, StoredGroupLeave, StoredRuntime,
+        TrustedDevice,
+    },
 };
+use data_encoding::BASE64;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -50,6 +58,7 @@ pub struct DeviceSlot {
     captured_at: String,
     age_label: String,
     groups: Vec<String>,
+    group_ids: Vec<String>,
     sequence: u64,
     size: u64,
     representations: Vec<ClipboardRepresentation>,
@@ -119,6 +128,51 @@ pub struct PendingPairing {
     pub(crate) status: String,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncGroupView {
+    group_id: String,
+    name: String,
+    owner_device_id: String,
+    revision: u64,
+    membership_epoch: u64,
+    is_owner: bool,
+    policy: GroupPolicy,
+    members: Vec<GroupMember>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingGroupInviteView {
+    invite_id: String,
+    group_id: String,
+    group_name: String,
+    owner_device_id: String,
+    owner_name: String,
+    expires_at: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateSyncGroupInput {
+    name: String,
+    member_device_ids: Vec<String>,
+    allow_text: bool,
+    allow_images: bool,
+    allow_html: bool,
+    allow_files: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateGroupPolicyInput {
+    group_id: String,
+    allow_text: bool,
+    allow_images: bool,
+    allow_html: bool,
+    allow_files: bool,
+}
+
 #[derive(Clone)]
 enum RemoteClipboardBody {
     Text(String),
@@ -135,6 +189,12 @@ pub(crate) struct RemoteImage {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) captured_at: String,
+    pub(crate) group_ids: Vec<String>,
+}
+
+struct SlotGroups {
+    names: Vec<String>,
+    ids: Vec<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -202,6 +262,8 @@ pub struct UiSnapshot {
     trusted_devices: Vec<TrustedDeviceView>,
     pending_pairings: Vec<PendingPairing>,
     cache_persistent: bool,
+    sync_groups: Vec<SyncGroupView>,
+    pending_group_invites: Vec<PendingGroupInviteView>,
     imports: Vec<ImportOperation>,
     settings: AppSettings,
 }
@@ -254,6 +316,8 @@ impl UiSnapshot {
                 .collect(),
             pending_pairings: Vec::new(),
             cache_persistent: false,
+            sync_groups: Vec::new(),
+            pending_group_invites: Vec::new(),
             imports: Vec::new(),
             settings,
         }
@@ -284,6 +348,16 @@ impl ServiceState {
         let clipboard_cache = ClipboardCache::open(data_dir);
         let mut snapshot = UiSnapshot::initial(settings, runtime, trusted_devices.clone());
         snapshot.cache_persistent = clipboard_cache.available();
+        let manifests = store.group_manifests()?;
+        snapshot.sync_groups = manifests
+            .iter()
+            .map(|manifest| group_view(manifest, identity.device_id()))
+            .collect();
+        snapshot.pending_group_invites = store
+            .group_invites(&current_time())?
+            .iter()
+            .map(pending_group_invite_view)
+            .collect();
         let mut remote_bodies = HashMap::new();
         if clipboard_cache.available() {
             let cached_slots = store.cached_slots(unix_seconds())?;
@@ -294,21 +368,45 @@ impl ServiceState {
                     .collect(),
             );
             for metadata in cached_slots {
-                let Some(device) = trusted_devices
+                if store.is_device_revoked(&metadata.device_id)? {
+                    continue;
+                }
+                let device = trusted_devices
                     .iter()
                     .find(|device| device.device_id == metadata.device_id && device.sync_enabled)
-                else {
-                    continue;
-                };
+                    .cloned()
+                    .or_else(|| {
+                        manifests.iter().find_map(|signed| {
+                            let manifest = &signed.manifest;
+                            manifest.active_member(identity.device_id())?;
+                            manifest
+                                .active_member(&metadata.device_id)
+                                .and_then(|member| trusted_from_group_member(member).ok())
+                        })
+                    });
+                let Some(device) = device else { continue };
                 match clipboard_cache.load(&metadata.device_id, &metadata.object_name) {
                     Ok(cached) if cached.sequence == metadata.sequence => {
+                        let Ok(groups) = validate_group_delivery_from_manifests(
+                            &manifests,
+                            identity.device_id(),
+                            &device.device_id,
+                            &cached.group_ids,
+                            "text",
+                        ) else {
+                            continue;
+                        };
                         let slot = text_slot(
-                            device,
+                            &device,
                             cached.sequence,
                             &cached.text,
                             cached.captured_at,
                             false,
                             "stale",
+                            SlotGroups {
+                                names: groups,
+                                ids: cached.group_ids.clone(),
+                            },
                         );
                         remote_bodies
                             .insert(slot.id.clone(), RemoteClipboardBody::Text(cached.text));
@@ -378,15 +476,168 @@ impl ServiceState {
         })
     }
 
-    pub(crate) fn enabled_device_ids(&self) -> Result<std::collections::HashSet<String>, String> {
-        Ok(self
-            .store
-            .trusted_devices()?
-            .into_iter()
-            .filter(|device| device.sync_enabled)
-            .map(|device| device.device_id)
-            .collect())
+    pub(crate) fn authorized_device(
+        &self,
+        device_id: &str,
+    ) -> Result<Option<TrustedDevice>, String> {
+        if self.store.is_device_revoked(device_id)? {
+            return Ok(None);
+        }
+        if let Some(device) = self.store.trusted_device(device_id)? {
+            return Ok(device.sync_enabled.then_some(device));
+        }
+        for signed in self.store.group_manifests()? {
+            let manifest = &signed.manifest;
+            if manifest.active_member(self.device_id()).is_none() {
+                continue;
+            }
+            if let Some(member) = manifest.active_member(device_id) {
+                return Ok(Some(trusted_from_group_member(member)?));
+            }
+        }
+        Ok(None)
     }
+
+    pub(crate) fn delivery_targets(
+        &self,
+        content_type: &str,
+    ) -> Result<HashMap<String, Vec<String>>, String> {
+        let mut targets = HashMap::<String, Vec<String>>::new();
+        for signed in self.store.group_manifests()? {
+            let manifest = &signed.manifest;
+            if !group_type_allowed(&manifest.policy, content_type) {
+                continue;
+            }
+            let Some(local) = manifest.active_member(self.device_id()) else {
+                continue;
+            };
+            if !local.direction.can_publish() {
+                continue;
+            }
+            for member in &manifest.members {
+                if member.device_id != self.device_id()
+                    && member.state == MemberState::Active
+                    && member.direction.can_subscribe()
+                    && !self.store.is_device_revoked(&member.device_id)?
+                    && self.store.is_device_sync_allowed(&member.device_id)?
+                {
+                    targets
+                        .entry(member.device_id.clone())
+                        .or_default()
+                        .push(manifest.group_id.clone());
+                }
+            }
+        }
+        Ok(targets)
+    }
+
+    pub(crate) fn validate_group_delivery(
+        &self,
+        origin_device_id: &str,
+        group_ids: &[String],
+        content_type: &str,
+    ) -> Result<Vec<String>, String> {
+        validate_group_delivery_from_manifests(
+            &self.store.group_manifests()?,
+            self.device_id(),
+            origin_device_id,
+            group_ids,
+            content_type,
+        )
+    }
+
+    pub(crate) fn replay_group_state(
+        &self,
+        transport: &super::transport::TransportHandle,
+        device_id: &str,
+    ) {
+        if let Ok(invites) = self.store.group_invites_for_target(device_id) {
+            for invite in invites {
+                let _ = transport.send_group_invite(
+                    device_id,
+                    invite.invite_id,
+                    invite.expires_at,
+                    invite.manifest,
+                );
+            }
+        }
+        if let Ok(groups) = self.store.group_manifests() {
+            for group in groups {
+                if group.manifest.active_member(device_id).is_some() {
+                    let _ = transport.send_group_manifest(device_id, group);
+                }
+            }
+        }
+        if let Ok(leaves) = self.store.group_leaves_for_owner(device_id) {
+            for leave in leaves {
+                let _ = transport.send_group_leave(device_id, leave.group_id, leave.leave_id);
+            }
+        }
+        if let Ok(tombstones) = self.store.group_tombstones_for_member(device_id) {
+            for tombstone in tombstones {
+                let _ = transport.send_group_tombstone(device_id, tombstone);
+            }
+        }
+    }
+}
+
+fn trusted_from_group_member(member: &GroupMember) -> Result<TrustedDevice, String> {
+    Ok(TrustedDevice {
+        device_id: member.device_id.clone(),
+        device_name: member.device_name.clone(),
+        platform: member.platform.clone(),
+        public_key: BASE64
+            .decode(member.public_key.as_bytes())
+            .map_err(|_| "同步组成员公钥编码无效".to_string())?,
+        certificate_der: BASE64
+            .decode(member.certificate.as_bytes())
+            .map_err(|_| "同步组成员证书编码无效".to_string())?,
+        paired_at: member.joined_at.clone(),
+        sync_enabled: true,
+    })
+}
+
+fn group_type_allowed(policy: &GroupPolicy, content_type: &str) -> bool {
+    match content_type {
+        "text" => policy.allow_text,
+        "image" => policy.allow_images,
+        "html" => policy.allow_html,
+        "files" => policy.allow_files,
+        _ => false,
+    }
+}
+
+fn validate_group_delivery_from_manifests(
+    manifests: &[SignedGroupManifest],
+    local_device_id: &str,
+    origin_device_id: &str,
+    group_ids: &[String],
+    content_type: &str,
+) -> Result<Vec<String>, String> {
+    let mut names = Vec::new();
+    for signed in manifests {
+        let manifest = &signed.manifest;
+        if !group_ids.contains(&manifest.group_id)
+            || !group_type_allowed(&manifest.policy, content_type)
+        {
+            continue;
+        }
+        let Some(origin) = manifest.active_member(origin_device_id) else {
+            continue;
+        };
+        let Some(local) = manifest.active_member(local_device_id) else {
+            continue;
+        };
+        if origin.direction.can_publish() && local.direction.can_subscribe() {
+            names.push(manifest.name.clone());
+        }
+    }
+    names.sort();
+    names.dedup();
+    if names.is_empty() {
+        return Err("远端槽位不属于当前允许的同步组".into());
+    }
+    Ok(names)
 }
 
 fn emit_snapshot(app: &AppHandle, snapshot: &UiSnapshot) -> Result<(), String> {
@@ -428,6 +679,7 @@ fn text_slot(
     captured_at: String,
     online: bool,
     availability: &str,
+    groups: SlotGroups,
 ) -> DeviceSlot {
     DeviceSlot {
         id: format!("device:{}", device.device_id),
@@ -445,7 +697,8 @@ fn text_slot(
         } else {
             "本机缓存".into()
         },
-        groups: vec!["直接配对".into()],
+        groups: groups.names,
+        group_ids: groups.ids,
         sequence,
         size: text.len() as u64,
         representations: vec![ClipboardRepresentation {
@@ -469,6 +722,7 @@ fn image_slot(
     width: u32,
     height: u32,
     captured_at: String,
+    groups: SlotGroups,
 ) -> DeviceSlot {
     DeviceSlot {
         id: format!("device:{}", device.device_id),
@@ -482,7 +736,8 @@ fn image_slot(
         preview: format!("图片 · {width} × {height}"),
         captured_at,
         age_label: "刚刚".into(),
-        groups: vec!["直接配对".into()],
+        groups: groups.names,
+        group_ids: groups.ids,
         sequence,
         size: rgba_len as u64,
         representations: vec![ClipboardRepresentation {
@@ -513,6 +768,42 @@ fn unix_seconds() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn current_time() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".into())
+}
+
+fn group_view(manifest: &SignedGroupManifest, local_device_id: &str) -> SyncGroupView {
+    SyncGroupView {
+        group_id: manifest.manifest.group_id.clone(),
+        name: manifest.manifest.name.clone(),
+        owner_device_id: manifest.manifest.owner_device_id.clone(),
+        revision: manifest.manifest.revision,
+        membership_epoch: manifest.manifest.membership_epoch,
+        is_owner: manifest.manifest.owner_device_id == local_device_id,
+        policy: manifest.manifest.policy.clone(),
+        members: manifest.manifest.members.clone(),
+    }
+}
+
+fn pending_group_invite_view(invite: &StoredGroupInvite) -> PendingGroupInviteView {
+    let owner_name = invite
+        .manifest
+        .manifest
+        .active_member(&invite.manifest.manifest.owner_device_id)
+        .map(|member| member.device_name.clone())
+        .unwrap_or_else(|| "未知设备".into());
+    PendingGroupInviteView {
+        invite_id: invite.invite_id.clone(),
+        group_id: invite.manifest.manifest.group_id.clone(),
+        group_name: invite.manifest.manifest.name.clone(),
+        owner_device_id: invite.manifest.manifest.owner_device_id.clone(),
+        owner_name,
+        expires_at: invite.expires_at.clone(),
+    }
 }
 
 pub fn capture_local_clipboard(
@@ -562,8 +853,8 @@ pub fn capture_local_clipboard(
     if !snapshot.publish_paused && snapshot.settings.allow_text && !suppress_publish {
         let sequence = state.store.next_origin_sequence()?;
         if let Some(transport) = app.try_state::<super::transport::TransportHandle>() {
-            let enabled_devices = state.enabled_device_ids()?;
-            transport.broadcast_text(sequence, text, now, &enabled_devices);
+            let targets = state.delivery_targets("text")?;
+            transport.broadcast_text(sequence, text, now, &targets);
         }
     }
     Ok(())
@@ -619,8 +910,8 @@ pub fn capture_local_image(
     if !snapshot.publish_paused && snapshot.settings.allow_images && !suppress_publish {
         let sequence = state.store.next_origin_sequence()?;
         if let Some(transport) = app.try_state::<super::transport::TransportHandle>() {
-            let enabled_devices = state.enabled_device_ids()?;
-            transport.broadcast_image(sequence, rgba, width, height, now, &enabled_devices);
+            let targets = state.delivery_targets("image")?;
+            transport.broadcast_image(sequence, rgba, width, height, now, &targets);
         }
     }
     Ok(())
@@ -656,7 +947,7 @@ pub fn upsert_nearby_device(
     app: &AppHandle,
     mut nearby: NearbyDevice,
 ) -> Result<(), String> {
-    nearby.paired = state.trusted_device(&nearby.device_id)?.is_some();
+    nearby.paired = state.authorized_device(&nearby.device_id)?.is_some();
     update(state, app, |snapshot| {
         if let Some(existing) = snapshot
             .nearby_devices
@@ -775,16 +1066,18 @@ pub(crate) fn receive_remote_text(
     sequence: u64,
     text: String,
     captured_at: String,
+    group_ids: Vec<String>,
 ) -> Result<(), String> {
     if text.len() > 1024 * 1024 {
         return Err("远端文本超过 1 MiB".into());
     }
     if !state
-        .trusted_device(&device.device_id)?
+        .authorized_device(&device.device_id)?
         .is_some_and(|trusted| trusted.sync_enabled)
     {
         return Err("该设备的剪贴板同步已停用".into());
     }
+    let group_names = state.validate_group_delivery(&device.device_id, &group_ids, "text")?;
     if !state
         .snapshot
         .lock()
@@ -815,6 +1108,7 @@ pub(crate) fn receive_remote_text(
         sequence,
         text: text.clone(),
         captured_at: captured_at.clone(),
+        group_ids: group_ids.clone(),
     }) {
         Ok(Some(object_name)) => {
             let metadata = CachedSlotMetadata {
@@ -849,7 +1143,18 @@ pub(crate) fn receive_remote_text(
                 return Ok(());
             }
         }
-        let slot = text_slot(device, sequence, &text, captured_at.clone(), true, "ready");
+        let slot = text_slot(
+            device,
+            sequence,
+            &text,
+            captured_at.clone(),
+            true,
+            "ready",
+            SlotGroups {
+                names: group_names,
+                ids: group_ids,
+            },
+        );
         snapshot
             .slots
             .retain(|item| item.device_id != device.device_id);
@@ -878,11 +1183,13 @@ pub(crate) fn receive_remote_image(
         return Err("远端图片格式或大小无效".into());
     }
     if !state
-        .trusted_device(&device.device_id)?
+        .authorized_device(&device.device_id)?
         .is_some_and(|trusted| trusted.sync_enabled)
     {
         return Err("该设备的剪贴板同步已停用".into());
     }
+    let group_names =
+        state.validate_group_delivery(&device.device_id, &image.group_ids, "image")?;
     {
         let snapshot = state
             .snapshot
@@ -927,6 +1234,10 @@ pub(crate) fn receive_remote_image(
             image.width,
             image.height,
             image.captured_at.clone(),
+            SlotGroups {
+                names: group_names,
+                ids: image.group_ids.clone(),
+            },
         ));
         snapshot.last_synchronized_at = image.captured_at;
         Ok(())
@@ -945,6 +1256,688 @@ pub fn remove_nearby_device(
             .retain(|device| device.instance_id != instance_id);
         Ok(())
     })?;
+    Ok(())
+}
+
+fn upsert_group_snapshot(
+    state: &ServiceState,
+    app: &AppHandle,
+    manifest: &SignedGroupManifest,
+) -> Result<(), String> {
+    let view = group_view(manifest, state.device_id());
+    update(state, app, |snapshot| {
+        snapshot
+            .sync_groups
+            .retain(|group| group.group_id != view.group_id);
+        snapshot.sync_groups.push(view);
+        snapshot
+            .sync_groups
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn reconcile_group_slots(state: &ServiceState, app: &AppHandle) -> Result<(), String> {
+    let slots = state
+        .snapshot
+        .lock()
+        .map_err(|_| "Rust 服务状态锁已损坏".to_string())?
+        .slots
+        .clone();
+    let mut retained = HashMap::<String, (Vec<String>, Vec<String>)>::new();
+    for slot in &slots {
+        let content_type = if slot
+            .representations
+            .iter()
+            .any(|representation| representation.kind == "image")
+        {
+            "image"
+        } else {
+            "text"
+        };
+        let mut valid_ids = Vec::new();
+        let mut valid_names = Vec::new();
+        for group_id in &slot.group_ids {
+            if let Ok(names) = state.validate_group_delivery(
+                &slot.device_id,
+                std::slice::from_ref(group_id),
+                content_type,
+            ) {
+                valid_ids.push(group_id.clone());
+                valid_names.extend(names);
+            }
+        }
+        valid_names.sort();
+        valid_names.dedup();
+        if !valid_ids.is_empty() {
+            retained.insert(slot.id.clone(), (valid_ids, valid_names));
+        }
+    }
+    let removed = slots
+        .iter()
+        .filter(|slot| !retained.contains_key(&slot.id))
+        .map(|slot| (slot.id.clone(), slot.device_id.clone()))
+        .collect::<Vec<_>>();
+    for (slot_id, device_id) in &removed {
+        state
+            .remote_bodies
+            .lock()
+            .map_err(|_| "远端正文缓存锁已损坏".to_string())?
+            .remove(slot_id);
+        if let Some(object_name) = state.store.remove_cached_slot(device_id)? {
+            state.clipboard_cache.remove(&object_name);
+        }
+    }
+    update(state, app, |snapshot| {
+        snapshot
+            .slots
+            .retain(|slot| retained.contains_key(&slot.id));
+        for slot in &mut snapshot.slots {
+            if let Some((group_ids, names)) = retained.get(&slot.id) {
+                slot.group_ids = group_ids.clone();
+                slot.groups = names.clone();
+            }
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn create_sync_group(
+    state: State<'_, ServiceState>,
+    transport: State<'_, super::transport::TransportHandle>,
+    app: AppHandle,
+    input: CreateSyncGroupInput,
+) -> Result<String, String> {
+    let mut member_device_ids = input.member_device_ids;
+    member_device_ids.sort();
+    member_device_ids.dedup();
+    if member_device_ids.is_empty() || member_device_ids.len() + 1 > MAX_GROUP_MEMBERS {
+        return Err("请选择 1 到 15 台可信设备".into());
+    }
+    let now = current_time();
+    let owner = GroupMember {
+        device_id: state.device_id().into(),
+        device_name: state.device_name().into(),
+        platform: crate::platform::platform_name().into(),
+        public_key: BASE64.encode(&state.identity().public_key_bytes()),
+        certificate: BASE64.encode(transport.certificate_der()),
+        joined_at: now.clone(),
+        state: MemberState::Active,
+        direction: SyncDirection::Bidirectional,
+    };
+    let mut members = vec![owner];
+    for device_id in &member_device_ids {
+        let device = state
+            .trusted_device(device_id)?
+            .filter(|device| device.sync_enabled)
+            .ok_or_else(|| format!("设备 {device_id} 尚未直接配对或同步已停用"))?;
+        members.push(GroupMember {
+            device_id: device.device_id,
+            device_name: device.device_name,
+            platform: device.platform,
+            public_key: BASE64.encode(&device.public_key),
+            certificate: BASE64.encode(&device.certificate_der),
+            joined_at: now.clone(),
+            state: MemberState::Invited,
+            direction: SyncDirection::Bidirectional,
+        });
+    }
+    let group_id = uuid::Uuid::new_v4().to_string();
+    let signed = SignedGroupManifest::sign(
+        GroupManifest {
+            encoding_version: GROUP_ENCODING_VERSION,
+            group_id: group_id.clone(),
+            owner_device_id: state.device_id().into(),
+            name: input.name,
+            revision: 1,
+            membership_epoch: 1,
+            policy: GroupPolicy {
+                allow_text: input.allow_text,
+                allow_images: input.allow_images,
+                allow_html: input.allow_html,
+                allow_files: input.allow_files,
+                offline_ttl_seconds: 24 * 60 * 60,
+            },
+            members,
+        },
+        state.identity(),
+    )?;
+    state.store.save_group_manifest(&signed, "active", &now)?;
+    upsert_group_snapshot(&state, &app, &signed)?;
+    let expires_at = (time::OffsetDateTime::now_utc() + time::Duration::minutes(10))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| now.clone());
+    for device_id in member_device_ids {
+        let invite = StoredGroupInvite {
+            invite_id: uuid::Uuid::new_v4().to_string(),
+            target_device_id: device_id.clone(),
+            expires_at: expires_at.clone(),
+            status: "sent".into(),
+            manifest: signed.clone(),
+        };
+        state.store.save_group_invite(&invite)?;
+        let _ = transport.send_group_invite(
+            &device_id,
+            invite.invite_id,
+            invite.expires_at,
+            signed.clone(),
+        );
+    }
+    Ok(group_id)
+}
+
+pub(crate) fn receive_group_invite(
+    state: &ServiceState,
+    app: &AppHandle,
+    sender_device_id: &str,
+    invite_id: String,
+    target_device_id: String,
+    expires_at: String,
+    manifest: SignedGroupManifest,
+) -> Result<(), String> {
+    if target_device_id != state.device_id()
+        || manifest.manifest.owner_device_id != sender_device_id
+        || expires_at <= current_time()
+    {
+        return Err("同步组邀请目标、来源或有效期无效".into());
+    }
+    let owner = state
+        .trusted_device(sender_device_id)?
+        .ok_or_else(|| "同步组邀请必须来自直接配对设备".to_string())?;
+    manifest.verify(&owner.public_key)?;
+    let target = manifest
+        .manifest
+        .members
+        .iter()
+        .find(|member| member.device_id == state.device_id())
+        .ok_or_else(|| "同步组邀请清单缺少本机".to_string())?;
+    if target.state != MemberState::Invited {
+        return Err("同步组邀请中的本机状态无效".into());
+    }
+    let invite = StoredGroupInvite {
+        invite_id,
+        target_device_id,
+        expires_at,
+        status: "pending".into(),
+        manifest,
+    };
+    state.store.save_group_invite(&invite)?;
+    let view = pending_group_invite_view(&invite);
+    update(state, app, |snapshot| {
+        snapshot
+            .pending_group_invites
+            .retain(|item| item.invite_id != view.invite_id);
+        snapshot.pending_group_invites.push(view);
+        Ok(())
+    })?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn confirm_group_invite(
+    state: State<'_, ServiceState>,
+    transport: State<'_, super::transport::TransportHandle>,
+    app: AppHandle,
+    invite_id: String,
+    accepted: bool,
+) -> Result<(), String> {
+    let invite = state
+        .store
+        .group_invite(&invite_id)?
+        .filter(|invite| invite.status == "pending" && invite.expires_at > current_time())
+        .ok_or_else(|| "同步组邀请不存在或已过期".to_string())?;
+    transport.send_group_accept(
+        &invite.manifest.manifest.owner_device_id,
+        invite_id.clone(),
+        invite.manifest.manifest.group_id.clone(),
+        accepted,
+    )?;
+    state
+        .store
+        .set_group_invite_status(&invite_id, if accepted { "accepted" } else { "rejected" })?;
+    update(&state, &app, |snapshot| {
+        snapshot
+            .pending_group_invites
+            .retain(|item| item.invite_id != invite_id);
+        Ok(())
+    })?;
+    Ok(())
+}
+
+pub(crate) fn receive_group_accept(
+    state: &ServiceState,
+    app: &AppHandle,
+    transport: &super::transport::TransportHandle,
+    sender_device_id: &str,
+    invite_id: &str,
+    group_id: &str,
+    accepted: bool,
+) -> Result<(), String> {
+    let _invite = state
+        .store
+        .group_invite(invite_id)?
+        .filter(|invite| {
+            invite.status == "sent"
+                && invite.target_device_id == sender_device_id
+                && invite.manifest.manifest.group_id == group_id
+        })
+        .ok_or_else(|| "同步组接受消息没有匹配邀请".to_string())?;
+    if !accepted {
+        return state.store.set_group_invite_status(invite_id, "rejected");
+    }
+    let current = state
+        .store
+        .group_manifest(group_id)?
+        .ok_or_else(|| "同步组不存在".to_string())?;
+    if current.manifest.owner_device_id != state.device_id() {
+        return Err("只有同步组 Owner 可以处理接受消息".into());
+    }
+    let mut manifest = current.manifest;
+    let member = manifest
+        .members
+        .iter_mut()
+        .find(|member| member.device_id == sender_device_id)
+        .ok_or_else(|| "同步组清单缺少接受设备".to_string())?;
+    member.state = MemberState::Active;
+    member.joined_at = current_time();
+    manifest.revision = manifest.revision.saturating_add(1);
+    manifest.membership_epoch = manifest.membership_epoch.saturating_add(1);
+    let signed = SignedGroupManifest::sign(manifest, state.identity())?;
+    state
+        .store
+        .save_group_manifest(&signed, "active", &current_time())?;
+    state.store.set_group_invite_status(invite_id, "accepted")?;
+    upsert_group_snapshot(state, app, &signed)?;
+    for member in &signed.manifest.members {
+        if member.state == MemberState::Active && member.device_id != state.device_id() {
+            let _ = transport.send_group_manifest(&member.device_id, signed.clone());
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn receive_group_manifest(
+    state: &ServiceState,
+    app: &AppHandle,
+    transport: &super::transport::TransportHandle,
+    manifest: SignedGroupManifest,
+) -> Result<(), String> {
+    let owner_key =
+        if let Some(existing) = state.store.group_manifest(&manifest.manifest.group_id)? {
+            existing
+                .manifest
+                .active_member(&existing.manifest.owner_device_id)
+                .ok_or_else(|| "已有同步组缺少 Owner".to_string())?
+                .public_key
+                .clone()
+        } else {
+            if !state
+                .store
+                .has_accepted_group_invite(&manifest.manifest.group_id, state.device_id())?
+            {
+                return Err("本机尚未接受此同步组邀请".into());
+            }
+            state
+                .trusted_device(&manifest.manifest.owner_device_id)?
+                .ok_or_else(|| "未知同步组 Owner".to_string())
+                .map(|device| BASE64.encode(&device.public_key))?
+        };
+    let owner_key = BASE64
+        .decode(owner_key.as_bytes())
+        .map_err(|_| "同步组 Owner 公钥编码无效".to_string())?;
+    manifest.verify(&owner_key)?;
+    let local_state = manifest
+        .manifest
+        .members
+        .iter()
+        .find(|member| member.device_id == state.device_id())
+        .map(|member| member.state.clone())
+        .ok_or_else(|| "同步组新清单缺少本机".to_string())?;
+    if local_state == MemberState::Invited {
+        return Err("未接受邀请的清单不能直接激活本机".into());
+    }
+    let state_label = if local_state == MemberState::Active {
+        "active"
+    } else {
+        "removed"
+    };
+    if !state
+        .store
+        .save_group_manifest(&manifest, state_label, &current_time())?
+    {
+        return Ok(());
+    }
+    if local_state == MemberState::Removed {
+        let removed_name = manifest.manifest.name.clone();
+        update(state, app, |snapshot| {
+            snapshot
+                .sync_groups
+                .retain(|group| group.group_id != manifest.manifest.group_id);
+            for slot in &mut snapshot.slots {
+                slot.groups.retain(|group| group != &removed_name);
+            }
+            snapshot.slots.retain(|slot| !slot.groups.is_empty());
+            Ok(())
+        })?;
+        reconcile_group_slots(state, app)?;
+        return Ok(());
+    }
+    upsert_group_snapshot(state, app, &manifest)?;
+    reconcile_group_slots(state, app)?;
+    for member in &manifest.manifest.members {
+        if member.state != MemberState::Active || member.device_id == state.device_id() {
+            continue;
+        }
+        if let Some(nearby) = state.nearby_device(&member.device_id) {
+            transport.connect_trusted(app.clone(), nearby);
+        }
+    }
+    Ok(())
+}
+
+fn publish_manifest_to_members(
+    state: &ServiceState,
+    transport: &super::transport::TransportHandle,
+    manifest: &SignedGroupManifest,
+    include_removed: Option<&str>,
+) {
+    for member in &manifest.manifest.members {
+        if member.device_id == state.device_id() {
+            continue;
+        }
+        if member.state == MemberState::Active
+            || include_removed.is_some_and(|device_id| device_id == member.device_id)
+        {
+            let _ = transport.send_group_manifest(&member.device_id, manifest.clone());
+        }
+    }
+}
+
+#[tauri::command]
+pub fn set_group_member_direction(
+    state: State<'_, ServiceState>,
+    transport: State<'_, super::transport::TransportHandle>,
+    app: AppHandle,
+    group_id: String,
+    device_id: String,
+    direction: String,
+) -> Result<(), String> {
+    let direction = match direction.as_str() {
+        "disabled" => SyncDirection::Disabled,
+        "send_only" => SyncDirection::SendOnly,
+        "receive_only" => SyncDirection::ReceiveOnly,
+        "bidirectional" => SyncDirection::Bidirectional,
+        _ => return Err("未知同步方向".into()),
+    };
+    let current = state
+        .store
+        .group_manifest(&group_id)?
+        .ok_or_else(|| "同步组不存在".to_string())?;
+    if current.manifest.owner_device_id != state.device_id() {
+        return Err("只有同步组 Owner 可以修改成员方向".into());
+    }
+    let mut manifest = current.manifest;
+    let member = manifest
+        .members
+        .iter_mut()
+        .find(|member| member.device_id == device_id && member.state == MemberState::Active)
+        .ok_or_else(|| "活动成员不存在".to_string())?;
+    member.direction = direction;
+    manifest.revision = manifest.revision.saturating_add(1);
+    manifest.membership_epoch = manifest.membership_epoch.saturating_add(1);
+    let signed = SignedGroupManifest::sign(manifest, state.identity())?;
+    state
+        .store
+        .save_group_manifest(&signed, "active", &current_time())?;
+    upsert_group_snapshot(&state, &app, &signed)?;
+    reconcile_group_slots(&state, &app)?;
+    publish_manifest_to_members(&state, &transport, &signed, None);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn remove_group_member(
+    state: State<'_, ServiceState>,
+    transport: State<'_, super::transport::TransportHandle>,
+    app: AppHandle,
+    group_id: String,
+    device_id: String,
+) -> Result<(), String> {
+    let current = state
+        .store
+        .group_manifest(&group_id)?
+        .ok_or_else(|| "同步组不存在".to_string())?;
+    if current.manifest.owner_device_id != state.device_id() {
+        return Err("只有同步组 Owner 可以移除成员".into());
+    }
+    if device_id == state.device_id() {
+        return Err("Owner 不能把自己移出同步组".into());
+    }
+    let mut manifest = current.manifest;
+    let member = manifest
+        .members
+        .iter_mut()
+        .find(|member| member.device_id == device_id && member.state != MemberState::Removed)
+        .ok_or_else(|| "同步组成员不存在".to_string())?;
+    member.state = MemberState::Removed;
+    member.direction = SyncDirection::Disabled;
+    manifest.revision = manifest.revision.saturating_add(1);
+    manifest.membership_epoch = manifest.membership_epoch.saturating_add(1);
+    let signed = SignedGroupManifest::sign(manifest, state.identity())?;
+    state
+        .store
+        .save_group_manifest(&signed, "active", &current_time())?;
+    upsert_group_snapshot(&state, &app, &signed)?;
+    reconcile_group_slots(&state, &app)?;
+    publish_manifest_to_members(&state, &transport, &signed, Some(&device_id));
+    Ok(())
+}
+
+#[tauri::command]
+pub fn update_group_policy(
+    state: State<'_, ServiceState>,
+    transport: State<'_, super::transport::TransportHandle>,
+    app: AppHandle,
+    input: UpdateGroupPolicyInput,
+) -> Result<(), String> {
+    let current = state
+        .store
+        .group_manifest(&input.group_id)?
+        .ok_or_else(|| "同步组不存在".to_string())?;
+    if current.manifest.owner_device_id != state.device_id() {
+        return Err("只有同步组 Owner 可以修改组策略".into());
+    }
+    let mut manifest = current.manifest;
+    manifest.policy.allow_text = input.allow_text;
+    manifest.policy.allow_images = input.allow_images;
+    manifest.policy.allow_html = input.allow_html;
+    manifest.policy.allow_files = input.allow_files;
+    manifest.revision = manifest.revision.saturating_add(1);
+    manifest.membership_epoch = manifest.membership_epoch.saturating_add(1);
+    let signed = SignedGroupManifest::sign(manifest, state.identity())?;
+    state
+        .store
+        .save_group_manifest(&signed, "active", &current_time())?;
+    upsert_group_snapshot(&state, &app, &signed)?;
+    reconcile_group_slots(&state, &app)?;
+    publish_manifest_to_members(&state, &transport, &signed, None);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn leave_sync_group(
+    state: State<'_, ServiceState>,
+    transport: State<'_, super::transport::TransportHandle>,
+    app: AppHandle,
+    group_id: String,
+) -> Result<(), String> {
+    let group = state
+        .store
+        .group_manifest(&group_id)?
+        .ok_or_else(|| "同步组不存在".to_string())?;
+    if group.manifest.owner_device_id == state.device_id() {
+        return Err("Owner 需要结束同步组，不能执行普通退出".into());
+    }
+    let leave = StoredGroupLeave {
+        group_id: group_id.clone(),
+        member_device_id: state.device_id().into(),
+        owner_device_id: group.manifest.owner_device_id.clone(),
+        leave_id: uuid::Uuid::new_v4().to_string(),
+        status: "pending".into(),
+    };
+    state.store.save_group_leave(&leave)?;
+    state
+        .store
+        .set_group_local_state(&group_id, "left", &current_time())?;
+    update(&state, &app, |snapshot| {
+        snapshot
+            .sync_groups
+            .retain(|group| group.group_id != group_id);
+        Ok(())
+    })?;
+    reconcile_group_slots(&state, &app)?;
+    let _ = transport.send_group_leave(&leave.owner_device_id, leave.group_id, leave.leave_id);
+    Ok(())
+}
+
+pub(crate) fn receive_group_leave(
+    state: &ServiceState,
+    app: &AppHandle,
+    transport: &super::transport::TransportHandle,
+    sender_device_id: &str,
+    group_id: &str,
+    leave_id: &str,
+) -> Result<(), String> {
+    let current = state
+        .store
+        .group_manifest(group_id)?
+        .ok_or_else(|| "同步组不存在".to_string())?;
+    if current.manifest.owner_device_id != state.device_id() {
+        return Err("本机不是同步组 Owner".into());
+    }
+    if current.manifest.active_member(sender_device_id).is_none() {
+        return Err("退出通知来源不是活动成员".into());
+    }
+    let leave = StoredGroupLeave {
+        group_id: group_id.into(),
+        member_device_id: sender_device_id.into(),
+        owner_device_id: state.device_id().into(),
+        leave_id: leave_id.into(),
+        status: "received".into(),
+    };
+    if !state.store.save_group_leave(&leave)? {
+        return Ok(());
+    }
+    let mut manifest = current.manifest;
+    let member = manifest
+        .members
+        .iter_mut()
+        .find(|member| member.device_id == sender_device_id)
+        .ok_or_else(|| "同步组清单缺少退出成员".to_string())?;
+    member.state = MemberState::Removed;
+    member.direction = SyncDirection::Disabled;
+    manifest.revision = manifest.revision.saturating_add(1);
+    manifest.membership_epoch = manifest.membership_epoch.saturating_add(1);
+    let signed = SignedGroupManifest::sign(manifest, state.identity())?;
+    state
+        .store
+        .save_group_manifest(&signed, "active", &current_time())?;
+    state
+        .store
+        .set_group_leave_status(group_id, sender_device_id, "processed")?;
+    upsert_group_snapshot(state, app, &signed)?;
+    reconcile_group_slots(state, app)?;
+    publish_manifest_to_members(state, transport, &signed, Some(sender_device_id));
+    Ok(())
+}
+
+#[tauri::command]
+pub fn delete_sync_group(
+    state: State<'_, ServiceState>,
+    transport: State<'_, super::transport::TransportHandle>,
+    app: AppHandle,
+    group_id: String,
+) -> Result<(), String> {
+    let group = state
+        .store
+        .group_manifest(&group_id)?
+        .ok_or_else(|| "同步组不存在".to_string())?;
+    if group.manifest.owner_device_id != state.device_id() {
+        return Err("只有同步组 Owner 可以结束同步组".into());
+    }
+    let recipients = group
+        .manifest
+        .members
+        .iter()
+        .filter(|member| {
+            member.state == MemberState::Active && member.device_id != state.device_id()
+        })
+        .map(|member| member.device_id.clone())
+        .collect::<Vec<_>>();
+    let tombstone = SignedGroupTombstone::sign(
+        GroupTombstone {
+            encoding_version: GROUP_ENCODING_VERSION,
+            group_id: group_id.clone(),
+            owner_device_id: state.device_id().into(),
+            revision: group.manifest.revision.saturating_add(1),
+            membership_epoch: group.manifest.membership_epoch.saturating_add(1),
+            deleted_at: current_time(),
+        },
+        state.identity(),
+    )?;
+    state.store.save_group_tombstone(&tombstone)?;
+    update(&state, &app, |snapshot| {
+        snapshot
+            .sync_groups
+            .retain(|group| group.group_id != group_id);
+        Ok(())
+    })?;
+    reconcile_group_slots(&state, &app)?;
+    for device_id in recipients {
+        let _ = transport.send_group_tombstone(&device_id, tombstone.clone());
+    }
+    Ok(())
+}
+
+pub(crate) fn receive_group_tombstone(
+    state: &ServiceState,
+    app: &AppHandle,
+    tombstone: SignedGroupTombstone,
+) -> Result<(), String> {
+    let group = state
+        .store
+        .group_manifest_any(&tombstone.tombstone.group_id)?
+        .ok_or_else(|| "同步组删除声明没有可信历史清单".to_string())?;
+    if group.manifest.owner_device_id != tombstone.tombstone.owner_device_id
+        || tombstone.tombstone.revision <= group.manifest.revision
+    {
+        return Err("同步组删除声明 Owner 或版本无效".into());
+    }
+    let owner_key = group
+        .manifest
+        .members
+        .iter()
+        .find(|member| member.device_id == group.manifest.owner_device_id)
+        .ok_or_else(|| "同步组历史清单缺少 Owner".to_string())?
+        .public_key
+        .clone();
+    let owner_key = BASE64
+        .decode(owner_key.as_bytes())
+        .map_err(|_| "同步组 Owner 公钥编码无效".to_string())?;
+    tombstone.verify(&owner_key)?;
+    if !state.store.save_group_tombstone(&tombstone)? {
+        return Ok(());
+    }
+    update(state, app, |snapshot| {
+        snapshot
+            .sync_groups
+            .retain(|group| group.group_id != tombstone.tombstone.group_id);
+        Ok(())
+    })?;
+    reconcile_group_slots(state, app)?;
     Ok(())
 }
 
@@ -1038,10 +2031,25 @@ pub fn revoke_device(
     let revoked_at = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".into());
+    let owner_group_ids = state
+        .store
+        .group_manifests()?
+        .into_iter()
+        .filter(|group| {
+            group.manifest.owner_device_id == device_id
+                && group.manifest.owner_device_id != state.device_id()
+        })
+        .map(|group| group.manifest.group_id)
+        .collect::<Vec<_>>();
     if let Some(object_name) = state.store.remove_cached_slot(&device_id)? {
         state.clipboard_cache.remove(&object_name);
     }
     state.store.revoke_device(&device_id, &revoked_at)?;
+    for group_id in &owner_group_ids {
+        state
+            .store
+            .set_group_local_state(group_id, "left", &revoked_at)?;
+    }
     transport.disable_peer(&device_id);
     state
         .remote_bodies
@@ -1056,6 +2064,9 @@ pub fn revoke_device(
         snapshot
             .pending_pairings
             .retain(|pairing| pairing.device_id != device_id);
+        snapshot
+            .sync_groups
+            .retain(|group| !owner_group_ids.contains(&group.group_id));
         if let Some(nearby) = snapshot
             .nearby_devices
             .iter_mut()
@@ -1065,6 +2076,7 @@ pub fn revoke_device(
         }
         Ok(())
     })?;
+    reconcile_group_slots(&state, &app)?;
     Ok(())
 }
 
@@ -1260,6 +2272,11 @@ pub fn create_import_intent(
         .representations
         .iter()
         .any(|representation| representation.kind == "image");
+    state.validate_group_delivery(
+        &slot.device_id,
+        &slot.group_ids,
+        if is_image { "image" } else { "text" },
+    )?;
     if (is_image && !snapshot.settings.allow_images) || (!is_image && !snapshot.settings.allow_text)
     {
         return Err("本机策略已停用此内容类型的取用".into());

@@ -42,7 +42,7 @@ export function App({ client }: { client: DesktopClient }) {
       case "home": return <HomePage {...shared} openClipboard={() => setPage("clipboard")} />;
       case "clipboard": return <ClipboardPage {...shared} />;
       case "devices": return <DevicesPage snapshot={snapshot} client={client} onError={setError} />;
-      case "groups": return <GroupsPage snapshot={snapshot} />;
+      case "groups": return <GroupsPage snapshot={snapshot} client={client} onError={setError} />;
       case "transfers": return <TransfersPage />;
       case "settings": return <SettingsPage {...shared} />;
     }

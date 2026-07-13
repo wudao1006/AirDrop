@@ -23,6 +23,7 @@ const initialSlots: DeviceSlot[] = [
     capturedAt: now,
     ageLabel: "8 秒前",
     groups: ["个人设备", "工作组"],
+    groupIds: ["demo-personal", "demo-work"],
     sequence: 1842,
     size: 94,
     representations: [
@@ -42,6 +43,7 @@ const initialSlots: DeviceSlot[] = [
     capturedAt: now,
     ageLabel: "1 分钟前",
     groups: ["工作组"],
+    groupIds: ["demo-work"],
     sequence: 907,
     size: 3_355_443,
     representations: [
@@ -60,6 +62,7 @@ const initialSlots: DeviceSlot[] = [
     capturedAt: now,
     ageLabel: "4 分钟前",
     groups: ["个人设备"],
+    groupIds: ["demo-personal"],
     sequence: 331,
     size: 24,
     representations: [
@@ -79,6 +82,7 @@ const initialSlots: DeviceSlot[] = [
     capturedAt: now,
     ageLabel: "12 分钟前",
     groups: ["实验室"],
+    groupIds: ["demo-lab"],
     sequence: 52,
     size: 4_096,
     blockedReason: "当前同步组未允许此私有格式",
@@ -115,6 +119,8 @@ const initialSnapshot: UiSnapshot = {
   trustedDevices: [],
   pendingPairings: [],
   cachePersistent: false,
+  syncGroups: [],
+  pendingGroupInvites: [],
   imports: [],
   settings: {
     ...DEFAULT_APPEARANCE_SETTINGS,
@@ -347,6 +353,34 @@ export class DemoDesktopClient implements DesktopClient {
     this.snapshot.trustedDevices = this.snapshot.trustedDevices.filter((item) => item.deviceId !== deviceId);
     this.snapshot.slots = this.snapshot.slots.filter((item) => item.deviceId !== deviceId);
     this.bump();
+  }
+
+  async createSyncGroup(_input: { name: string; memberDeviceIds: string[]; allowText: boolean; allowImages: boolean; allowHtml: boolean; allowFiles: boolean }): Promise<string> {
+    throw new Error("浏览器预览不能创建真实同步组，请打开 AirDrop 应用");
+  }
+
+  async confirmGroupInvite(_inviteId: string, _accepted: boolean): Promise<void> {
+    throw new Error("浏览器预览没有真实同步组邀请");
+  }
+
+  async setGroupMemberDirection(_groupId: string, _deviceId: string, _direction: "disabled" | "send_only" | "receive_only" | "bidirectional"): Promise<void> {
+    throw new Error("浏览器预览不能修改真实同步组");
+  }
+
+  async removeGroupMember(_groupId: string, _deviceId: string): Promise<void> {
+    throw new Error("浏览器预览不能移除真实同步组成员");
+  }
+
+  async updateGroupPolicy(_input: { groupId: string; allowText: boolean; allowImages: boolean; allowHtml: boolean; allowFiles: boolean }): Promise<void> {
+    throw new Error("浏览器预览不能修改真实同步组策略");
+  }
+
+  async leaveSyncGroup(_groupId: string): Promise<void> {
+    throw new Error("浏览器预览不能退出真实同步组");
+  }
+
+  async deleteSyncGroup(_groupId: string): Promise<void> {
+    throw new Error("浏览器预览不能结束真实同步组");
   }
 
   private bump(): void {

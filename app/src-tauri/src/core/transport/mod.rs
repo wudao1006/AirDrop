@@ -2,6 +2,7 @@ mod protocol;
 
 use super::{
     discovery::TRANSPORT_PORT,
+    group::{SignedGroupManifest, SignedGroupTombstone},
     identity::device_id_for_key,
     service::{self, PendingPairing, ServiceState},
     storage::TrustedDevice,
@@ -55,6 +56,13 @@ struct LocalImageOffer {
     png: Arc<Vec<u8>>,
 }
 
+#[derive(Clone)]
+struct LocalTextOffer {
+    sequence: u64,
+    captured_at: String,
+    text: String,
+}
+
 impl Drop for PairCommandRegistration {
     fn drop(&mut self) {
         if let Ok(mut commands) = self.commands.lock() {
@@ -72,7 +80,7 @@ pub(crate) struct TransportHandle {
     pair_commands: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<bool>>>>,
     peers: Arc<Mutex<HashMap<String, PeerConnection>>>,
     connecting: Arc<Mutex<HashSet<String>>>,
-    latest_offer: Arc<Mutex<Option<TrustedMessage>>>,
+    latest_offer: Arc<Mutex<Option<LocalTextOffer>>>,
     latest_image: Arc<Mutex<Option<LocalImageOffer>>>,
 }
 
@@ -100,25 +108,30 @@ impl TransportHandle {
         sequence: u64,
         text: String,
         captured_at: String,
-        enabled_devices: &HashSet<String>,
+        targets: &HashMap<String, Vec<String>>,
     ) {
         if text.len() > 1024 * 1024 {
             return;
         }
-        let message = TrustedMessage::ClipboardSlotOffer {
-            schema_version: 1,
-            message_id: uuid::Uuid::new_v4().simple().to_string(),
-            origin_sequence: sequence,
+        let offer = LocalTextOffer {
+            sequence,
             captured_at,
             text,
         };
         if let Ok(mut latest) = self.latest_offer.lock() {
-            *latest = Some(message.clone());
+            *latest = Some(offer.clone());
         }
         if let Ok(peers) = self.peers.lock() {
             for (device_id, peer) in peers.iter() {
-                if enabled_devices.contains(device_id) {
-                    let _ = peer.sender.send(message.clone());
+                if let Some(group_ids) = targets.get(device_id) {
+                    let _ = peer.sender.send(TrustedMessage::ClipboardSlotOffer {
+                        schema_version: 1,
+                        message_id: uuid::Uuid::new_v4().simple().to_string(),
+                        origin_sequence: offer.sequence,
+                        captured_at: offer.captured_at.clone(),
+                        text: offer.text.clone(),
+                        group_ids: group_ids.clone(),
+                    });
                 }
             }
         }
@@ -131,7 +144,7 @@ impl TransportHandle {
         width: u32,
         height: u32,
         captured_at: String,
-        enabled_devices: &HashSet<String>,
+        targets: &HashMap<String, Vec<String>>,
     ) {
         let mut png = Vec::new();
         if PngEncoder::new(&mut png)
@@ -162,15 +175,18 @@ impl TransportHandle {
             .map(|peers| {
                 peers
                     .iter()
-                    .filter(|(device_id, _)| enabled_devices.contains(*device_id))
-                    .map(|(_, peer)| peer.connection.clone())
+                    .filter_map(|(device_id, peer)| {
+                        targets
+                            .get(device_id)
+                            .map(|groups| (peer.connection.clone(), groups.clone()))
+                    })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        for connection in connections {
+        for (connection, group_ids) in connections {
             let offer = offer.clone();
             self.runtime.spawn(async move {
-                if let Err(error) = send_image_blob(connection, offer).await {
+                if let Err(error) = send_image_blob(connection, offer, group_ids).await {
                     tracing::debug!(error = %error, "clipboard image send failed");
                 }
             });
@@ -201,6 +217,109 @@ impl TransportHandle {
         }
     }
 
+    pub(crate) fn certificate_der(&self) -> &[u8] {
+        &self.certificate_der
+    }
+
+    pub(crate) fn send_to(&self, device_id: &str, message: TrustedMessage) -> Result<(), String> {
+        let peers = self
+            .peers
+            .lock()
+            .map_err(|_| "可信连接表锁已损坏".to_string())?;
+        peers
+            .get(device_id)
+            .ok_or_else(|| "目标设备当前不在线".to_string())?
+            .sender
+            .send(message)
+            .map_err(|_| "目标设备连接已断开".to_string())
+    }
+
+    pub(crate) fn send_group_invite(
+        &self,
+        device_id: &str,
+        invite_id: String,
+        expires_at: String,
+        manifest: SignedGroupManifest,
+    ) -> Result<(), String> {
+        self.send_to(
+            device_id,
+            TrustedMessage::GroupInvite {
+                schema_version: 1,
+                message_id: uuid::Uuid::new_v4().simple().to_string(),
+                invite_id,
+                target_device_id: device_id.to_string(),
+                expires_at,
+                manifest,
+            },
+        )
+    }
+
+    pub(crate) fn send_group_accept(
+        &self,
+        owner_device_id: &str,
+        invite_id: String,
+        group_id: String,
+        accepted: bool,
+    ) -> Result<(), String> {
+        self.send_to(
+            owner_device_id,
+            TrustedMessage::GroupAccept {
+                schema_version: 1,
+                message_id: uuid::Uuid::new_v4().simple().to_string(),
+                invite_id,
+                group_id,
+                accepted,
+            },
+        )
+    }
+
+    pub(crate) fn send_group_manifest(
+        &self,
+        device_id: &str,
+        manifest: SignedGroupManifest,
+    ) -> Result<(), String> {
+        self.send_to(
+            device_id,
+            TrustedMessage::GroupManifestUpdate {
+                schema_version: 1,
+                message_id: uuid::Uuid::new_v4().simple().to_string(),
+                manifest,
+            },
+        )
+    }
+
+    pub(crate) fn send_group_leave(
+        &self,
+        owner_device_id: &str,
+        group_id: String,
+        leave_id: String,
+    ) -> Result<(), String> {
+        self.send_to(
+            owner_device_id,
+            TrustedMessage::GroupLeaveNotice {
+                schema_version: 1,
+                message_id: uuid::Uuid::new_v4().simple().to_string(),
+                group_id,
+                leave_id,
+            },
+        )
+    }
+
+    pub(crate) fn send_group_tombstone(
+        &self,
+        device_id: &str,
+        tombstone: SignedGroupTombstone,
+    ) -> Result<(), String> {
+        self.send_to(
+            device_id,
+            TrustedMessage::GroupTombstone {
+                schema_version: 1,
+                message_id: uuid::Uuid::new_v4().simple().to_string(),
+                tombstone,
+            },
+        )
+    }
+
     pub(crate) fn connect_pairing(&self, app: AppHandle, nearby: service::NearbyDevice) {
         let handle = self.clone();
         self.runtime.spawn(async move {
@@ -216,7 +335,7 @@ impl TransportHandle {
             let state = app.state::<ServiceState>();
             state.device_id() < device_id.as_str()
                 && state
-                    .trusted_device(&device_id)
+                    .authorized_device(&device_id)
                     .ok()
                     .flatten()
                     .is_some_and(|device| device.sync_enabled)
@@ -248,7 +367,7 @@ impl TransportHandle {
                 let current = {
                     let state = app.state::<ServiceState>();
                     if !state
-                        .trusted_device(&device_id)
+                        .authorized_device(&device_id)
                         .ok()
                         .flatten()
                         .is_some_and(|device| device.sync_enabled)
@@ -367,7 +486,7 @@ impl TransportHandle {
         let trusted = {
             let state = app.state::<ServiceState>();
             state
-                .trusted_device(&nearby.device_id)?
+                .authorized_device(&nearby.device_id)?
                 .ok_or_else(|| "设备尚未配对".to_string())?
         };
         if !trusted.sync_enabled {
@@ -542,7 +661,7 @@ impl TransportHandle {
         let trusted = {
             let state = app.state::<ServiceState>();
             let trusted = state
-                .trusted_device(&device_id)?
+                .authorized_device(&device_id)?
                 .ok_or_else(|| "对端身份不在可信设备中".to_string())?;
             if !trusted.sync_enabled {
                 return Err("该设备的剪贴板同步已停用".into());
@@ -562,15 +681,35 @@ impl TransportHandle {
                     connection: connection.clone(),
                 },
             );
+        {
+            let state = app.state::<ServiceState>();
+            state.replay_group_state(self, &device_id);
+        }
         if let Some(latest) = self
             .latest_offer
             .lock()
             .ok()
             .and_then(|latest| latest.clone())
         {
-            if let Ok(peers) = self.peers.lock() {
-                if let Some(peer) = peers.get(&device_id) {
-                    let _ = peer.sender.send(latest);
+            let groups = {
+                let state = app.state::<ServiceState>();
+                state
+                    .delivery_targets("text")
+                    .ok()
+                    .and_then(|targets| targets.get(&device_id).cloned())
+            };
+            if let Some(group_ids) = groups {
+                if let Ok(peers) = self.peers.lock() {
+                    if let Some(peer) = peers.get(&device_id) {
+                        let _ = peer.sender.send(TrustedMessage::ClipboardSlotOffer {
+                            schema_version: 1,
+                            message_id: uuid::Uuid::new_v4().simple().to_string(),
+                            origin_sequence: latest.sequence,
+                            captured_at: latest.captured_at,
+                            text: latest.text,
+                            group_ids,
+                        });
+                    }
                 }
             }
         }
@@ -581,9 +720,18 @@ impl TransportHandle {
             .and_then(|latest| latest.clone())
         {
             let connection = connection.clone();
+            let groups = {
+                let state = app.state::<ServiceState>();
+                state
+                    .delivery_targets("image")
+                    .ok()
+                    .and_then(|targets| targets.get(&device_id).cloned())
+            };
             self.runtime.spawn(async move {
-                if let Err(error) = send_image_blob(connection, image).await {
-                    tracing::debug!(error = %error, "cached clipboard image send failed");
+                if let Some(group_ids) = groups {
+                    if let Err(error) = send_image_blob(connection, image, group_ids).await {
+                        tracing::debug!(error = %error, "cached clipboard image send failed");
+                    }
                 }
             });
         }
@@ -606,6 +754,7 @@ impl TransportHandle {
                     origin_sequence,
                     captured_at,
                     text,
+                    group_ids,
                     ..
                 }) => {
                     let state = app.state::<ServiceState>();
@@ -616,8 +765,79 @@ impl TransportHandle {
                         origin_sequence,
                         text,
                         captured_at,
+                        group_ids,
                     ) {
                         tracing::warn!(device_id = %device_id, error = %error, "remote clipboard rejected");
+                    }
+                }
+                Ok(TrustedMessage::GroupInvite {
+                    schema_version: 1,
+                    invite_id,
+                    target_device_id,
+                    expires_at,
+                    manifest,
+                    ..
+                }) => {
+                    let state = app.state::<ServiceState>();
+                    if let Err(error) = service::receive_group_invite(
+                        &state,
+                        &app,
+                        &device_id,
+                        invite_id,
+                        target_device_id,
+                        expires_at,
+                        manifest,
+                    ) {
+                        tracing::warn!(device_id = %device_id, error = %error, "group invite rejected");
+                    }
+                }
+                Ok(TrustedMessage::GroupAccept {
+                    schema_version: 1,
+                    invite_id,
+                    group_id,
+                    accepted,
+                    ..
+                }) => {
+                    let state = app.state::<ServiceState>();
+                    if let Err(error) = service::receive_group_accept(
+                        &state, &app, self, &device_id, &invite_id, &group_id, accepted,
+                    ) {
+                        tracing::warn!(device_id = %device_id, error = %error, "group accept rejected");
+                    }
+                }
+                Ok(TrustedMessage::GroupManifestUpdate {
+                    schema_version: 1,
+                    manifest,
+                    ..
+                }) => {
+                    let state = app.state::<ServiceState>();
+                    if let Err(error) =
+                        service::receive_group_manifest(&state, &app, self, manifest)
+                    {
+                        tracing::warn!(device_id = %device_id, error = %error, "group manifest rejected");
+                    }
+                }
+                Ok(TrustedMessage::GroupLeaveNotice {
+                    schema_version: 1,
+                    group_id,
+                    leave_id,
+                    ..
+                }) => {
+                    let state = app.state::<ServiceState>();
+                    if let Err(error) = service::receive_group_leave(
+                        &state, &app, self, &device_id, &group_id, &leave_id,
+                    ) {
+                        tracing::warn!(device_id = %device_id, error = %error, "group leave rejected");
+                    }
+                }
+                Ok(TrustedMessage::GroupTombstone {
+                    schema_version: 1,
+                    tombstone,
+                    ..
+                }) => {
+                    let state = app.state::<ServiceState>();
+                    if let Err(error) = service::receive_group_tombstone(&state, &app, tombstone) {
+                        tracing::warn!(device_id = %device_id, error = %error, "group tombstone rejected");
                     }
                 }
                 Ok(_) => return Err("可信连接收到意外消息".into()),
@@ -642,7 +862,11 @@ impl TransportHandle {
     }
 }
 
-async fn send_image_blob(connection: Connection, offer: LocalImageOffer) -> Result<(), String> {
+async fn send_image_blob(
+    connection: Connection,
+    offer: LocalImageOffer,
+    group_ids: Vec<String>,
+) -> Result<(), String> {
     let mut send = connection
         .open_uni()
         .await
@@ -656,6 +880,7 @@ async fn send_image_blob(connection: Connection, offer: LocalImageOffer) -> Resu
         height: offer.height,
         png_length: offer.png.len() as u64,
         sha256: HEXLOWER.encode(&Sha256::digest(offer.png.as_slice())),
+        group_ids,
     };
     write_frame(&mut send, &header).await?;
     send.write_all(offer.png.as_slice())
@@ -707,6 +932,7 @@ async fn receive_image_blobs(app: AppHandle, connection: Connection, device: Tru
                     width: header.width,
                     height: header.height,
                     captured_at: header.captured_at,
+                    group_ids: header.group_ids,
                 },
             )
         }
@@ -1262,6 +1488,7 @@ mod tests {
             origin_sequence: 7,
             captured_at: "2026-07-13T00:00:00Z".into(),
             text: "hello over quic".into(),
+            group_ids: vec!["00112233-4455-6677-8899-aabbccddeeff".into()],
         };
         write_frame(&mut send, &offer).await.unwrap();
         let echoed: TrustedMessage = read_frame(&mut receive).await.unwrap();
@@ -1287,6 +1514,7 @@ mod tests {
                 height: 1,
                 png: Arc::new(png),
             },
+            vec!["00112233-4455-6677-8899-aabbccddeeff".into()],
         )
         .await
         .unwrap();

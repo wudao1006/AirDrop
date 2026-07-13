@@ -52,6 +52,7 @@ export interface DeviceSlot {
   capturedAt: string;
   ageLabel: string;
   groups: string[];
+  groupIds: string[];
   sequence: number;
   size: number;
   representations: ClipboardRepresentation[];
@@ -88,6 +89,48 @@ export interface PendingPairing {
   direction: "incoming" | "outgoing";
   expiresAt: string;
   status: "awaiting_confirmation" | "waiting_for_peer";
+}
+
+export type GroupMemberState = "invited" | "active" | "removed";
+export type SyncDirection = "disabled" | "send_only" | "receive_only" | "bidirectional";
+
+export interface GroupPolicy {
+  allowText: boolean;
+  allowImages: boolean;
+  allowHtml: boolean;
+  allowFiles: boolean;
+  offlineTtlSeconds: number;
+}
+
+export interface GroupMember {
+  deviceId: string;
+  deviceName: string;
+  platform: "macos" | "windows" | "linux" | "android" | "unknown";
+  publicKey: string;
+  certificate: string;
+  joinedAt: string;
+  state: GroupMemberState;
+  direction: SyncDirection;
+}
+
+export interface SyncGroup {
+  groupId: string;
+  name: string;
+  ownerDeviceId: string;
+  revision: number;
+  membershipEpoch: number;
+  isOwner: boolean;
+  policy: GroupPolicy;
+  members: GroupMember[];
+}
+
+export interface PendingGroupInvite {
+  inviteId: string;
+  groupId: string;
+  groupName: string;
+  ownerDeviceId: string;
+  ownerName: string;
+  expiresAt: string;
 }
 
 export interface CurrentClipboard {
@@ -145,6 +188,8 @@ export interface UiSnapshot {
   trustedDevices: TrustedDevice[];
   pendingPairings: PendingPairing[];
   cachePersistent: boolean;
+  syncGroups: SyncGroup[];
+  pendingGroupInvites: PendingGroupInvite[];
   imports: ImportOperation[];
   settings: AppSettings;
 }

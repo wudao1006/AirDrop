@@ -95,7 +95,7 @@ pub(crate) fn start(app: AppHandle) -> Result<(), String> {
                     }
                     if app
                         .state::<service::ServiceState>()
-                        .trusted_device(&nearby.device_id)
+                        .authorized_device(&nearby.device_id)
                         .ok()
                         .flatten()
                         .is_some()

@@ -19,6 +19,13 @@ export interface AppClient {
   confirmPairing(pairingId: string, accepted: boolean): Promise<void>;
   setDeviceSyncEnabled(deviceId: string, enabled: boolean): Promise<void>;
   revokeDevice(deviceId: string): Promise<void>;
+  createSyncGroup(input: { name: string; memberDeviceIds: string[]; allowText: boolean; allowImages: boolean; allowHtml: boolean; allowFiles: boolean }): Promise<string>;
+  confirmGroupInvite(inviteId: string, accepted: boolean): Promise<void>;
+  setGroupMemberDirection(groupId: string, deviceId: string, direction: "disabled" | "send_only" | "receive_only" | "bidirectional"): Promise<void>;
+  removeGroupMember(groupId: string, deviceId: string): Promise<void>;
+  updateGroupPolicy(input: { groupId: string; allowText: boolean; allowImages: boolean; allowHtml: boolean; allowFiles: boolean }): Promise<void>;
+  leaveSyncGroup(groupId: string): Promise<void>;
+  deleteSyncGroup(groupId: string): Promise<void>;
 }
 
 export type DesktopClient = AppClient;

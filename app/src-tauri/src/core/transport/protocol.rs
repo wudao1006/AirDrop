@@ -1,3 +1,4 @@
+use crate::core::group::{SignedGroupManifest, SignedGroupTombstone};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -64,6 +65,38 @@ pub(crate) enum TrustedMessage {
         origin_sequence: u64,
         captured_at: String,
         text: String,
+        group_ids: Vec<String>,
+    },
+    GroupInvite {
+        schema_version: u8,
+        message_id: String,
+        invite_id: String,
+        target_device_id: String,
+        expires_at: String,
+        manifest: SignedGroupManifest,
+    },
+    GroupAccept {
+        schema_version: u8,
+        message_id: String,
+        invite_id: String,
+        group_id: String,
+        accepted: bool,
+    },
+    GroupManifestUpdate {
+        schema_version: u8,
+        message_id: String,
+        manifest: SignedGroupManifest,
+    },
+    GroupLeaveNotice {
+        schema_version: u8,
+        message_id: String,
+        group_id: String,
+        leave_id: String,
+    },
+    GroupTombstone {
+        schema_version: u8,
+        message_id: String,
+        tombstone: SignedGroupTombstone,
     },
 }
 
@@ -78,6 +111,7 @@ pub(crate) struct ImageBlobHeader {
     pub(crate) height: u32,
     pub(crate) png_length: u64,
     pub(crate) sha256: String,
+    pub(crate) group_ids: Vec<String>,
 }
 
 pub(crate) async fn write_frame<T: Serialize>(

@@ -51,6 +51,13 @@ pub fn run() {
             core::service::confirm_pairing,
             core::service::set_device_sync_enabled,
             core::service::revoke_device,
+            core::service::create_sync_group,
+            core::service::confirm_group_invite,
+            core::service::set_group_member_direction,
+            core::service::remove_group_member,
+            core::service::update_group_policy,
+            core::service::leave_sync_group,
+            core::service::delete_sync_group,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build AirDrop desktop application");

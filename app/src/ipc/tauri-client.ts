@@ -109,6 +109,34 @@ class TauriAppClient implements DesktopClient {
   revokeDevice(deviceId: string): Promise<void> {
     return invoke("revoke_device", { deviceId });
   }
+
+  createSyncGroup(input: { name: string; memberDeviceIds: string[]; allowText: boolean; allowImages: boolean; allowHtml: boolean; allowFiles: boolean }): Promise<string> {
+    return invoke("create_sync_group", { input });
+  }
+
+  confirmGroupInvite(inviteId: string, accepted: boolean): Promise<void> {
+    return invoke("confirm_group_invite", { inviteId, accepted });
+  }
+
+  setGroupMemberDirection(groupId: string, deviceId: string, direction: "disabled" | "send_only" | "receive_only" | "bidirectional"): Promise<void> {
+    return invoke("set_group_member_direction", { groupId, deviceId, direction });
+  }
+
+  removeGroupMember(groupId: string, deviceId: string): Promise<void> {
+    return invoke("remove_group_member", { groupId, deviceId });
+  }
+
+  updateGroupPolicy(input: { groupId: string; allowText: boolean; allowImages: boolean; allowHtml: boolean; allowFiles: boolean }): Promise<void> {
+    return invoke("update_group_policy", { input });
+  }
+
+  leaveSyncGroup(groupId: string): Promise<void> {
+    return invoke("leave_sync_group", { groupId });
+  }
+
+  deleteSyncGroup(groupId: string): Promise<void> {
+    return invoke("delete_sync_group", { groupId });
+  }
 }
 
 export const createDesktopClient = (): DesktopClient => {
