@@ -422,12 +422,21 @@ impl ServiceState {
                 let Some(device) = device else { continue };
                 match clipboard_cache.load(&metadata.device_id, &metadata.object_name) {
                     Ok(cached) if cached.sequence == metadata.sequence => {
+                        let content_type = text_content_type(&cached.text);
+                        let locally_allowed = if content_type == "url" {
+                            snapshot.settings.allow_urls
+                        } else {
+                            snapshot.settings.allow_text
+                        };
+                        if !locally_allowed {
+                            continue;
+                        }
                         let Ok(groups) = validate_group_delivery_from_manifests(
                             &manifests,
                             identity.device_id(),
                             &device.device_id,
                             &cached.group_ids,
-                            "text",
+                            content_type,
                         ) else {
                             continue;
                         };
@@ -623,6 +632,7 @@ impl ServiceState {
             .map_err(|_| "Rust 服务状态锁已损坏".to_string())?;
         let enabled = match content_type {
             "text" => snapshot.settings.allow_text,
+            "url" => snapshot.settings.allow_urls,
             "image" => snapshot.settings.allow_images,
             "html" => snapshot.settings.allow_html,
             "files" => snapshot.settings.allow_files,
@@ -659,6 +669,7 @@ impl ServiceState {
             !snapshot.publish_paused
                 && match content_type {
                     "text" => snapshot.settings.allow_text,
+                    "url" => snapshot.settings.allow_urls,
                     "image" => snapshot.settings.allow_images,
                     "html" => snapshot.settings.allow_html,
                     "files" => snapshot.settings.allow_files,
@@ -721,6 +732,7 @@ fn trusted_from_group_member(member: &GroupMember) -> Result<TrustedDevice, Stri
 fn group_type_allowed(policy: &GroupPolicy, content_type: &str) -> bool {
     match content_type {
         "text" => policy.allow_text,
+        "url" => policy.allow_text,
         "image" => policy.allow_images,
         "html" => policy.allow_html,
         "files" => policy.allow_files,
@@ -802,6 +814,12 @@ fn text_slot(
     availability: &str,
     groups: SlotGroups,
 ) -> DeviceSlot {
+    let content_type = text_content_type(text);
+    let (kind, label, mime) = if content_type == "url" {
+        ("url", "URL", "text/uri-list;charset=utf-8")
+    } else {
+        ("text", "纯文本", "text/plain;charset=utf-8")
+    };
     DeviceSlot {
         id: format!("device:{}", device.device_id),
         revision: sequence,
@@ -823,10 +841,10 @@ fn text_slot(
         sequence,
         size: text.len() as u64,
         representations: vec![ClipboardRepresentation {
-            id: "text/plain".into(),
-            kind: "text".into(),
-            label: "纯文本".into(),
-            mime: "text/plain;charset=utf-8".into(),
+            id: mime.into(),
+            kind: kind.into(),
+            label: label.into(),
+            mime: mime.into(),
             size: text.len() as u64,
             status: "ready".into(),
             enabled: true,
@@ -876,11 +894,17 @@ fn image_slot(
 }
 
 fn rich_slot(device: &TrustedDevice, rich: &RemoteRich, groups: SlotGroups) -> DeviceSlot {
+    let fallback_type = text_content_type(&rich.text);
+    let (fallback_kind, fallback_label, fallback_mime) = if fallback_type == "url" {
+        ("url", "URL 降级", "text/uri-list;charset=utf-8")
+    } else {
+        ("text", "纯文本降级", "text/plain;charset=utf-8")
+    };
     let mut representations = vec![ClipboardRepresentation {
-        id: "text/plain".into(),
-        kind: "text".into(),
-        label: "纯文本降级".into(),
-        mime: "text/plain;charset=utf-8".into(),
+        id: fallback_mime.into(),
+        kind: fallback_kind.into(),
+        label: fallback_label.into(),
+        mime: fallback_mime.into(),
         size: rich.text.len() as u64,
         status: "ready".into(),
         enabled: true,
@@ -1009,6 +1033,17 @@ pub(crate) fn file_list_hash(files: &[String]) -> [u8; 32] {
     hash.finalize().into()
 }
 
+pub(crate) fn text_content_type(text: &str) -> &'static str {
+    let value = text.trim();
+    if value.is_empty() || value.chars().any(char::is_whitespace) {
+        return "text";
+    }
+    url::Url::parse(value)
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https" | "ftp" | "mailto"))
+        .map_or("text", |_| "url")
+}
+
 fn unix_seconds() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1064,6 +1099,7 @@ pub fn capture_local_clipboard(
     if text.len() > 1024 * 1024 {
         return report_clipboard_failure(state, app, "文本剪贴板超过 1 MiB，已跳过同步".into());
     }
+    let content_type = text_content_type(&text);
     let suppress_publish = {
         let mut suppressed = state
             .suppress_next_capture
@@ -1082,11 +1118,20 @@ pub fn capture_local_clipboard(
                 source: "local".into(),
                 source_label: "来自本机系统剪贴板".into(),
                 preview: truncate_text(&text, 4096),
-                types: vec!["纯文本".into()],
+                types: vec![if content_type == "url" {
+                    "URL".into()
+                } else {
+                    "纯文本".into()
+                }],
                 changed_at: now.clone(),
             };
         }
-        if !snapshot.publish_paused && snapshot.settings.allow_text && !suppress_publish {
+        let allowed = if content_type == "url" {
+            snapshot.settings.allow_urls
+        } else {
+            snapshot.settings.allow_text
+        };
+        if !snapshot.publish_paused && allowed && !suppress_publish {
             let preview = truncate_text(&text, 80);
             snapshot.last_published_preview = format!("本机最近捕获：{preview}");
         }
@@ -1096,10 +1141,15 @@ pub fn capture_local_clipboard(
         snapshot.clipboard_capability.limitation = None;
         Ok(())
     })?;
-    if !snapshot.publish_paused && snapshot.settings.allow_text && !suppress_publish {
+    let allowed = if content_type == "url" {
+        snapshot.settings.allow_urls
+    } else {
+        snapshot.settings.allow_text
+    };
+    if !snapshot.publish_paused && allowed && !suppress_publish {
         let sequence = state.store.next_origin_sequence()?;
         if let Some(transport) = app.try_state::<super::transport::TransportHandle>() {
-            let targets = state.delivery_targets("text")?;
+            let targets = state.delivery_targets(content_type)?;
             transport.broadcast_text(sequence, text, now, &targets);
         }
     }
@@ -1124,6 +1174,7 @@ pub fn capture_local_rich(
     if total_size > 1024 * 1024 {
         return report_clipboard_failure(state, app, "富文本剪贴板超过 1 MiB，已跳过同步".into());
     }
+    let fallback_type = text_content_type(&text);
     let hash = rich_hash(&text, html.as_deref(), rtf.as_deref());
     let suppress_publish = {
         let mut suppressed = state
@@ -1147,8 +1198,13 @@ pub fn capture_local_rich(
                 changed_at: now.clone(),
             };
         }
+        let fallback_allowed = if fallback_type == "url" {
+            snapshot.settings.allow_urls
+        } else {
+            snapshot.settings.allow_text
+        };
         if !snapshot.publish_paused
-            && (snapshot.settings.allow_html || snapshot.settings.allow_text)
+            && (snapshot.settings.allow_html || fallback_allowed)
             && !suppress_publish
         {
             snapshot.last_published_preview = format!("本机最近捕获：{}", truncate_text(&text, 80));
@@ -1156,16 +1212,21 @@ pub fn capture_local_rich(
         snapshot.last_synchronized_at = now.clone();
         Ok(())
     })?;
+    let fallback_allowed = if fallback_type == "url" {
+        snapshot.settings.allow_urls
+    } else {
+        snapshot.settings.allow_text
+    };
     if !snapshot.publish_paused
-        && (snapshot.settings.allow_html || snapshot.settings.allow_text)
+        && (snapshot.settings.allow_html || fallback_allowed)
         && !suppress_publish
     {
         let sequence = state.store.next_origin_sequence()?;
         if let Some(transport) = app.try_state::<super::transport::TransportHandle>() {
             if snapshot.settings.allow_html {
                 let rich_targets = state.delivery_targets("html")?;
-                let text_targets = if snapshot.settings.allow_text {
-                    state.delivery_targets("text")?
+                let text_targets = if fallback_allowed {
+                    state.delivery_targets(fallback_type)?
                 } else {
                     HashMap::new()
                 };
@@ -1181,7 +1242,7 @@ pub fn capture_local_rich(
                     },
                 );
             } else {
-                let targets = state.delivery_targets("text")?;
+                let targets = state.delivery_targets(fallback_type)?;
                 transport.broadcast_text(sequence, text, now, &targets);
             }
         }
@@ -1474,23 +1535,24 @@ pub(crate) fn receive_remote_text(
     {
         return Err("该设备的剪贴板同步已停用".into());
     }
-    let group_names = state.validate_group_delivery(&device.device_id, &group_ids, "text")?;
-    if !state
-        .snapshot
-        .lock()
-        .map_err(|_| "Rust 服务状态锁已损坏".to_string())?
-        .settings
-        .allow_text
+    let content_type = text_content_type(&text);
+    let group_names = state.validate_group_delivery(&device.device_id, &group_ids, content_type)?;
     {
-        return Err("本机策略已停用纯文本同步".into());
-    }
-    if state
-        .snapshot
-        .lock()
-        .map_err(|_| "Rust 服务状态锁已损坏".to_string())?
-        .subscribe_paused
-    {
-        return Ok(());
+        let snapshot = state
+            .snapshot
+            .lock()
+            .map_err(|_| "Rust 服务状态锁已损坏".to_string())?;
+        let allowed = if content_type == "url" {
+            snapshot.settings.allow_urls
+        } else {
+            snapshot.settings.allow_text
+        };
+        if !allowed {
+            return Err("本机策略已停用此文本类型同步".into());
+        }
+        if snapshot.subscribe_paused {
+            return Ok(());
+        }
     }
     let slot_id = format!("device:{}", device.device_id);
     state.clear_accepted_file_transfer(&device.device_id);
@@ -1585,8 +1647,9 @@ pub(crate) fn receive_remote_rich(
     }
     let mut group_names =
         state.validate_group_delivery(&device.device_id, &rich.group_ids, "html")?;
+    let fallback_type = text_content_type(&rich.text);
     if let Ok(text_group_names) =
-        state.validate_group_delivery(&device.device_id, &rich.group_ids, "text")
+        state.validate_group_delivery(&device.device_id, &rich.group_ids, fallback_type)
     {
         group_names.extend(text_group_names);
         group_names.sort();
@@ -1835,6 +1898,15 @@ fn reconcile_group_slots(state: &ServiceState, app: &AppHandle) -> Result<(), St
             .representations
             .iter()
             .any(|representation| representation.kind == "html");
+        let fallback_type = if slot
+            .representations
+            .iter()
+            .any(|representation| representation.kind == "url")
+        {
+            "url"
+        } else {
+            "text"
+        };
         let content_type = if slot
             .representations
             .iter()
@@ -1850,7 +1922,7 @@ fn reconcile_group_slots(state: &ServiceState, app: &AppHandle) -> Result<(), St
         } else if is_rich {
             "html"
         } else {
-            "text"
+            fallback_type
         };
         let mut valid_ids = Vec::new();
         let mut valid_names = Vec::new();
@@ -1869,7 +1941,7 @@ fn reconcile_group_slots(state: &ServiceState, app: &AppHandle) -> Result<(), St
                 if let Ok(names) = state.validate_group_delivery(
                     &slot.device_id,
                     std::slice::from_ref(group_id),
-                    "text",
+                    fallback_type,
                 ) {
                     text_ids.push(group_id.clone());
                     text_names.extend(names);
@@ -1935,13 +2007,27 @@ fn reconcile_group_slots(state: &ServiceState, app: &AppHandle) -> Result<(), St
                 slot.group_ids = group_ids.clone();
                 slot.groups = names.clone();
                 if *downgrade_to_text {
+                    let fallback_type = if slot
+                        .representations
+                        .iter()
+                        .any(|representation| representation.kind == "url")
+                    {
+                        "url"
+                    } else {
+                        "text"
+                    };
                     let size = downgraded_sizes.get(&slot.id).copied().unwrap_or(slot.size);
+                    let (id, kind, label, mime) = if fallback_type == "url" {
+                        ("text/uri-list", "url", "URL", "text/uri-list;charset=utf-8")
+                    } else {
+                        ("text/plain", "text", "纯文本", "text/plain;charset=utf-8")
+                    };
                     slot.size = size;
                     slot.representations = vec![ClipboardRepresentation {
-                        id: "text/plain".into(),
-                        kind: "text".into(),
-                        label: "纯文本".into(),
-                        mime: "text/plain;charset=utf-8".into(),
+                        id: id.into(),
+                        kind: kind.into(),
+                        label: label.into(),
+                        mime: mime.into(),
                         size,
                         status: "ready".into(),
                         enabled: true,
@@ -2828,6 +2914,20 @@ pub fn update_settings(
             });
             snapshot.imports.clear();
         }
+        if !snapshot.settings.allow_urls {
+            snapshot.slots.retain(|slot| {
+                let has_url = slot
+                    .representations
+                    .iter()
+                    .any(|representation| representation.kind == "url");
+                let has_rich = slot
+                    .representations
+                    .iter()
+                    .any(|representation| representation.kind == "html");
+                !has_url || has_rich
+            });
+            snapshot.imports.clear();
+        }
         if !snapshot.settings.allow_images {
             snapshot.slots.retain(|slot| {
                 !slot
@@ -2858,13 +2958,27 @@ pub fn update_settings(
         Ok(())
     })?;
     state.store.save_settings(&snapshot.settings)?;
-    if !snapshot.settings.allow_text {
-        if let Some(transport) = app.try_state::<super::transport::TransportHandle>() {
-            transport.clear_latest_text();
-        }
-        for device in state.store.trusted_devices()? {
-            if let Some(object_name) = state.store.remove_cached_slot(&device.device_id)? {
-                state.clipboard_cache.remove(&object_name);
+    if let Some(transport) = app.try_state::<super::transport::TransportHandle>() {
+        transport
+            .retain_enabled_latest_text(snapshot.settings.allow_text, snapshot.settings.allow_urls);
+    }
+    if !snapshot.settings.allow_text || !snapshot.settings.allow_urls {
+        for metadata in state.store.cached_slots(unix_seconds())? {
+            let remove = state
+                .clipboard_cache
+                .load(&metadata.device_id, &metadata.object_name)
+                .map(|cached| {
+                    if text_content_type(&cached.text) == "url" {
+                        !snapshot.settings.allow_urls
+                    } else {
+                        !snapshot.settings.allow_text
+                    }
+                })
+                .unwrap_or(true);
+            if remove {
+                if let Some(object_name) = state.store.remove_cached_slot(&metadata.device_id)? {
+                    state.clipboard_cache.remove(&object_name);
+                }
             }
         }
     }
@@ -2875,7 +2989,8 @@ pub fn update_settings(
     }
     if !snapshot.settings.allow_html {
         if let Some(transport) = app.try_state::<super::transport::TransportHandle>() {
-            transport.clear_latest_rich();
+            transport
+                .downgrade_latest_rich(snapshot.settings.allow_text, snapshot.settings.allow_urls);
         }
     }
     if !snapshot.settings.allow_files {
@@ -2887,6 +3002,7 @@ pub fn update_settings(
         }
     }
     if !snapshot.settings.allow_text
+        || !snapshot.settings.allow_urls
         || !snapshot.settings.allow_images
         || !snapshot.settings.allow_html
         || !snapshot.settings.allow_files
@@ -2896,7 +3012,13 @@ pub fn update_settings(
             .lock()
             .map_err(|_| "远端正文缓存锁已损坏".to_string())?
             .retain(|_, body| match body {
-                RemoteClipboardBody::Text(_) => snapshot.settings.allow_text,
+                RemoteClipboardBody::Text(text) => {
+                    if text_content_type(text) == "url" {
+                        snapshot.settings.allow_urls
+                    } else {
+                        snapshot.settings.allow_text
+                    }
+                }
                 RemoteClipboardBody::Rich { .. } => snapshot.settings.allow_html,
                 RemoteClipboardBody::Files(_) => snapshot.settings.allow_files,
                 RemoteClipboardBody::Image { .. } => snapshot.settings.allow_images,
@@ -2940,6 +3062,12 @@ pub fn create_import_intent(
         .any(|representation| representation.kind == "html")
     {
         "html"
+    } else if slot
+        .representations
+        .iter()
+        .any(|representation| representation.kind == "url")
+    {
+        "url"
     } else {
         "text"
     };
@@ -2947,6 +3075,7 @@ pub fn create_import_intent(
     let allowed = match content_type {
         "image" => snapshot.settings.allow_images,
         "html" => snapshot.settings.allow_html,
+        "url" => snapshot.settings.allow_urls,
         "files" => snapshot.settings.allow_files,
         _ => snapshot.settings.allow_text,
     };
@@ -3017,7 +3146,14 @@ pub fn confirm_import(
                     .map_err(|_| "剪贴板回环抑制锁已损坏".to_string())? = None;
                 return Err(format!("无法写入本机系统剪贴板：{error}"));
             }
-            (truncate_text(text, 4096), vec!["纯文本".into()])
+            (
+                truncate_text(text, 4096),
+                vec![if text_content_type(text) == "url" {
+                    "URL".into()
+                } else {
+                    "纯文本".into()
+                }],
+            )
         }
         RemoteClipboardBody::Rich { text, html, rtf } => {
             *state
@@ -3127,4 +3263,18 @@ pub fn cancel_import(
         Ok(())
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::text_content_type;
+
+    #[test]
+    fn classifies_standalone_network_urls_without_treating_paths_as_urls() {
+        assert_eq!(text_content_type("https://example.com/path"), "url");
+        assert_eq!(text_content_type("mailto:user@example.com"), "url");
+        assert_eq!(text_content_type("file:///tmp/example.txt"), "text");
+        assert_eq!(text_content_type("See https://example.com"), "text");
+        assert_eq!(text_content_type("C:\\Temp\\example.txt"), "text");
+    }
 }

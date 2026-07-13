@@ -69,6 +69,7 @@ struct LocalTextOffer {
     sequence: u64,
     captured_at: String,
     text: String,
+    content_type: String,
 }
 
 #[derive(Clone)]
@@ -78,6 +79,7 @@ struct LocalRichOffer {
     text: String,
     html: Option<String>,
     rtf: Option<String>,
+    fallback_type: String,
 }
 
 #[derive(Clone)]
@@ -148,6 +150,7 @@ impl TransportHandle {
         let offer = LocalTextOffer {
             sequence,
             captured_at,
+            content_type: service::text_content_type(&text).into(),
             text,
         };
         if let Ok(mut latest) = self.latest_offer.lock() {
@@ -195,6 +198,7 @@ impl TransportHandle {
         let offer = LocalRichOffer {
             sequence,
             captured_at,
+            fallback_type: service::text_content_type(&text).into(),
             text,
             html,
             rtf,
@@ -358,6 +362,17 @@ impl TransportHandle {
         }
     }
 
+    pub(crate) fn retain_enabled_latest_text(&self, allow_text: bool, allow_urls: bool) {
+        if let Ok(mut latest) = self.latest_offer.lock() {
+            if latest.as_ref().is_some_and(|offer| {
+                (offer.content_type == "url" && !allow_urls)
+                    || (offer.content_type == "text" && !allow_text)
+            }) {
+                *latest = None;
+            }
+        }
+    }
+
     pub(crate) fn clear_latest_image(&self) {
         if let Ok(mut latest) = self.latest_image.lock() {
             *latest = None;
@@ -367,6 +382,30 @@ impl TransportHandle {
     pub(crate) fn clear_latest_rich(&self) {
         if let Ok(mut latest) = self.latest_rich.lock() {
             *latest = None;
+        }
+    }
+
+    pub(crate) fn downgrade_latest_rich(&self, allow_text: bool, allow_urls: bool) {
+        let rich = self
+            .latest_rich
+            .lock()
+            .ok()
+            .and_then(|mut latest| latest.take());
+        let Some(rich) = rich else { return };
+        let fallback_allowed = if rich.fallback_type == "url" {
+            allow_urls
+        } else {
+            allow_text
+        };
+        if fallback_allowed {
+            if let Ok(mut latest) = self.latest_offer.lock() {
+                *latest = Some(LocalTextOffer {
+                    sequence: rich.sequence,
+                    captured_at: rich.captured_at,
+                    text: rich.text,
+                    content_type: rich.fallback_type,
+                });
+            }
         }
     }
 
@@ -853,10 +892,10 @@ impl TransportHandle {
             let groups = {
                 let state = app.state::<ServiceState>();
                 state
-                    .can_publish_content("text")
+                    .can_publish_content(&latest.content_type)
                     .then(|| {
                         state
-                            .delivery_targets("text")
+                            .delivery_targets(&latest.content_type)
                             .ok()
                             .and_then(|targets| targets.get(&device_id).cloned())
                     })
@@ -895,10 +934,10 @@ impl TransportHandle {
                     })
                     .flatten();
                 let text = state
-                    .can_publish_content("text")
+                    .can_publish_content(&latest.fallback_type)
                     .then(|| {
                         state
-                            .delivery_targets("text")
+                            .delivery_targets(&latest.fallback_type)
                             .ok()
                             .and_then(|targets| targets.get(&device_id).cloned())
                     })
