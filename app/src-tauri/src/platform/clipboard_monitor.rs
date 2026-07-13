@@ -4,6 +4,33 @@ use tauri::{AppHandle, Manager};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
+fn read_basic_clipboard(app: &AppHandle) -> Result<platform::SystemClipboardContent, String> {
+    let text = app.clipboard().read_text();
+    let image = app
+        .clipboard()
+        .read_image()
+        .map(|image| (image.rgba().to_vec(), image.width(), image.height()));
+    if text.is_err() && image.is_err() {
+        return Err("无法读取系统剪贴板中的文本或图片".into());
+    }
+    Ok(platform::SystemClipboardContent {
+        text: text.ok().filter(|value| !value.trim().is_empty()),
+        image: image.ok(),
+        ..Default::default()
+    })
+}
+
+pub(crate) fn read_system_clipboard(
+    app: &AppHandle,
+) -> Result<platform::SystemClipboardContent, String> {
+    match platform::ExtendedClipboard::new() {
+        Ok(clipboard) => clipboard
+            .read_content()
+            .or_else(|_| read_basic_clipboard(app)),
+        Err(_) => read_basic_clipboard(app),
+    }
+}
+
 pub(crate) fn start_clipboard_monitor(app: AppHandle) {
     thread::spawn(move || {
         let mut previous_text = None::<String>;
@@ -23,41 +50,40 @@ pub(crate) fn start_clipboard_monitor(app: AppHandle) {
         let mut failure_reported = false;
         loop {
             thread::sleep(platform::clipboard_poll_interval());
-            let text_result = app.clipboard().read_text();
-            let image_result = app
-                .clipboard()
-                .read_image()
-                .map(|image| (image.rgba().to_vec(), image.width(), image.height()));
-            let current_rich = extended_clipboard
-                .as_ref()
-                .and_then(platform::ExtendedClipboard::read_rich);
-            let current_files = extended_clipboard
-                .as_ref()
-                .map(platform::ExtendedClipboard::read_files)
-                .unwrap_or_default();
-            if text_result.is_ok() || image_result.is_ok() {
+            let content_result = extended_clipboard.as_ref().map_or_else(
+                || read_basic_clipboard(&app),
+                |clipboard| {
+                    clipboard.read_content().or_else(|extended_error| {
+                        read_basic_clipboard(&app)
+                            .map_err(|basic_error| format!("{extended_error}；{basic_error}"))
+                    })
+                },
+            );
+            let content = match content_result {
+                Ok(content) => content,
+                Err(error) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    if consecutive_failures >= 3 && !failure_reported {
+                        let state = app.state::<service::ServiceState>();
+                        let _ = service::report_clipboard_failure(&state, &app, error);
+                        failure_reported = true;
+                    }
+                    continue;
+                }
+            };
+            {
                 consecutive_failures = 0;
                 if failure_reported {
                     let state = app.state::<service::ServiceState>();
                     let _ = service::report_clipboard_recovered(&state, &app);
                     failure_reported = false;
                 }
-            } else {
-                consecutive_failures = consecutive_failures.saturating_add(1);
-                if consecutive_failures >= 3 && !failure_reported {
-                    let state = app.state::<service::ServiceState>();
-                    let _ = service::report_clipboard_failure(
-                        &state,
-                        &app,
-                        "暂时无法读取系统剪贴板中的文本或图片".into(),
-                    );
-                    failure_reported = true;
-                }
-                continue;
             }
 
-            let current_text = text_result.ok().filter(|text| !text.trim().is_empty());
-            let current_image = image_result.ok().and_then(|(rgba, width, height)| {
+            let current_text = content.text;
+            let current_rich = content.rich;
+            let current_files = content.files;
+            let current_image = content.image.and_then(|(rgba, width, height)| {
                 let expected = (width as usize)
                     .checked_mul(height as usize)
                     .and_then(|pixels| pixels.checked_mul(4));

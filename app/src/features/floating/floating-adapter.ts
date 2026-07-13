@@ -93,6 +93,7 @@ const containsCenter = (area: FloatingRect, bounds: FloatingRect): boolean => {
 export class TauriFloatingAdapter implements FloatingAdapter {
   readonly supported = true;
   private orb: FloatingNativeWindow | null = null;
+  private lastBounds: FloatingRect | null = null;
   private ignoreMoveEventsUntil = 0;
 
   constructor(private readonly tauri: FloatingTauriBoundary) {}
@@ -102,7 +103,6 @@ export class TauriFloatingAdapter implements FloatingAdapter {
     if (existing) {
       this.orb = existing;
       await existing.show();
-      await existing.setFocus();
       return;
     }
 
@@ -112,6 +112,8 @@ export class TauriFloatingAdapter implements FloatingAdapter {
       decorations: false,
       alwaysOnTop: true,
       skipTaskbar: true,
+      shadow: false,
+      focus: false,
       resizable: false,
       width: COLLAPSED_ORB_SIZE.width,
       height: COLLAPSED_ORB_SIZE.height,
@@ -141,6 +143,7 @@ export class TauriFloatingAdapter implements FloatingAdapter {
   async closeOrb(): Promise<void> {
     const orb = this.orb ?? await this.tauri.getWindow(FLOATING_ORB_LABEL);
     this.orb = null;
+    this.lastBounds = null;
     if (orb) await orb.close();
   }
 
@@ -169,45 +172,57 @@ export class TauriFloatingAdapter implements FloatingAdapter {
 
   async getOrbBounds(): Promise<FloatingRect> {
     const { position, size, scaleFactor } = await this.getOrbPhysicalMetrics();
-    return {
+    const bounds = {
       x: position.x / scaleFactor,
       y: position.y / scaleFactor,
       width: size.width / scaleFactor,
       height: size.height / scaleFactor,
     };
+    this.lastBounds = bounds;
+    return bounds;
   }
 
   async getOrbWorkArea(): Promise<FloatingRect> {
     const { position, size, scaleFactor } = await this.getOrbPhysicalMetrics();
     const physicalBounds = { x: position.x, y: position.y, width: size.width, height: size.height };
-    const monitors = await this.tauri.availableMonitors().catch(() => []);
-    const matching = monitors.find((monitor) => containsCenter(physicalMonitorRect(monitor), physicalBounds));
-    const monitor = matching ?? await this.tauri.currentMonitor().catch(() => null);
-    return monitor ? logicalMonitorRect(monitor) : {
+    this.lastBounds = {
       x: position.x / scaleFactor,
       y: position.y / scaleFactor,
       width: size.width / scaleFactor,
       height: size.height / scaleFactor,
     };
+    const monitors = await this.tauri.availableMonitors().catch(() => []);
+    const matching = monitors.find((monitor) => containsCenter(physicalMonitorRect(monitor), physicalBounds));
+    const monitor = matching ?? await this.tauri.currentMonitor().catch(() => null);
+    return monitor ? logicalMonitorRect(monitor) : this.lastBounds;
   }
 
   async setOrbBounds(bounds: FloatingRect): Promise<void> {
     const orb = await this.requireOrb();
-    const current = await this.getOrbBounds();
+    const current = this.lastBounds ?? await this.getOrbBounds();
     const x = Math.round(bounds.x);
     const y = Math.round(bounds.y);
     const width = Math.round(bounds.width);
     const height = Math.round(bounds.height);
     const positionChanged = Math.abs(current.x - x) > 0.5 || Math.abs(current.y - y) > 0.5;
     const sizeChanged = Math.abs(current.width - width) > 0.5 || Math.abs(current.height - height) > 0.5;
-    if (!positionChanged && !sizeChanged) return;
+    if (!positionChanged && !sizeChanged) {
+      this.lastBounds = { x, y, width, height };
+      return;
+    }
 
     this.ignoreMoveEventsUntil = Date.now() + 350;
-    const growing = width * height > current.width * current.height;
-    if (growing && positionChanged) await orb.setPosition(new LogicalPosition(x, y));
-    if (sizeChanged) await orb.setSize(new LogicalSize(width, height));
-    if (!growing && positionChanged) await orb.setPosition(new LogicalPosition(x, y));
-    this.ignoreMoveEventsUntil = Date.now() + 350;
+    try {
+      const growing = width * height > current.width * current.height;
+      if (growing && positionChanged) await orb.setPosition(new LogicalPosition(x, y));
+      if (sizeChanged) await orb.setSize(new LogicalSize(width, height));
+      if (!growing && positionChanged) await orb.setPosition(new LogicalPosition(x, y));
+      this.lastBounds = { x, y, width, height };
+      this.ignoreMoveEventsUntil = Date.now() + 250;
+    } catch (error) {
+      this.lastBounds = null;
+      throw error;
+    }
   }
 
   private async requireOrb(): Promise<FloatingNativeWindow> {

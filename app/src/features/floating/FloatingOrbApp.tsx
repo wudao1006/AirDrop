@@ -91,7 +91,7 @@ export function FloatingOrbApp({ adapter = defaultAdapter }: FloatingOrbAppProps
     window.clearTimeout(collapseTimerRef.current);
     collapseTimerRef.current = window.setTimeout(() => {
       if (mountedRef.current) requestLayout(false);
-    }, 180);
+    }, 80);
   }, [requestLayout]);
 
   const runAction = useCallback((action: FloatingOrbAction) => {

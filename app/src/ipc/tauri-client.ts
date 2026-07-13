@@ -1,4 +1,3 @@
-import { readText } from "@tauri-apps/plugin-clipboard-manager";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { DesktopClient, Unsubscribe } from "./client";
@@ -80,8 +79,7 @@ class TauriAppClient implements DesktopClient {
   }
 
   async publishCurrentClipboard(): Promise<void> {
-    const text = await readText();
-    await invoke("publish_local_clipboard", { text, now: new Date().toISOString() });
+    await invoke("publish_current_clipboard");
   }
 
   async updateSettings(settings: Partial<AppSettings>): Promise<void> {

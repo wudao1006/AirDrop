@@ -245,6 +245,8 @@ pub struct AppSettings {
     pub(crate) allow_urls: bool,
     pub(crate) allow_files: bool,
     pub(crate) allow_private: bool,
+    #[serde(default)]
+    pub(crate) content_policy_version: u8,
 }
 
 impl Default for AppSettings {
@@ -265,8 +267,9 @@ impl Default for AppSettings {
             allow_html: true,
             allow_images: true,
             allow_urls: true,
-            allow_files: false,
+            allow_files: true,
             allow_private: false,
+            content_policy_version: 1,
         }
     }
 }
@@ -324,7 +327,7 @@ impl UiSnapshot {
             current_clipboard: CurrentClipboard {
                 source: "unknown".into(),
                 source_label: "正在监听本机剪贴板".into(),
-                preview: "复制文本后会自动显示在这里。".into(),
+                preview: "复制文本、图片、富文本或文件后会自动显示在这里。".into(),
                 types: Vec::new(),
                 changed_at: "1970-01-01T00:00:00.000Z".into(),
             },
@@ -375,7 +378,12 @@ impl ServiceState {
     pub fn open(data_dir: &Path) -> Result<Self, String> {
         let store = Store::open(data_dir)?;
         let identity = Identity::load_or_create(data_dir)?;
-        let settings = store.load_settings()?.unwrap_or_default();
+        let mut settings = store.load_settings()?.unwrap_or_default();
+        if settings.content_policy_version < 1 {
+            settings.allow_files = true;
+            settings.content_policy_version = 1;
+            store.save_settings(&settings)?;
+        }
         let runtime = store.load_runtime()?;
         let trusted_devices = store.trusted_devices()?;
         let clipboard_cache = ClipboardCache::open(data_dir);
@@ -2878,6 +2886,41 @@ pub fn publish_local_clipboard(
         return Err("当前文本剪贴板为空".into());
     }
     capture_local_clipboard(&state, &app, text, now)
+}
+
+#[tauri::command]
+pub async fn publish_current_clipboard(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let content = crate::platform::read_system_clipboard(&app)?;
+        let now = current_time();
+        let state = app.state::<ServiceState>();
+        let mut captured = false;
+
+        if !content.files.is_empty() {
+            capture_local_files(&state, &app, content.files, now.clone())?;
+            captured = true;
+        } else {
+            if let Some((text, html, rtf)) = content.rich {
+                capture_local_rich(&state, &app, text, html, rtf, now.clone())?;
+                captured = true;
+            } else if let Some(text) = content.text {
+                capture_local_clipboard(&state, &app, text, now.clone())?;
+                captured = true;
+            }
+            if let Some((rgba, width, height)) = content.image {
+                capture_local_image(&state, &app, rgba, width, height, now)?;
+                captured = true;
+            }
+        }
+
+        if captured {
+            Ok(())
+        } else {
+            Err("当前剪贴板没有可同步的文本、图片、富文本或文件".into())
+        }
+    })
+    .await
+    .map_err(|error| format!("剪贴板读取任务失败：{error}"))?
 }
 
 #[tauri::command]

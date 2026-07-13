@@ -2,6 +2,14 @@ mod clipboard_monitor;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 mod extended_clipboard;
 
+#[derive(Default)]
+pub(crate) struct SystemClipboardContent {
+    pub(crate) text: Option<String>,
+    pub(crate) rich: Option<(String, Option<String>, Option<String>)>,
+    pub(crate) image: Option<(Vec<u8>, u32, u32)>,
+    pub(crate) files: Vec<String>,
+}
+
 #[cfg(target_os = "android")]
 mod android;
 #[cfg(target_os = "linux")]
@@ -34,7 +42,7 @@ use unsupported as current;
 #[cfg(target_os = "windows")]
 use windows as current;
 
-pub(crate) use clipboard_monitor::start_clipboard_monitor;
+pub(crate) use clipboard_monitor::{read_system_clipboard, start_clipboard_monitor};
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 pub(crate) use extended_clipboard::{
     write_file_clipboard, write_rich_clipboard, ExtendedClipboard,
@@ -49,12 +57,8 @@ impl ExtendedClipboard {
         Err("当前平台暂不支持读取富文本剪贴板".into())
     }
 
-    pub(crate) fn read_rich(&self) -> Option<(String, Option<String>, Option<String>)> {
-        None
-    }
-
-    pub(crate) fn read_files(&self) -> Vec<String> {
-        Vec::new()
+    pub(crate) fn read_content(&self) -> Result<SystemClipboardContent, String> {
+        Err("当前平台暂不支持读取富文本和文件剪贴板".into())
     }
 }
 

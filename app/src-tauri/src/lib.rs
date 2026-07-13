@@ -1,7 +1,9 @@
 mod core;
 mod platform;
 
-use tauri::Manager;
+use tauri::{Emitter, Manager};
+#[cfg(desktop)]
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -9,7 +11,23 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_process::init());
     #[cfg(desktop)]
-    let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+    let builder = builder
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, _shortcut, event| {
+                    if event.state() != ShortcutState::Pressed {
+                        return;
+                    }
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.unminimize();
+                        let _ = window.set_focus();
+                        let _ = window.emit("airdrop://open-clipboard", ());
+                    }
+                })
+                .build(),
+        );
     let app = builder
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
@@ -19,6 +37,13 @@ pub fn run() {
             }
         }))
         .setup(|app| {
+            #[cfg(desktop)]
+            {
+                let shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyV);
+                if let Err(error) = app.global_shortcut().register(shortcut) {
+                    tracing::warn!(error = %error, "global clipboard shortcut unavailable");
+                }
+            }
             let data_dir = app.path().app_data_dir()?;
             let log_guard = core::logging::initialize(&data_dir).map_err(std::io::Error::other)?;
             app.manage(log_guard);
@@ -46,6 +71,7 @@ pub fn run() {
             core::service::set_synchronization_paused,
             core::service::set_app_activity,
             core::service::publish_local_clipboard,
+            core::service::publish_current_clipboard,
             core::service::update_settings,
             core::service::create_import_intent,
             core::service::confirm_import,

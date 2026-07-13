@@ -11,6 +11,7 @@ import { SettingsPage } from "../features/settings/SettingsPage";
 import { applyAppearanceSettings, subscribeToSystemAppearanceChanges } from "../features/settings/appearance";
 import { useAndroidLifecycle } from "../platform/android/useAndroidLifecycle";
 import { FloatingOrbManager } from "../features/floating/FloatingOrbManager";
+import { listen } from "@tauri-apps/api/event";
 
 export function App({ client }: { client: DesktopClient }) {
   const [page, setPage] = useState<PageId>("home");
@@ -28,6 +29,19 @@ export function App({ client }: { client: DesktopClient }) {
     const unsubscribe = client.subscribe(applySnapshot);
     return () => { mounted = false; unsubscribe(); };
   }, [client]);
+
+  useEffect(() => {
+    if (client.platform !== "desktop" || !window.__TAURI_INTERNALS__) return;
+    let active = true;
+    let dispose: (() => void) | undefined;
+    void listen("airdrop://open-clipboard", () => setPage("clipboard")).then((unlisten) => {
+      if (active) dispose = unlisten; else unlisten();
+    });
+    return () => {
+      active = false;
+      dispose?.();
+    };
+  }, [client.platform]);
 
   useLayoutEffect(() => {
     if (!snapshot) return;

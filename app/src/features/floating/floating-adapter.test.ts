@@ -62,7 +62,7 @@ describe("floating adapter", () => {
     const tauri = boundary(window);
     const adapter = new TauriFloatingAdapter(tauri);
     await adapter.ensureOrb();
-    expect(tauri.createWindow).toHaveBeenCalledWith("floating-orb", expect.objectContaining({ url: "?surface=floating", width: 72, height: 68 }));
+    expect(tauri.createWindow).toHaveBeenCalledWith("floating-orb", expect.objectContaining({ url: "?surface=floating", width: 72, height: 68, shadow: false, focus: false }));
     expect(window.show).toHaveBeenCalledOnce();
   });
 
@@ -74,7 +74,7 @@ describe("floating adapter", () => {
     await adapter.ensureOrb();
     expect(tauri.createWindow).not.toHaveBeenCalled();
     expect(window.show).toHaveBeenCalledOnce();
-    expect(window.setFocus).toHaveBeenCalledOnce();
+    expect(window.setFocus).not.toHaveBeenCalled();
   });
 
   it("reports tauri://error creation failures", async () => {

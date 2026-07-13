@@ -1,4 +1,7 @@
-use clipboard_rs::{Clipboard, ClipboardContent, ClipboardContext, ContentFormat};
+use super::SystemClipboardContent;
+use clipboard_rs::{
+    common::RustImage, Clipboard, ClipboardContent, ClipboardContext, ContentFormat,
+};
 
 pub(crate) struct ExtendedClipboard {
     context: ClipboardContext,
@@ -11,50 +14,83 @@ impl ExtendedClipboard {
             .map_err(|error| format!("无法初始化系统富文本剪贴板：{error}"))
     }
 
-    pub(crate) fn read_rich(&self) -> Option<(String, Option<String>, Option<String>)> {
-        let html = self
+    pub(crate) fn read_content(&self) -> Result<SystemClipboardContent, String> {
+        let formats = self
             .context
-            .has(ContentFormat::Html)
-            .then(|| self.context.get_html().ok())
-            .flatten()
-            .filter(|value| !value.trim().is_empty());
-        let rtf = self
-            .context
-            .has(ContentFormat::Rtf)
-            .then(|| self.context.get_rich_text().ok())
-            .flatten()
-            .filter(|value| !value.trim().is_empty());
-        if html.is_none() && rtf.is_none() {
-            return None;
-        }
-        let text = self.context.get_text().unwrap_or_default();
-        Some((text, html, rtf))
-    }
+            .available_formats()
+            .map_err(|error| format!("无法读取系统剪贴板格式：{error}"))?;
 
-    pub(crate) fn read_files(&self) -> Vec<String> {
-        if !self.context.has(ContentFormat::Files) {
-            return Vec::new();
-        }
-        let mut files = self
-            .context
-            .get_files()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|value| {
-                if value.starts_with("file:") {
-                    url::Url::parse(&value)
-                        .ok()?
-                        .to_file_path()
-                        .ok()
-                        .map(|path| path.to_string_lossy().into_owned())
-                } else {
-                    Some(value)
-                }
+        let text = if self.context.has(ContentFormat::Text) {
+            self.context
+                .get_text()
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        } else {
+            None
+        };
+        let html = if self.context.has(ContentFormat::Html) {
+            self.context
+                .get_html()
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        } else {
+            None
+        };
+        let rtf = if self.context.has(ContentFormat::Rtf) {
+            self.context
+                .get_rich_text()
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        } else {
+            None
+        };
+        let rich = (html.is_some() || rtf.is_some())
+            .then(|| (text.clone().unwrap_or_default(), html, rtf));
+        let image = if self.context.has(ContentFormat::Image) {
+            self.context.get_image().ok().and_then(|image| {
+                let (width, height) = image.get_size();
+                image
+                    .get_dynamic_image()
+                    .ok()
+                    .map(|image| (image.to_rgba8().into_raw(), width, height))
             })
-            .collect::<Vec<_>>();
+        } else {
+            None
+        };
+        let mut files = if self.context.has(ContentFormat::Files) {
+            self.context.get_files().unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+        .into_iter()
+        .filter_map(|value| {
+            if value.starts_with("file:") {
+                url::Url::parse(&value)
+                    .ok()?
+                    .to_file_path()
+                    .ok()
+                    .map(|path| path.to_string_lossy().into_owned())
+            } else {
+                Some(value)
+            }
+        })
+        .collect::<Vec<_>>();
         files.sort();
         files.dedup();
-        files
+        if !formats.is_empty()
+            && text.is_none()
+            && rich.is_none()
+            && image.is_none()
+            && files.is_empty()
+        {
+            return Err("系统剪贴板包含暂不支持或暂时无法解码的格式".into());
+        }
+        Ok(SystemClipboardContent {
+            text,
+            rich,
+            image,
+            files,
+        })
     }
 }
 
