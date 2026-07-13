@@ -714,10 +714,8 @@ impl ServiceState {
         transport: &super::transport::TransportHandle,
         device_id: &str,
     ) {
-        if let Ok(invites) = self
-            .store
-            .group_invites_for_target(device_id, &current_time())
-        {
+        let replayed_at = current_time();
+        if let Ok(invites) = self.store.group_invites_for_target(device_id, &replayed_at) {
             for invite in invites {
                 let _ = transport.send_group_invite(
                     device_id,
@@ -739,6 +737,40 @@ impl ServiceState {
         }
         if let Ok(groups) = self.store.group_manifests() {
             for group in groups {
+                let invited = group.manifest.owner_device_id == self.device_id()
+                    && group.manifest.members.iter().any(|member| {
+                        member.device_id == device_id && member.state == MemberState::Invited
+                    });
+                if invited
+                    && self
+                        .store
+                        .should_retry_group_invite(
+                            &group.manifest.group_id,
+                            device_id,
+                            &replayed_at,
+                        )
+                        .unwrap_or(false)
+                {
+                    let expires_at = (time::OffsetDateTime::now_utc()
+                        + time::Duration::minutes(10))
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_else(|_| replayed_at.clone());
+                    let invite = StoredGroupInvite {
+                        invite_id: uuid::Uuid::new_v4().to_string(),
+                        target_device_id: device_id.to_string(),
+                        expires_at,
+                        status: "sent".into(),
+                        manifest: group.clone(),
+                    };
+                    if self.store.save_group_invite(&invite).is_ok() {
+                        let _ = transport.send_group_invite(
+                            device_id,
+                            invite.invite_id,
+                            invite.expires_at,
+                            invite.manifest,
+                        );
+                    }
+                }
                 if group.manifest.active_member(device_id).is_some() {
                     let _ = transport.send_group_manifest(device_id, group);
                 }

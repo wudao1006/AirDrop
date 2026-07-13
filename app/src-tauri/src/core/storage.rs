@@ -1216,6 +1216,40 @@ impl Store {
         Ok(invites)
     }
 
+    pub(crate) fn should_retry_group_invite(
+        &self,
+        group_id: &str,
+        target_device_id: &str,
+        now: &str,
+    ) -> Result<bool, String> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "本地数据库锁已损坏".to_string())?;
+        let mut statement = connection
+            .prepare(
+                "SELECT status, expires_at FROM group_invites
+                 WHERE group_id = ?1 AND target_device_id = ?2",
+            )
+            .map_err(|error| format!("无法检查同步组邀请重试状态：{error}"))?;
+        let rows = statement
+            .query_map(params![group_id, target_device_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| format!("无法读取同步组邀请重试状态：{error}"))?;
+        for row in rows {
+            let (status, expires_at) =
+                row.map_err(|error| format!("同步组邀请重试状态已损坏：{error}"))?;
+            if status == "accepted" || status == "rejected" {
+                return Ok(false);
+            }
+            if status == "sent" && expires_at.as_str() > now {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub(crate) fn has_accepted_group_invite(
         &self,
         group_id: &str,
@@ -1407,9 +1441,30 @@ mod tests {
                 .len(),
             1
         );
+        assert!(!store
+            .should_retry_group_invite(
+                &revision_two.manifest.group_id,
+                identity.device_id(),
+                "2026-07-13T00:05:00Z",
+            )
+            .unwrap());
+        assert!(store
+            .should_retry_group_invite(
+                &revision_two.manifest.group_id,
+                identity.device_id(),
+                "2026-07-13T00:11:00Z",
+            )
+            .unwrap());
         store
             .set_group_invite_status("invite-1", "accepted")
             .unwrap();
+        assert!(!store
+            .should_retry_group_invite(
+                &revision_two.manifest.group_id,
+                identity.device_id(),
+                "2026-07-13T00:11:00Z",
+            )
+            .unwrap());
         assert_eq!(
             store
                 .group_invite_responses_for_owner(identity.device_id())

@@ -40,7 +40,7 @@ dependencies = [
 
 [[package]]
 name = "airdrop-app"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "chacha20poly1305",
  "clipboard-rs",
