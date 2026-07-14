@@ -101,7 +101,11 @@ interface FloatingOrbManagerProps {
   adapter?: FloatingAdapter;
 }
 
-const errorMessage = (error: unknown): string => error instanceof Error ? error.message : "悬浮球操作失败";
+const errorMessage = (error: unknown): string => {
+  if (error instanceof Error) return error.message;
+  if (typeof error === "string" && error.trim()) return error;
+  return "悬浮球操作失败";
+};
 
 export function FloatingOrbManager({ client, snapshot, setPage, onError, adapter: suppliedAdapter }: FloatingOrbManagerProps) {
   const adapter = useMemo(() => suppliedAdapter ?? createFloatingAdapter(), [suppliedAdapter]);
@@ -133,9 +137,7 @@ export function FloatingOrbManager({ client, snapshot, setPage, onError, adapter
 
     const handleAction = async (payload: FloatingOrbActionPayload) => {
       if (payload.action === "use-slot") {
-        await client.createImportIntent(payload.slotId, payload.revision);
-        setPage("clipboard");
-        await adapter.showMain();
+        await client.useSlot(payload.slotId, payload.revision);
         await broadcastState();
         return;
       }
@@ -218,7 +220,19 @@ export function FloatingOrbManager({ client, snapshot, setPage, onError, adapter
           void broadcastState().catch((error: unknown) => onError(errorMessage(error)));
         })) return;
         if (!await registerListener(FLOATING_EVENTS.action, (payload) => {
-          void handleAction(payload).catch((error: unknown) => onError(errorMessage(error)));
+          void handleAction(payload).then(() => adapter.emit(FLOATING_EVENTS.actionResult, {
+            requestId: payload.requestId,
+            success: true,
+            message: payload.action === "use-slot" ? "已写入本机剪贴板" : "操作已完成",
+          })).catch((error: unknown) => {
+            const message = errorMessage(error);
+            onError(message);
+            void adapter.emit(FLOATING_EVENTS.actionResult, {
+              requestId: payload.requestId,
+              success: false,
+              message,
+            }).catch(() => undefined);
+          });
         })) return;
         if (!await registerListener(FLOATING_EVENTS.layout, (payload) => {
           void handleLayout(payload).catch((error: unknown) => onError(errorMessage(error)));

@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { App } from "../../app/App";
 import { DemoDesktopClient } from "../../ipc/demo-client";
@@ -87,6 +87,18 @@ describe("explicit clipboard import", () => {
 
     await client.confirmImport(importId);
     expect(writer).toHaveBeenCalledOnce();
+    expect(writer).toHaveBeenCalledWith("这段文字来自 MacBook，可以选择后写入当前设备。");
+  });
+
+  it("writes a ready remote slot after one explicit use click", async () => {
+    const writer = vi.fn(async () => undefined);
+    const client = new DemoDesktopClient(writer);
+
+    render(<App client={client} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "使用" }));
+
+    await waitFor(() => expect(writer).toHaveBeenCalledOnce());
     expect(writer).toHaveBeenCalledWith("这段文字来自 MacBook，可以选择后写入当前设备。");
   });
 

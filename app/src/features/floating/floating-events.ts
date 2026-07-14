@@ -7,6 +7,7 @@ export const FLOATING_EVENTS = {
   ready: "airdrop://orb-ready",
   state: "airdrop://orb-state",
   action: "airdrop://orb-action",
+  actionResult: "airdrop://orb-action-result",
   layout: "airdrop://orb-layout",
   layoutState: "airdrop://orb-layout-state",
   openMenu: "airdrop://orb-open-menu",
@@ -50,9 +51,17 @@ export interface FloatingOrbStatePayload {
   >;
 }
 
-export type FloatingOrbActionPayload =
+export type FloatingOrbActionCommand =
   | { action: FloatingOrbAction }
   | { action: "use-slot"; slotId: string; revision: number };
+
+export type FloatingOrbActionPayload = FloatingOrbActionCommand & { requestId: string };
+
+export interface FloatingOrbActionResultPayload {
+  requestId: string;
+  success: boolean;
+  message: string;
+}
 
 export interface FloatingOrbLayoutPayload {
   requestId: string;
@@ -77,6 +86,7 @@ export interface FloatingEventPayloads {
   [FLOATING_EVENTS.ready]: FloatingOrbReadyPayload;
   [FLOATING_EVENTS.state]: FloatingOrbStatePayload;
   [FLOATING_EVENTS.action]: FloatingOrbActionPayload;
+  [FLOATING_EVENTS.actionResult]: FloatingOrbActionResultPayload;
   [FLOATING_EVENTS.layout]: FloatingOrbLayoutPayload;
   [FLOATING_EVENTS.layoutState]: FloatingOrbLayoutStatePayload;
   [FLOATING_EVENTS.openMenu]: Record<string, never>;

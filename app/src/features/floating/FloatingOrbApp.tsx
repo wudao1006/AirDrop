@@ -6,7 +6,8 @@ import { applyAppearanceSettings, loadAppearanceSettings } from "../settings/app
 import {
   FLOATING_EVENTS,
   type FloatingEventPayloads,
-  type FloatingOrbActionPayload,
+  type FloatingOrbActionCommand,
+  type FloatingOrbActionResultPayload,
   type FloatingOrbLayoutStatePayload,
   type FloatingOrbStatePayload,
   type FloatingSlotSummary,
@@ -81,7 +82,7 @@ interface FloatingOrbAppProps {
 const LAYOUT_ACK_TIMEOUT_MS = 2_000;
 const MENU_TRANSITION_MS = 240;
 const MENU_WIDTH = 356;
-const menuHeight = (slotCount: number): number => Math.min(520, 132 + Math.max(1, slotCount) * 76);
+const menuHeight = (slotCount: number): number => Math.min(520, 158 + Math.max(1, slotCount) * 76);
 type FloatingSurfacePhase = "collapsed" | "opening" | "expanded" | "closing";
 
 const transitionDuration = (): number => typeof window !== "undefined"
@@ -108,6 +109,7 @@ export function FloatingOrbApp({
   const surfacePhaseRef = useRef(surfacePhase);
   const stateRef = useRef(state);
   const preparedDragsRef = useRef(preparedDrags);
+  const pendingActionsRef = useRef(new Map<string, FloatingOrbActionCommand>());
   const mountedRef = useRef(true);
   const collapseTimerRef = useRef<number | undefined>(undefined);
   const transitionTimerRef = useRef<number | undefined>(undefined);
@@ -171,19 +173,18 @@ export function FloatingOrbApp({
     collapseTimerRef.current = window.setTimeout(beginCollapse, 120);
   }, [beginCollapse]);
 
-  const runAction = useCallback((payload: FloatingOrbActionPayload) => {
-    if (payload.action === "use-slot") setUsingSlotId(payload.slotId);
-    void adapter.emit(FLOATING_EVENTS.action, payload).then(() => {
+  const runAction = useCallback((command: FloatingOrbActionCommand) => {
+    const actionRequestId = requestId();
+    pendingActionsRef.current.set(actionRequestId, command);
+    if (command.action === "use-slot") setUsingSlotId(command.slotId);
+    setStatus(command.action === "use-slot" ? "正在写入本机剪贴板…" : "正在执行操作…");
+    void adapter.emit(FLOATING_EVENTS.action, { ...command, requestId: actionRequestId }).catch(() => {
       if (!mountedRef.current) return;
-      setUsingSlotId(null);
-      setStatus(payload.action === "use-slot" ? "已取入本机剪贴板" : "操作已发送");
-      scheduleCollapse();
-    }).catch(() => {
-      if (!mountedRef.current) return;
+      pendingActionsRef.current.delete(actionRequestId);
       setUsingSlotId(null);
       setStatus("操作失败，请打开主窗口查看");
     });
-  }, [adapter, scheduleCollapse]);
+  }, [adapter]);
 
   useEffect(() => {
     let disposed = false;
@@ -236,6 +237,18 @@ export function FloatingOrbApp({
       const openMenuUnlisten = await adapter.listen(FLOATING_EVENTS.openMenu, () => requestLayout(true));
       if (disposed) { openMenuUnlisten(); return; }
       unlisteners.push(openMenuUnlisten);
+
+      const actionResultUnlisten = await adapter.listen(FLOATING_EVENTS.actionResult, (result: FloatingOrbActionResultPayload) => {
+        if (disposed) return;
+        const command = pendingActionsRef.current.get(result.requestId);
+        if (!command) return;
+        pendingActionsRef.current.delete(result.requestId);
+        if (command.action === "use-slot") setUsingSlotId(null);
+        setStatus(result.message);
+        if (result.success) scheduleCollapse();
+      });
+      if (disposed) { actionResultUnlisten(); return; }
+      unlisteners.push(actionResultUnlisten);
       await adapter.emit(FLOATING_EVENTS.ready, { protocolVersion: 1 });
     };
 
@@ -252,9 +265,10 @@ export function FloatingOrbApp({
       window.clearTimeout(layoutAckTimerRef.current);
       window.removeEventListener("blur", collapse);
       window.removeEventListener("keydown", onKeyDown);
+      pendingActionsRef.current.clear();
       unlisteners.splice(0).forEach((unlisten) => unlisten());
     };
-  }, [adapter, beginCollapse, requestLayout]);
+  }, [adapter, beginCollapse, requestLayout, scheduleCollapse]);
 
   useEffect(() => {
     if (expanded) firstActionRef.current?.focus();
@@ -370,6 +384,7 @@ export function FloatingOrbApp({
           <button type="button" disabled={!slot.available || usingSlotId !== null || draggingSlotId !== null} onPointerDown={(event) => event.stopPropagation()} onClick={() => runAction({ action: "use-slot", slotId: slot.id, revision: slot.revision })}>{usingSlotId === slot.id ? "取入中" : "使用"}</button>
         </article>) : <div className="floating-empty"><Icon name="devices" size={22} /><strong>暂无设备内容</strong><span>其他设备复制内容后会显示在这里</span></div>}
       </div>
+      <div className="floating-status" role="status" aria-live="polite"><span />{status}</div>
       <footer className="floating-menu-actions">
         <button type="button" disabled={!state?.canReadClipboard || state.busy} onClick={() => runAction({ action: "publish-current" })}><Icon name="refresh" /><span>刷新</span></button>
         <button type="button" onClick={() => runAction({ action: "toggle-sync" })}><Icon name={paused ? "play" : "pause"} /><span>{paused ? "恢复" : "暂停"}</span></button>
@@ -393,6 +408,6 @@ export function FloatingOrbApp({
         <span className="floating-liquid-edge" /><FlowMark />
       </button>
     </span>}
-    <span className="sr-only" role="status" aria-live="polite">{status}</span>
+    {!expanded && <span className="sr-only" role="status" aria-live="polite">{status}</span>}
   </main>;
 }

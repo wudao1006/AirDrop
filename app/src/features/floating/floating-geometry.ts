@@ -1,6 +1,6 @@
 import type { FloatingOrbSide } from "./floating-events";
 
-export const COLLAPSED_ORB_SIZE = { width: 72, height: 68 } as const;
+export const COLLAPSED_ORB_SIZE = { width: 88, height: 84 } as const;
 export const EXPANDED_ORB_SIZE = { width: 356, height: 420 } as const;
 
 export interface FloatingRect {

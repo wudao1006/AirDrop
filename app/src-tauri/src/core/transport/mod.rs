@@ -21,7 +21,7 @@ use protocol::{
     read_frame, write_frame, ClipboardCapabilities, FileBlobHeader, FileResumePlan,
     FileTransferAck, ImageBlobHeader, PairMessage, TrustedMessage, PAIR_ALPN, TRUSTED_ALPN,
 };
-use quinn::{crypto::rustls::QuicClientConfig, Connection, Endpoint};
+use quinn::{crypto::rustls::QuicClientConfig, Connection, Endpoint, TransportConfig};
 use rcgen::{CertificateParams, KeyPair};
 use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
@@ -48,6 +48,8 @@ type HmacSha256 = Hmac<Sha256>;
 const MAX_IMAGE_BLOB: usize = 16 * 1024 * 1024;
 const IMAGE_BLOB_KIND: u8 = 1;
 const FILE_BLOB_KIND: u8 = 2;
+const CONNECTION_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 struct PairCommandRegistration {
     commands: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<bool>>>>,
@@ -2287,7 +2289,9 @@ fn server_config(
     crypto.max_early_data_size = 0;
     let quic = quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
         .map_err(|error| format!("无法配置 QUIC TLS：{error}"))?;
-    Ok(quinn::ServerConfig::with_crypto(Arc::new(quic)))
+    let mut server = quinn::ServerConfig::with_crypto(Arc::new(quic));
+    server.transport_config(persistent_transport_config()?);
+    Ok(server)
 }
 
 fn client_config(
@@ -2312,7 +2316,20 @@ fn client_config(
     crypto.enable_early_data = false;
     let quic = QuicClientConfig::try_from(crypto)
         .map_err(|error| format!("无法配置 QUIC 客户端：{error}"))?;
-    Ok(quinn::ClientConfig::new(Arc::new(quic)))
+    let mut client = quinn::ClientConfig::new(Arc::new(quic));
+    client.transport_config(persistent_transport_config()?);
+    Ok(client)
+}
+
+fn persistent_transport_config() -> Result<Arc<TransportConfig>, String> {
+    let mut transport = TransportConfig::default();
+    transport.keep_alive_interval(Some(CONNECTION_KEEP_ALIVE_INTERVAL));
+    transport.max_idle_timeout(Some(
+        CONNECTION_IDLE_TIMEOUT
+            .try_into()
+            .map_err(|_| "可信连接空闲超时配置无效".to_string())?,
+    ));
+    Ok(Arc::new(transport))
 }
 
 #[derive(Debug)]

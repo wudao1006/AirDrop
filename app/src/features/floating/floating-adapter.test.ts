@@ -46,6 +46,7 @@ describe("floating adapter", () => {
       ready: "airdrop://orb-ready",
       state: "airdrop://orb-state",
       action: "airdrop://orb-action",
+      actionResult: "airdrop://orb-action-result",
       layout: "airdrop://orb-layout",
       layoutState: "airdrop://orb-layout-state",
       openMenu: "airdrop://orb-open-menu",
@@ -63,7 +64,7 @@ describe("floating adapter", () => {
     const tauri = boundary(window);
     const adapter = new TauriFloatingAdapter(tauri);
     await adapter.ensureOrb();
-    expect(tauri.createWindow).toHaveBeenCalledWith("floating-orb", expect.objectContaining({ url: "?surface=floating", width: 72, height: 68, shadow: false, focus: false, dragDropEnabled: false }));
+    expect(tauri.createWindow).toHaveBeenCalledWith("floating-orb", expect.objectContaining({ url: "?surface=floating", width: 88, height: 84, shadow: false, focus: false, dragDropEnabled: false }));
     expect(window.show).toHaveBeenCalledOnce();
   });
 

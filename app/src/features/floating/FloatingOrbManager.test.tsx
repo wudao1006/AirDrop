@@ -29,7 +29,7 @@ const setup = async (overrides: Partial<FloatingAdapter> = {}) => {
       return () => handlers.delete(event);
     }),
     onOrbMoved: vi.fn(async () => () => undefined),
-    getOrbBounds: vi.fn(async () => ({ x: 928, y: 100, width: 72, height: 68 })),
+    getOrbBounds: vi.fn(async () => ({ x: 912, y: 100, width: 88, height: 84 })),
     getOrbWorkArea: vi.fn(async () => ({ x: 0, y: 0, width: 1000, height: 700 })),
     setOrbBounds: vi.fn(async () => undefined),
     ...overrides,
@@ -69,20 +69,25 @@ describe("FloatingOrbManager", () => {
     handlers.get(FLOATING_EVENTS.ready)?.({ protocolVersion: 1 });
     await waitFor(() => expect(adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.state, expect.objectContaining({ publishPaused: false })));
 
-    handlers.get(FLOATING_EVENTS.action)?.({ action: "open-clipboard" });
+    handlers.get(FLOATING_EVENTS.action)?.({ action: "open-clipboard", requestId: "action-open" });
     await waitFor(() => expect(setPage).toHaveBeenCalledWith("clipboard"));
     expect(adapter.showMain).toHaveBeenCalled();
 
-    handlers.get(FLOATING_EVENTS.action)?.({ action: "toggle-sync" });
+    handlers.get(FLOATING_EVENTS.action)?.({ action: "toggle-sync", requestId: "action-toggle" });
     await waitFor(() => expect(pause).toHaveBeenCalledWith(true));
 
-    const createImport = vi.spyOn(demo, "createImportIntent");
-    const confirmImport = vi.spyOn(demo, "confirmImport");
-    handlers.get(FLOATING_EVENTS.action)?.({ action: "use-slot", slotId: "macbook-slot", revision: 7 });
-    await waitFor(() => expect(createImport).toHaveBeenCalledWith("macbook-slot", 7));
-    await waitFor(() => expect(setPage).toHaveBeenCalledWith("clipboard"));
-    expect(adapter.showMain).toHaveBeenCalled();
-    expect(confirmImport).not.toHaveBeenCalled();
+    const useSlot = vi.spyOn(demo, "useSlot");
+    vi.mocked(adapter.showMain).mockClear();
+    setPage.mockClear();
+    handlers.get(FLOATING_EVENTS.action)?.({ action: "use-slot", slotId: "macbook-slot", revision: 7, requestId: "action-use" });
+    await waitFor(() => expect(useSlot).toHaveBeenCalledWith("macbook-slot", 7));
+    await waitFor(() => expect(adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.actionResult, {
+      requestId: "action-use",
+      success: true,
+      message: "已写入本机剪贴板",
+    }));
+    expect(setPage).not.toHaveBeenCalled();
+    expect(adapter.showMain).not.toHaveBeenCalled();
   });
 
   it("acknowledges a clamped, side-aware layout transaction", async () => {
@@ -99,8 +104,8 @@ describe("FloatingOrbManager", () => {
       anchor: expect.objectContaining({ x: expect.any(Number), y: expect.any(Number) }),
     })));
     const payload = vi.mocked(adapter.emit).mock.calls.find(([event]) => event === FLOATING_EVENTS.layoutState)?.[1] as { anchor?: { x: number; y: number } };
-    expect(payload.anchor?.x).toBeCloseTo(320 / 356);
-    expect(payload.anchor?.y).toBeCloseTo(34 / 420);
+    expect(payload.anchor?.x).toBeCloseTo(312 / 356);
+    expect(payload.anchor?.y).toBeCloseTo(42 / 420);
   });
 
   it("always emits a failure ack when layout geometry is unavailable", async () => {
@@ -125,20 +130,25 @@ describe("FloatingOrbManager", () => {
     const update = vi.spyOn(demo, "updateSettings");
     render(<FloatingOrbManager client={demo} snapshot={snapshot} setPage={vi.fn()} onError={vi.fn()} adapter={adapter} />);
     await waitFor(() => expect(adapter.ensureOrb).toHaveBeenCalled());
-    handlers.get(FLOATING_EVENTS.action)?.({ action: "hide-orb" });
+    handlers.get(FLOATING_EVENTS.action)?.({ action: "hide-orb", requestId: "action-hide" });
     await waitFor(() => expect(update).toHaveBeenCalledWith({ floatingOrbEnabled: false }));
     await waitFor(() => expect(adapter.closeOrb).toHaveBeenCalled());
   });
 
   it("reports action errors without disabling the orb", async () => {
     const { demo, snapshot, handlers, adapter } = await setup();
-    vi.spyOn(demo, "publishCurrentClipboard").mockRejectedValue(new Error("clipboard denied"));
+    vi.spyOn(demo, "publishCurrentClipboard").mockRejectedValue("clipboard denied");
     const update = vi.spyOn(demo, "updateSettings");
     const onError = vi.fn();
     render(<FloatingOrbManager client={demo} snapshot={snapshot} setPage={vi.fn()} onError={onError} adapter={adapter} />);
     await waitFor(() => expect(adapter.ensureOrb).toHaveBeenCalled());
-    handlers.get(FLOATING_EVENTS.action)?.({ action: "publish-current" });
+    handlers.get(FLOATING_EVENTS.action)?.({ action: "publish-current", requestId: "action-failed" });
     await waitFor(() => expect(onError).toHaveBeenCalledWith("clipboard denied"));
+    await waitFor(() => expect(adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.actionResult, {
+      requestId: "action-failed",
+      success: false,
+      message: "clipboard denied",
+    }));
     expect(update).not.toHaveBeenCalledWith({ floatingOrbEnabled: false });
   });
 

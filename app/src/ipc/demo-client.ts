@@ -171,6 +171,11 @@ export class DemoDesktopClient implements DesktopClient {
     return () => this.listeners.delete(listener);
   }
 
+  async useSlot(slotId: string, revision: number): Promise<void> {
+    const importId = await this.createImportIntent(slotId, revision);
+    await this.confirmImport(importId);
+  }
+
   async createImportIntent(slotId: string, revision: number): Promise<string> {
     if (this.platform === "android" && this.snapshot.activity !== "foreground_live") {
       throw new Error("回到前台并完成重连后才能选择设备剪贴板");

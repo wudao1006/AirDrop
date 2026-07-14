@@ -71,6 +71,7 @@ describe("FloatingOrbApp", () => {
       `listen:${FLOATING_EVENTS.state}`,
       `listen:${FLOATING_EVENTS.layoutState}`,
       `listen:${FLOATING_EVENTS.openMenu}`,
+      `listen:${FLOATING_EVENTS.actionResult}`,
       `emit:${FLOATING_EVENTS.ready}`,
     ]);
   });
@@ -123,7 +124,12 @@ describe("FloatingOrbApp", () => {
     expect(screen.getByText("文件")).toBeInTheDocument();
     expect(screen.getByText("完整文件名设计稿.fig · 资料目录")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "使用" }));
-    expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.action, { action: "use-slot", slotId: "slot-1", revision: 8 });
+    expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.action, expect.objectContaining({ action: "use-slot", slotId: "slot-1", revision: 8, requestId: expect.any(String) }));
+    const request = vi.mocked(context.adapter.emit).mock.calls.find(([event, payload]) => event === FLOATING_EVENTS.action && (payload as { action: string }).action === "use-slot")?.[1] as FloatingEventPayloads[typeof FLOATING_EVENTS.action];
+    expect(screen.getByRole("button", { name: "取入中" })).toBeDisabled();
+    context.dispatch(FLOATING_EVENTS.actionResult, { requestId: request.requestId, success: true, message: "已写入本机剪贴板" });
+    expect(await screen.findByRole("button", { name: "使用" })).toBeEnabled();
+    expect(screen.getByRole("status")).toHaveTextContent("已写入本机剪贴板");
   });
 
   it("starts a native content drag from the card body without using the clipboard action", async () => {
@@ -200,9 +206,9 @@ describe("FloatingOrbApp", () => {
     context.dispatch(FLOATING_EVENTS.state, { ...liveState, publishPaused: true, subscribePaused: true });
     await openMenu(context);
     fireEvent.click(screen.getByRole("button", { name: "恢复" }));
-    expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.action, { action: "toggle-sync" });
+    expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.action, expect.objectContaining({ action: "toggle-sync", requestId: expect.any(String) }));
     fireEvent.click(screen.getByRole("button", { name: "隐藏" }));
-    expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.action, { action: "hide-orb" });
+    expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.action, expect.objectContaining({ action: "hide-orb", requestId: expect.any(String) }));
   });
 
   it("keeps the menu mounted while the closing animation finishes", async () => {
@@ -228,7 +234,7 @@ describe("FloatingOrbApp", () => {
     const view = render(<FloatingOrbApp adapter={context.adapter} />);
     await waitFor(() => expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.ready, expect.anything()));
     view.unmount();
-    expect(context.unlisteners).toHaveLength(3);
+    expect(context.unlisteners).toHaveLength(4);
     context.unlisteners.forEach((unlisten) => expect(unlisten).toHaveBeenCalledOnce());
   });
 });

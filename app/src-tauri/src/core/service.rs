@@ -21,6 +21,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_clipboard_manager::ClipboardExt;
@@ -1192,6 +1193,20 @@ fn copied_file_names(files: &[String]) -> Vec<String> {
                 .to_string()
         })
         .collect()
+}
+
+fn retry_clipboard_write(mut operation: impl FnMut() -> Result<(), String>) -> Result<(), String> {
+    let mut last_error = None;
+    for attempt in 0..4 {
+        match operation() {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+        if attempt < 3 {
+            std::thread::sleep(Duration::from_millis(25 * (attempt + 1)));
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "系统剪贴板写入失败".into()))
 }
 
 fn redact_disallowed_previews(snapshot: &mut UiSnapshot) {
@@ -4339,7 +4354,11 @@ pub fn confirm_import(
                 .suppress_next_capture
                 .lock()
                 .map_err(|_| "剪贴板回环抑制锁已损坏".to_string())? = Some(text.clone());
-            if let Err(error) = app.clipboard().write_text(text) {
+            if let Err(error) = retry_clipboard_write(|| {
+                app.clipboard()
+                    .write_text(text)
+                    .map_err(|error| error.to_string())
+            }) {
                 *state
                     .suppress_next_capture
                     .lock()
@@ -4369,9 +4388,9 @@ pub fn confirm_import(
                 .suppress_next_capture
                 .lock()
                 .map_err(|_| "剪贴板回环抑制锁已损坏".to_string())? = Some(text.clone());
-            if let Err(error) =
+            if let Err(error) = retry_clipboard_write(|| {
                 crate::platform::write_rich_clipboard(text.clone(), html.clone(), rtf.clone())
-            {
+            }) {
                 *state
                     .suppress_next_rich
                     .lock()
@@ -4396,7 +4415,9 @@ pub fn confirm_import(
                 .lock()
                 .map_err(|_| "文件剪贴板回环抑制锁已损坏".to_string())? =
                 Some(file_list_hash(&paths));
-            if let Err(error) = crate::platform::write_file_clipboard(paths) {
+            if let Err(error) =
+                retry_clipboard_write(|| crate::platform::write_file_clipboard(paths.clone()))
+            {
                 *state
                     .suppress_next_files
                     .lock()
@@ -4426,7 +4447,11 @@ pub fn confirm_import(
                 .map_err(|_| "图片剪贴板回环抑制锁已损坏".to_string())? =
                 Some(image_hash(rgba, *width, *height));
             let image = tauri::image::Image::new_owned(rgba.clone(), *width, *height);
-            if let Err(error) = app.clipboard().write_image(&image) {
+            if let Err(error) = retry_clipboard_write(|| {
+                app.clipboard()
+                    .write_image(&image)
+                    .map_err(|error| error.to_string())
+            }) {
                 *state
                     .suppress_next_image
                     .lock()

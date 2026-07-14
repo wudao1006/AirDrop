@@ -6,6 +6,7 @@ export interface AppClient {
   readonly platform: PlatformKind;
   getSnapshot(): Promise<UiSnapshot>;
   subscribe(listener: (snapshot: UiSnapshot) => void): Unsubscribe;
+  useSlot(slotId: string, revision: number): Promise<void>;
   createImportIntent(slotId: string, revision: number): Promise<string>;
   confirmImport(importId: string): Promise<void>;
   cancelImport(importId: string): Promise<void>;

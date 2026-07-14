@@ -54,6 +54,11 @@ class TauriAppClient implements DesktopClient {
     };
   }
 
+  async useSlot(slotId: string, revision: number): Promise<void> {
+    const importId = await this.createImportIntent(slotId, revision);
+    await this.confirmImport(importId);
+  }
+
   createImportIntent(slotId: string, revision: number): Promise<string> {
     return invoke("create_import_intent", { slotId, revision });
   }
