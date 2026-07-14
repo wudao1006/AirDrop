@@ -1,4 +1,4 @@
-import { StrictMode } from "react";
+import { StrictMode, useLayoutEffect } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./app/App";
 import { FloatingOrbApp } from "./features/floating/FloatingOrbApp";
@@ -10,6 +10,15 @@ import "./styles/global.css";
 
 applyAppearanceSettings(loadAppearanceSettings());
 
+const setFloatingDocumentMode = (enabled: boolean): void => {
+  if (typeof document === "undefined") return;
+  document.documentElement.classList.toggle("floating-surface", enabled);
+};
+
+if (typeof location !== "undefined") {
+  setFloatingDocumentMode(new URLSearchParams(location.search).get("surface") === "floating");
+}
+
 export function AirDropSurface({
   search = location.search,
   createClient = createDesktopClient,
@@ -17,7 +26,14 @@ export function AirDropSurface({
   search?: string;
   createClient?: () => DesktopClient;
 }) {
-  if (new URLSearchParams(search).get("surface") === "floating") return <FloatingOrbApp />;
+  const floating = new URLSearchParams(search).get("surface") === "floating";
+  useLayoutEffect(() => {
+    setFloatingDocumentMode(floating);
+    return () => {
+      if (floating) setFloatingDocumentMode(false);
+    };
+  }, [floating]);
+  if (floating) return <FloatingOrbApp />;
   return <App client={createClient()} />;
 }
 

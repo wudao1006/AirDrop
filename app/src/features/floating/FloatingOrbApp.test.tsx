@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { FloatingEventPayloads, FloatingOrbStatePayload } from "./floating-events";
 import { FLOATING_EVENTS } from "./floating-events";
 import { FloatingOrbApp, type FloatingOrbWindowAdapter } from "./FloatingOrbApp";
+import type { FloatingContentDragAdapter } from "./floating-drag";
 import { AirDropSurface } from "../../main";
 
 const liveState: FloatingOrbStatePayload = {
@@ -57,6 +58,7 @@ describe("FloatingOrbApp", () => {
     const createClient = vi.fn();
     render(<AirDropSurface search="?surface=floating" createClient={createClient} />);
     expect(screen.getByRole("button", { name: /AirDrop 悬浮球/ })).toBeInTheDocument();
+    expect(document.documentElement).toHaveClass("floating-surface");
     expect(screen.queryByRole("navigation", { name: "主导航" })).not.toBeInTheDocument();
     expect(createClient).not.toHaveBeenCalled();
   });
@@ -108,6 +110,7 @@ describe("FloatingOrbApp", () => {
         revision: 8,
         deviceName: "工作电脑",
         platform: "windows",
+        online: true,
         kind: "files",
         preview: "2 个文件",
         fileNames: ["完整文件名设计稿.fig", "资料目录"],
@@ -116,9 +119,78 @@ describe("FloatingOrbApp", () => {
       }],
     });
     await openMenu(context);
+    expect(screen.getByText("1 台设备 · 拖动内容可直接插入")).toBeInTheDocument();
+    expect(screen.getByText("文件")).toBeInTheDocument();
     expect(screen.getByText("完整文件名设计稿.fig · 资料目录")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "使用" }));
     expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.action, { action: "use-slot", slotId: "slot-1", revision: 8 });
+  });
+
+  it("starts a native content drag from the card body without using the clipboard action", async () => {
+    const context = setup();
+    const dragAdapter: FloatingContentDragAdapter = {
+      supported: true,
+      prepare: vi.fn(async () => ({ item: { data: "完整正文", types: ["text/plain"] } })),
+      startFiles: vi.fn(async () => undefined),
+    };
+    render(<FloatingOrbApp adapter={context.adapter} dragAdapter={dragAdapter} />);
+    await waitFor(() => expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.ready, expect.anything()));
+    context.dispatch(FLOATING_EVENTS.state, {
+      ...liveState,
+      slots: [{
+        id: "slot-text",
+        revision: 12,
+        deviceName: "书房电脑",
+        platform: "linux",
+        online: true,
+        kind: "text",
+        preview: "拖入目标编辑器",
+        ageLabel: "刚刚",
+        available: true,
+      }],
+    });
+    await openMenu(context);
+    const content = screen.getByText("拖入目标编辑器");
+    await waitFor(() => expect(content.closest(".floating-device-copy")).toHaveAttribute("draggable", "true"));
+    const dataTransfer = { setData: vi.fn(), setDragImage: vi.fn(), effectAllowed: "none" };
+    fireEvent.dragStart(content, { dataTransfer });
+    expect(dragAdapter.prepare).toHaveBeenCalledWith("slot-text", 12);
+    expect(dataTransfer.setData).toHaveBeenCalledWith("text/plain", "完整正文");
+    expect(dataTransfer.effectAllowed).toBe("copy");
+    expect(context.adapter.emit).not.toHaveBeenCalledWith(FLOATING_EVENTS.action, expect.objectContaining({ action: "use-slot" }));
+  });
+
+  it("uses the native file drag path for images and file bundles", async () => {
+    const context = setup();
+    const dragAdapter: FloatingContentDragAdapter = {
+      supported: true,
+      prepare: vi.fn(async () => ({ item: ["/tmp/report.pdf"], leaseId: "lease-1" })),
+      startFiles: vi.fn(async (_request, _prepared, onEvent) => onEvent({ result: "Dropped" })),
+    };
+    render(<FloatingOrbApp adapter={context.adapter} dragAdapter={dragAdapter} />);
+    await waitFor(() => expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.ready, expect.anything()));
+    context.dispatch(FLOATING_EVENTS.state, {
+      ...liveState,
+      slots: [{
+        id: "slot-files",
+        revision: 4,
+        deviceName: "工作电脑",
+        platform: "windows",
+        online: true,
+        kind: "files",
+        preview: "1 个文件",
+        fileNames: ["report.pdf"],
+        ageLabel: "刚刚",
+        available: true,
+      }],
+    });
+    await openMenu(context);
+    fireEvent.pointerDown(screen.getByText("report.pdf"), { button: 0 });
+    await waitFor(() => expect(dragAdapter.startFiles).toHaveBeenCalledWith(
+      expect.objectContaining({ slotId: "slot-files", revision: 4 }),
+      expect.objectContaining({ leaseId: "lease-1" }),
+      expect.any(Function),
+    ));
   });
 
   it("uses paused state for quick actions", async () => {
@@ -131,6 +203,24 @@ describe("FloatingOrbApp", () => {
     expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.action, { action: "toggle-sync" });
     fireEvent.click(screen.getByRole("button", { name: "隐藏" }));
     expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.action, { action: "hide-orb" });
+  });
+
+  it("keeps the menu mounted while the closing animation finishes", async () => {
+    const context = setup();
+    render(<FloatingOrbApp adapter={context.adapter} />);
+    await waitFor(() => expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.ready, expect.anything()));
+    await openMenu(context);
+
+    fireEvent.click(screen.getByRole("button", { name: "关闭快捷菜单" }));
+    await waitFor(() => expect(screen.getByRole("region", { name: "AirDrop 快捷菜单" }).closest("main")).toHaveClass("is-closing"));
+    expect(context.adapter.emit).not.toHaveBeenCalledWith(FLOATING_EVENTS.layout, expect.objectContaining({ expanded: false }));
+
+    await waitFor(() => expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.layout, expect.objectContaining({ expanded: false })), { timeout: 1_000 });
+    const layout = vi.mocked(context.adapter.emit).mock.calls.filter(([event, payload]) =>
+      event === FLOATING_EVENTS.layout && !(payload as { expanded: boolean }).expanded,
+    ).at(-1)?.[1] as FloatingEventPayloads[typeof FLOATING_EVENTS.layout];
+    context.dispatch(FLOATING_EVENTS.layoutState, { ...layout, success: true });
+    expect(await screen.findByRole("button", { name: /AirDrop 悬浮球/ })).toBeInTheDocument();
   });
 
   it("removes all native listeners on unmount", async () => {

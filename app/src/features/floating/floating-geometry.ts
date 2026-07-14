@@ -1,6 +1,6 @@
 import type { FloatingOrbSide } from "./floating-events";
 
-export const COLLAPSED_ORB_SIZE = { width: 64, height: 60 } as const;
+export const COLLAPSED_ORB_SIZE = { width: 72, height: 68 } as const;
 export const EXPANDED_ORB_SIZE = { width: 356, height: 420 } as const;
 
 export interface FloatingRect {
@@ -48,6 +48,11 @@ export const sameRect = (left: FloatingRect, right: FloatingRect, tolerance = 0.
   && Math.abs(left.y - right.y) <= tolerance
   && Math.abs(left.width - right.width) <= tolerance
   && Math.abs(left.height - right.height) <= tolerance;
+
+export const anchorForRect = (source: FloatingRect, target: FloatingRect): { x: number; y: number } => ({
+  x: target.width === 0 ? 0.5 : clamp((source.x + source.width / 2 - target.x) / target.width, 0, 1),
+  y: target.height === 0 ? 0.5 : clamp((source.y + source.height / 2 - target.y) / target.height, 0, 1),
+});
 
 export const snappedRect = (
   workArea: FloatingRect,

@@ -76,6 +76,8 @@ export interface NearbyDevice {
 export interface TrustedDevice {
   deviceId: string;
   deviceName: string;
+  advertisedName: string;
+  localAlias: string | null;
   platform: "macos" | "windows" | "linux" | "android" | "unknown";
   pairedAt: string;
   online: boolean;
@@ -180,6 +182,7 @@ export interface AppSettings {
 export interface UiSnapshot {
   revision: number;
   platform: PlatformKind;
+  localDeviceName: string;
   activity: AppActivity;
   lastSynchronizedAt: string;
   clipboardCapability: ClipboardCapability;
@@ -193,6 +196,7 @@ export interface UiSnapshot {
   nearbyDevices: NearbyDevice[];
   trustedDevices: TrustedDevice[];
   pendingPairings: PendingPairing[];
+  pairingAllowedUntil: number | null;
   cachePersistent: boolean;
   syncGroups: SyncGroup[];
   pendingGroupInvites: PendingGroupInvite[];

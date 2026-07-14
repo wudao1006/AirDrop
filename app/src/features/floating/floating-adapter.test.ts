@@ -24,7 +24,7 @@ const nativeWindow = (created: "success" | "error" = "success"): FloatingNativeW
   unminimize: vi.fn(async () => undefined),
   setFocus: vi.fn(async () => undefined),
   outerPosition: vi.fn(async () => ({ x: 0, y: 0 })),
-  outerSize: vi.fn(async () => ({ width: 64, height: 60 })),
+  outerSize: vi.fn(async () => ({ width: 72, height: 68 })),
   scaleFactor: vi.fn(async () => 1),
   setPosition: vi.fn(async () => undefined),
   setSize: vi.fn(async () => undefined),
@@ -63,7 +63,7 @@ describe("floating adapter", () => {
     const tauri = boundary(window);
     const adapter = new TauriFloatingAdapter(tauri);
     await adapter.ensureOrb();
-    expect(tauri.createWindow).toHaveBeenCalledWith("floating-orb", expect.objectContaining({ url: "?surface=floating", width: 64, height: 60, shadow: false, focus: false }));
+    expect(tauri.createWindow).toHaveBeenCalledWith("floating-orb", expect.objectContaining({ url: "?surface=floating", width: 72, height: 68, shadow: false, focus: false, dragDropEnabled: false }));
     expect(window.show).toHaveBeenCalledOnce();
   });
 
@@ -129,7 +129,7 @@ describe("floating adapter", () => {
     vi.mocked(tauri.currentMonitor).mockRejectedValue(new Error("unsupported"));
     const adapter = new TauriFloatingAdapter(tauri);
     await adapter.ensureOrb();
-    await expect(adapter.getOrbWorkArea()).resolves.toEqual({ x: 0, y: 0, width: 64, height: 60 });
+    await expect(adapter.getOrbWorkArea()).resolves.toEqual({ x: 0, y: 0, width: 72, height: 68 });
   });
 
   it("selects a mixed-DPI monitor using physical coordinates", async () => {

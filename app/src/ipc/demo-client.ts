@@ -95,6 +95,7 @@ const initialSlots: DeviceSlot[] = [
 const initialSnapshot: UiSnapshot = {
   revision: 1,
   platform: "desktop",
+  localDeviceName: "我的设备",
   activity: "foreground_live",
   lastSynchronizedAt: now,
   clipboardCapability: {
@@ -118,6 +119,7 @@ const initialSnapshot: UiSnapshot = {
   nearbyDevices: [],
   trustedDevices: [],
   pendingPairings: [],
+  pairingAllowedUntil: null,
   cachePersistent: false,
   syncGroups: [],
   pendingGroupInvites: [],
@@ -346,6 +348,25 @@ export class DemoDesktopClient implements DesktopClient {
 
   async confirmPairing(_pairingId: string, _accepted: boolean): Promise<void> {
     throw new Error("浏览器预览没有真实配对会话");
+  }
+
+  async setLocalDeviceName(deviceName: string): Promise<void> {
+    const normalized = deviceName.trim();
+    if (!normalized) throw new Error("本机名称不能为空");
+    this.snapshot.localDeviceName = normalized;
+    this.bump();
+  }
+
+  async setDeviceAlias(deviceId: string, localAlias: string | null): Promise<void> {
+    const device = this.snapshot.trustedDevices.find((item) => item.deviceId === deviceId);
+    if (!device) throw new Error("可信设备不存在");
+    const normalized = localAlias?.trim() || null;
+    device.localAlias = normalized;
+    device.deviceName = normalized ?? device.advertisedName;
+    for (const slot of this.snapshot.slots.filter((item) => item.deviceId === deviceId)) {
+      slot.deviceName = device.deviceName;
+    }
+    this.bump();
   }
 
   async setDeviceSyncEnabled(deviceId: string, enabled: boolean): Promise<void> {

@@ -25,4 +25,21 @@ describe("global request visibility", () => {
     fireEvent.click(screen.getByRole("button", { name: "查看并处理" }));
     expect(await screen.findByRole("button", { name: "接受邀请" })).toBeInTheDocument();
   });
+
+  it("keeps the pairing window visible after navigating away and back", async () => {
+    const demo = new DemoDesktopClient(async () => undefined);
+    const snapshot = await demo.getSnapshot();
+    snapshot.pairingAllowedUntil = Math.floor(Date.now() / 1000) + 120;
+    const client = Object.create(demo) as DemoDesktopClient;
+    client.getSnapshot = vi.fn(async () => snapshot);
+    client.subscribe = vi.fn(() => () => undefined);
+
+    render(<App client={client} />);
+    fireEvent.click(await screen.findByRole("button", { name: "设备" }));
+    expect(screen.getByRole("button", { name: "配对窗口已开放" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    fireEvent.click(screen.getByRole("button", { name: "设备" }));
+    expect(screen.getByRole("button", { name: "配对窗口已开放" })).toBeInTheDocument();
+  });
 });

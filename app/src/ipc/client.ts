@@ -18,6 +18,8 @@ export interface AppClient {
   allowPairing(): Promise<void>;
   beginPairing(instanceId: string): Promise<void>;
   confirmPairing(pairingId: string, accepted: boolean): Promise<void>;
+  setLocalDeviceName(deviceName: string): Promise<void>;
+  setDeviceAlias(deviceId: string, localAlias: string | null): Promise<void>;
   setDeviceSyncEnabled(deviceId: string, enabled: boolean): Promise<void>;
   revokeDevice(deviceId: string): Promise<void>;
   createSyncGroup(input: { name: string; memberDeviceIds: string[]; allowText: boolean; allowImages: boolean; allowHtml: boolean; allowFiles: boolean }): Promise<string>;

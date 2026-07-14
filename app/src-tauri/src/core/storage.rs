@@ -5,17 +5,27 @@ use super::{
 use rusqlite::{params, Connection, OptionalExtension};
 use std::{fs, path::Path, sync::Mutex};
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 #[derive(Clone, Debug)]
 pub(crate) struct TrustedDevice {
     pub(crate) device_id: String,
     pub(crate) device_name: String,
+    pub(crate) local_alias: Option<String>,
     pub(crate) platform: String,
     pub(crate) public_key: Vec<u8>,
     pub(crate) certificate_der: Vec<u8>,
     pub(crate) paired_at: String,
     pub(crate) sync_enabled: bool,
+}
+
+impl TrustedDevice {
+    pub(crate) fn display_name(&self) -> &str {
+        self.local_alias
+            .as_deref()
+            .filter(|alias| !alias.is_empty())
+            .unwrap_or(&self.device_name)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -75,13 +85,19 @@ impl Store {
                    publish_paused INTEGER NOT NULL,
                    subscribe_paused INTEGER NOT NULL
                  );
+                 CREATE TABLE IF NOT EXISTS device_profile (
+                   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                   device_name TEXT NOT NULL
+                 );
                  CREATE TABLE IF NOT EXISTS trusted_devices (
                    device_id TEXT PRIMARY KEY,
                    device_name TEXT NOT NULL,
+                   local_alias TEXT,
                    platform TEXT NOT NULL,
                    public_key BLOB NOT NULL,
                    certificate_der BLOB NOT NULL,
                    paired_at TEXT NOT NULL,
+                   sync_enabled INTEGER NOT NULL DEFAULT 1,
                    revoked INTEGER NOT NULL DEFAULT 0
                  );
                  CREATE TABLE IF NOT EXISTS pending_pairings (
@@ -186,6 +202,23 @@ impl Store {
                 )
                 .map_err(|error| format!("无法升级远端序号正文校验结构：{error}"))?;
         }
+        if !column_exists(&connection, "trusted_devices", "local_alias")? {
+            connection
+                .execute(
+                    "ALTER TABLE trusted_devices ADD COLUMN local_alias TEXT",
+                    [],
+                )
+                .map_err(|error| format!("无法升级可信设备备注结构：{error}"))?;
+        }
+        connection
+            .execute(
+                "CREATE TABLE IF NOT EXISTS device_profile (
+                   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                   device_name TEXT NOT NULL
+                 )",
+                [],
+            )
+            .map_err(|error| format!("无法升级本机设备资料结构：{error}"))?;
         connection
             .pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(|error| format!("无法更新数据库版本：{error}"))?;
@@ -227,6 +260,36 @@ impl Store {
                 params![json],
             )
             .map_err(|error| format!("无法保存设置：{error}"))?;
+        Ok(())
+    }
+
+    pub(crate) fn load_device_name(&self) -> Result<Option<String>, String> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "本地数据库锁已损坏".to_string())?;
+        connection
+            .query_row(
+                "SELECT device_name FROM device_profile WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("无法读取本机设备名称：{error}"))
+    }
+
+    pub(crate) fn save_device_name(&self, device_name: &str) -> Result<(), String> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "本地数据库锁已损坏".to_string())?;
+        connection
+            .execute(
+                "INSERT INTO device_profile(singleton, device_name) VALUES(1, ?1)
+                 ON CONFLICT(singleton) DO UPDATE SET device_name = excluded.device_name",
+                params![device_name],
+            )
+            .map_err(|error| format!("无法保存本机设备名称：{error}"))?;
         Ok(())
     }
 
@@ -424,7 +487,7 @@ impl Store {
         let transaction = connection
             .transaction()
             .map_err(|error| format!("无法开始配对事务：{error}"))?;
-        let device = transaction
+        let mut device = transaction
             .query_row(
                 "SELECT device_id, device_name, platform, public_key, certificate_der, ?2
                  FROM pending_pairings WHERE pairing_id = ?1",
@@ -433,6 +496,7 @@ impl Store {
                     Ok(TrustedDevice {
                         device_id: row.get(0)?,
                         device_name: row.get(1)?,
+                        local_alias: None,
                         platform: row.get(2)?,
                         public_key: row.get(3)?,
                         certificate_der: row.get(4)?,
@@ -442,6 +506,15 @@ impl Store {
                 },
             )
             .map_err(|error| format!("待确认配对不存在：{error}"))?;
+        device.local_alias = transaction
+            .query_row(
+                "SELECT local_alias FROM trusted_devices WHERE device_id = ?1",
+                params![device.device_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("无法读取设备原有备注：{error}"))?
+            .flatten();
         transaction
             .execute(
                 "INSERT INTO trusted_devices(
@@ -504,18 +577,19 @@ impl Store {
             .map_err(|_| "本地数据库锁已损坏".to_string())?;
         connection
             .query_row(
-                "SELECT device_id, device_name, platform, public_key, certificate_der, paired_at, sync_enabled
+                "SELECT device_id, device_name, local_alias, platform, public_key, certificate_der, paired_at, sync_enabled
                  FROM trusted_devices WHERE device_id = ?1 AND revoked = 0",
                 params![device_id],
                 |row| {
                     Ok(TrustedDevice {
                         device_id: row.get(0)?,
                         device_name: row.get(1)?,
-                        platform: row.get(2)?,
-                        public_key: row.get(3)?,
-                        certificate_der: row.get(4)?,
-                        paired_at: row.get(5)?,
-                        sync_enabled: row.get(6)?,
+                        local_alias: row.get(2)?,
+                        platform: row.get(3)?,
+                        public_key: row.get(4)?,
+                        certificate_der: row.get(5)?,
+                        paired_at: row.get(6)?,
+                        sync_enabled: row.get(7)?,
                     })
                 },
             )
@@ -530,8 +604,8 @@ impl Store {
             .map_err(|_| "本地数据库锁已损坏".to_string())?;
         let mut statement = connection
             .prepare(
-                "SELECT device_id, device_name, platform, public_key, certificate_der, paired_at, sync_enabled
-                 FROM trusted_devices WHERE revoked = 0 ORDER BY device_name",
+                "SELECT device_id, device_name, local_alias, platform, public_key, certificate_der, paired_at, sync_enabled
+                 FROM trusted_devices WHERE revoked = 0 ORDER BY COALESCE(NULLIF(local_alias, ''), device_name)",
             )
             .map_err(|error| format!("无法查询可信设备：{error}"))?;
         let rows = statement
@@ -539,11 +613,12 @@ impl Store {
                 Ok(TrustedDevice {
                     device_id: row.get(0)?,
                     device_name: row.get(1)?,
-                    platform: row.get(2)?,
-                    public_key: row.get(3)?,
-                    certificate_der: row.get(4)?,
-                    paired_at: row.get(5)?,
-                    sync_enabled: row.get(6)?,
+                    local_alias: row.get(2)?,
+                    platform: row.get(3)?,
+                    public_key: row.get(4)?,
+                    certificate_der: row.get(5)?,
+                    paired_at: row.get(6)?,
+                    sync_enabled: row.get(7)?,
                 })
             })
             .map_err(|error| format!("无法读取可信设备：{error}"))?;
@@ -600,6 +675,51 @@ impl Store {
                 params![device_id, enabled],
             )
             .map_err(|error| format!("无法保存设备同步策略：{error}"))?;
+        if changed != 1 {
+            return Err("可信设备不存在或已经撤销".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_device_local_alias(
+        &self,
+        device_id: &str,
+        local_alias: Option<&str>,
+    ) -> Result<(), String> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "本地数据库锁已损坏".to_string())?;
+        let changed = connection
+            .execute(
+                "UPDATE trusted_devices SET local_alias = ?2
+                 WHERE device_id = ?1 AND revoked = 0",
+                params![device_id, local_alias],
+            )
+            .map_err(|error| format!("无法保存设备备注名：{error}"))?;
+        if changed != 1 {
+            return Err("可信设备不存在或已经撤销".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn update_trusted_device_profile(
+        &self,
+        device_id: &str,
+        device_name: &str,
+        platform: &str,
+    ) -> Result<(), String> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "本地数据库锁已损坏".to_string())?;
+        let changed = connection
+            .execute(
+                "UPDATE trusted_devices SET device_name = ?2, platform = ?3
+                 WHERE device_id = ?1 AND revoked = 0",
+                params![device_id, device_name, platform],
+            )
+            .map_err(|error| format!("无法更新可信设备资料：{error}"))?;
         if changed != 1 {
             return Err("可信设备不存在或已经撤销".into());
         }
@@ -1256,7 +1376,9 @@ impl Store {
             .prepare(
                 "SELECT invite_id, expires_at, status, manifest_json
                  FROM group_invites
-                 WHERE target_device_id = ?1 AND status = 'sent' AND expires_at > ?2",
+                 WHERE target_device_id = ?1
+                   AND status IN ('queued', 'sent')
+                   AND expires_at > ?2",
             )
             .map_err(|error| format!("无法查询待发送同步组邀请：{error}"))?;
         let rows = statement
@@ -1355,7 +1477,7 @@ impl Store {
             if status == "accepted" || status == "rejected" {
                 return Ok(false);
             }
-            if status == "sent" && expires_at.as_str() > now {
+            if (status == "queued" || status == "sent") && expires_at.as_str() > now {
                 return Ok(false);
             }
         }
@@ -1468,6 +1590,7 @@ mod tests {
         let pending = TrustedDevice {
             device_id: "ld1_test".into(),
             device_name: "Test PC".into(),
+            local_alias: None,
             platform: "windows".into(),
             public_key: vec![7; 32],
             certificate_der: vec![8; 64],
@@ -1481,6 +1604,24 @@ mod tests {
             .promote_trusted_device("pair-1", "2026-07-13T00:01:00Z")
             .unwrap();
         assert_eq!(trusted.device_name, "Test PC");
+        reopened.save_device_name("My Workstation").unwrap();
+        assert_eq!(
+            reopened.load_device_name().unwrap().as_deref(),
+            Some("My Workstation")
+        );
+        reopened
+            .set_device_local_alias("ld1_test", Some("办公室电脑"))
+            .unwrap();
+        let aliased = reopened.trusted_device("ld1_test").unwrap().unwrap();
+        assert_eq!(aliased.device_name, "Test PC");
+        assert_eq!(aliased.display_name(), "办公室电脑");
+        reopened
+            .update_trusted_device_profile("ld1_test", "Work PC", "linux")
+            .unwrap();
+        let updated = reopened.trusted_device("ld1_test").unwrap().unwrap();
+        assert_eq!(updated.device_name, "Work PC");
+        assert_eq!(updated.platform, "linux");
+        assert_eq!(updated.display_name(), "办公室电脑");
         assert_eq!(
             reopened
                 .trusted_device("ld1_test")
@@ -1594,7 +1735,7 @@ mod tests {
             invite_id: "invite-1".into(),
             target_device_id: identity.device_id().into(),
             expires_at: "2026-07-13T00:10:00Z".into(),
-            status: "sent".into(),
+            status: "queued".into(),
             manifest: revision_two.clone(),
         };
         store.save_group_invite(&invite).unwrap();

@@ -54,15 +54,17 @@ impl DiscoveryHandle {
             tracing::warn!(error = %error, "mDNS discovery shutdown failed");
         }
     }
+
+    pub(crate) fn refresh(&self, app: AppHandle) -> Result<(), String> {
+        self.suspend();
+        self.resume(app)
+    }
 }
 
 fn start_session(app: AppHandle) -> Result<DiscoverySession, String> {
     let (device_id, device_name) = {
         let state = app.state::<service::ServiceState>();
-        (
-            state.device_id().to_string(),
-            state.device_name().to_string(),
-        )
+        (state.device_id().to_string(), state.device_name()?)
     };
 
     let daemon = ServiceDaemon::new().map_err(|error| format!("无法启动局域网发现：{error}"))?;

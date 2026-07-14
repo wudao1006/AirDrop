@@ -24,6 +24,7 @@ export interface FloatingSlotSummary {
   revision: number;
   deviceName: string;
   platform: "macos" | "windows" | "linux" | "android";
+  online: boolean;
   kind: RepresentationKind;
   preview: string;
   imagePreview?: string;
@@ -69,6 +70,7 @@ export interface FloatingOrbLayoutStatePayload {
   message?: string;
   side?: FloatingOrbSide;
   bounds?: { x: number; y: number; width: number; height: number };
+  anchor?: { x: number; y: number };
 }
 
 export interface FloatingEventPayloads {

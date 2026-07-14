@@ -18,6 +18,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
+    fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -127,6 +128,8 @@ pub struct NearbyDevice {
 pub struct TrustedDeviceView {
     device_id: String,
     device_name: String,
+    advertised_name: String,
+    local_alias: Option<String>,
     platform: String,
     paired_at: String,
     online: bool,
@@ -189,6 +192,31 @@ pub struct UpdateGroupPolicyInput {
     allow_images: bool,
     allow_html: bool,
     allow_files: bool,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum PreparedDragData {
+    Fixed(String),
+    Map(HashMap<String, String>),
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum PreparedDragItem {
+    Files(Vec<String>),
+    Data {
+        data: PreparedDragData,
+        types: Vec<String>,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreparedSlotDrag {
+    item: PreparedDragItem,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lease_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -329,6 +357,7 @@ impl Default for AppSettings {
 pub struct UiSnapshot {
     revision: u64,
     platform: String,
+    local_device_name: String,
     activity: String,
     last_synchronized_at: String,
     clipboard_capability: ClipboardCapability,
@@ -342,6 +371,7 @@ pub struct UiSnapshot {
     nearby_devices: Vec<NearbyDevice>,
     trusted_devices: Vec<TrustedDeviceView>,
     pending_pairings: Vec<PendingPairing>,
+    pairing_allowed_until: Option<u64>,
     cache_persistent: bool,
     sync_groups: Vec<SyncGroupView>,
     pending_group_invites: Vec<PendingGroupInviteView>,
@@ -351,6 +381,7 @@ pub struct UiSnapshot {
 
 impl UiSnapshot {
     fn initial(
+        local_device_name: String,
         settings: AppSettings,
         runtime: Option<StoredRuntime>,
         trusted_devices: Vec<TrustedDevice>,
@@ -373,6 +404,7 @@ impl UiSnapshot {
             } else {
                 "desktop".into()
             },
+            local_device_name,
             activity: "foreground_live".into(),
             last_synchronized_at: "1970-01-01T00:00:00.000Z".into(),
             clipboard_capability: ClipboardCapability {
@@ -400,16 +432,22 @@ impl UiSnapshot {
             nearby_devices: Vec::new(),
             trusted_devices: trusted_devices
                 .into_iter()
-                .map(|device| TrustedDeviceView {
-                    device_id: device.device_id,
-                    device_name: device.device_name,
-                    platform: device.platform,
-                    paired_at: device.paired_at,
-                    online: false,
-                    sync_enabled: device.sync_enabled,
+                .map(|device| {
+                    let device_name = device.display_name().to_string();
+                    TrustedDeviceView {
+                        device_id: device.device_id,
+                        device_name,
+                        advertised_name: device.device_name,
+                        local_alias: device.local_alias,
+                        platform: device.platform,
+                        paired_at: device.paired_at,
+                        online: false,
+                        sync_enabled: device.sync_enabled,
+                    }
                 })
                 .collect(),
             pending_pairings: Vec::new(),
+            pairing_allowed_until: None,
             cache_persistent: false,
             sync_groups: Vec::new(),
             pending_group_invites: Vec::new(),
@@ -427,6 +465,7 @@ pub struct ServiceState {
     snapshot: Mutex<UiSnapshot>,
     store: Store,
     identity: Identity,
+    device_name: Mutex<String>,
     remote_bodies: Mutex<HashMap<String, RemoteClipboardBody>>,
     incoming_sequences: Mutex<HashMap<String, u64>>,
     recoverable_sequences: Mutex<HashSet<String>>,
@@ -438,12 +477,21 @@ pub struct ServiceState {
     file_cache_root: PathBuf,
     imported_files: Mutex<Option<Arc<ReceivedFileBundle>>>,
     accepted_file_transfers: Mutex<HashMap<String, String>>,
+    drag_file_leases: Mutex<HashMap<String, (Arc<ReceivedFileBundle>, u64)>>,
 }
 
 impl ServiceState {
     pub fn open(data_dir: &Path) -> Result<Self, String> {
         let store = Store::open(data_dir)?;
         let identity = Identity::load_or_create(data_dir)?;
+        let device_name = match store.load_device_name()? {
+            Some(device_name) => device_name,
+            None => {
+                let device_name = identity.device_name().to_string();
+                store.save_device_name(&device_name)?;
+                device_name
+            }
+        };
         let mut settings = store.load_settings()?.unwrap_or_default();
         if settings.content_policy_version < 1 {
             settings.allow_files = true;
@@ -455,17 +503,34 @@ impl ServiceState {
         let clipboard_cache = ClipboardCache::open(data_dir);
         let file_cache_root = data_dir.join("cache").join("files");
         prepare_file_cache(&file_cache_root);
-        let mut snapshot = UiSnapshot::initial(settings, runtime, trusted_devices.clone());
+        let mut snapshot = UiSnapshot::initial(
+            device_name.clone(),
+            settings,
+            runtime,
+            trusted_devices.clone(),
+        );
         snapshot.cache_persistent = clipboard_cache.available();
         let manifests = store.group_manifests()?;
+        let display_names =
+            device_display_names(identity.device_id(), &device_name, trusted_devices.iter());
         snapshot.sync_groups = manifests
             .iter()
-            .map(|manifest| group_view(manifest, identity.device_id()))
+            .map(|manifest| {
+                let mut view = group_view(manifest, identity.device_id());
+                apply_group_display_names(&mut view, &display_names);
+                view
+            })
             .collect();
         snapshot.pending_group_invites = store
             .group_invites(&current_time())?
             .iter()
-            .map(pending_group_invite_view)
+            .map(|invite| {
+                let mut view = pending_group_invite_view(invite);
+                if let Some(name) = display_names.get(&view.owner_device_id) {
+                    view.owner_name = name.clone();
+                }
+                view
+            })
             .collect();
         let mut remote_bodies = HashMap::new();
         if clipboard_cache.available() {
@@ -568,6 +633,7 @@ impl ServiceState {
             snapshot: Mutex::new(snapshot),
             store,
             identity,
+            device_name: Mutex::new(device_name),
             remote_bodies: Mutex::new(remote_bodies),
             incoming_sequences: Mutex::new(incoming_sequences),
             recoverable_sequences: Mutex::new(recoverable_sequences),
@@ -579,6 +645,7 @@ impl ServiceState {
             file_cache_root,
             imported_files: Mutex::new(None),
             accepted_file_transfers: Mutex::new(HashMap::new()),
+            drag_file_leases: Mutex::new(HashMap::new()),
         })
     }
 
@@ -586,8 +653,11 @@ impl ServiceState {
         self.identity.device_id()
     }
 
-    pub(crate) fn device_name(&self) -> &str {
-        self.identity.device_name()
+    pub(crate) fn device_name(&self) -> Result<String, String> {
+        self.device_name
+            .lock()
+            .map(|name| name.clone())
+            .map_err(|_| "本机设备名称状态锁已损坏".to_string())
     }
 
     #[cfg(desktop)]
@@ -668,6 +738,23 @@ impl ServiceState {
                 .find(|device| device.device_id == device_id)
                 .cloned()
         })
+    }
+
+    fn displayed_device_names(&self) -> Result<HashMap<String, String>, String> {
+        let snapshot = self
+            .snapshot
+            .lock()
+            .map_err(|_| "Rust 服务状态锁已损坏".to_string())?;
+        let mut names = snapshot
+            .trusted_devices
+            .iter()
+            .map(|device| (device.device_id.clone(), device.device_name.clone()))
+            .collect::<HashMap<_, _>>();
+        names.insert(
+            self.device_id().to_string(),
+            snapshot.local_device_name.clone(),
+        );
+        Ok(names)
     }
 
     pub(crate) fn authorized_device(
@@ -855,12 +942,18 @@ impl ServiceState {
         let replayed_at = current_time();
         if let Ok(invites) = self.store.group_invites_for_target(device_id, &replayed_at) {
             for invite in invites {
-                let _ = transport.send_group_invite(
-                    device_id,
-                    invite.invite_id,
-                    invite.expires_at,
-                    invite.manifest,
-                );
+                let invite_id = invite.invite_id.clone();
+                if transport
+                    .send_group_invite(
+                        device_id,
+                        invite.invite_id,
+                        invite.expires_at,
+                        invite.manifest,
+                    )
+                    .is_ok()
+                {
+                    let _ = self.store.set_group_invite_status(&invite_id, "sent");
+                }
             }
         }
         if let Ok(invites) = self.store.group_invite_responses_for_owner(device_id) {
@@ -897,16 +990,22 @@ impl ServiceState {
                         invite_id: uuid::Uuid::new_v4().to_string(),
                         target_device_id: device_id.to_string(),
                         expires_at,
-                        status: "sent".into(),
+                        status: "queued".into(),
                         manifest: group.clone(),
                     };
                     if self.store.save_group_invite(&invite).is_ok() {
-                        let _ = transport.send_group_invite(
-                            device_id,
-                            invite.invite_id,
-                            invite.expires_at,
-                            invite.manifest,
-                        );
+                        let invite_id = invite.invite_id.clone();
+                        if transport
+                            .send_group_invite(
+                                device_id,
+                                invite.invite_id,
+                                invite.expires_at,
+                                invite.manifest,
+                            )
+                            .is_ok()
+                        {
+                            let _ = self.store.set_group_invite_status(&invite_id, "sent");
+                        }
                     }
                 }
                 if group.manifest.active_member(device_id).is_some() {
@@ -931,6 +1030,7 @@ fn trusted_from_group_member(member: &GroupMember) -> Result<TrustedDevice, Stri
     Ok(TrustedDevice {
         device_id: member.device_id.clone(),
         device_name: member.device_name.clone(),
+        local_alias: None,
         platform: member.platform.clone(),
         public_key: BASE64
             .decode(member.public_key.as_bytes())
@@ -1036,6 +1136,48 @@ fn image_preview_data_url(rgba: &[u8], width: u32, height: u32) -> Option<String
         )
         .ok()?;
     Some(format!("data:image/png;base64,{}", BASE64.encode(&png)))
+}
+
+fn encode_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| "图片尺寸溢出".to_string())?;
+    if rgba.len() != expected {
+        return Err("图片像素数据长度无效".into());
+    }
+    let mut png = Vec::new();
+    PngEncoder::new(&mut png)
+        .write_image(rgba, width, height, ColorType::Rgba8.into())
+        .map_err(|error| format!("无法编码拖放图片：{error}"))?;
+    Ok(png)
+}
+
+fn prepare_drag_image_file(
+    state: &ServiceState,
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<String, String> {
+    let root = state.file_cache_root.join("drag");
+    fs::create_dir_all(&root).map_err(|error| format!("无法创建拖放图片缓存：{error}"))?;
+    let hash = data_encoding::HEXLOWER.encode(&image_hash(rgba, width, height));
+    let path = root.join(format!("image-{hash}.png"));
+    if !path.exists() {
+        let temporary = root.join(format!(
+            "image-{hash}-{}.tmp",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::write(&temporary, encode_png(rgba, width, height)?)
+            .map_err(|error| format!("无法写入拖放图片缓存：{error}"))?;
+        if let Err(error) = fs::rename(&temporary, &path) {
+            let _ = fs::remove_file(&temporary);
+            if !path.exists() {
+                return Err(format!("无法提交拖放图片缓存：{error}"));
+            }
+        }
+    }
+    Ok(path.to_string_lossy().into_owned())
 }
 
 fn copied_file_names(files: &[String]) -> Vec<String> {
@@ -1185,7 +1327,7 @@ fn text_slot(
         id: format!("device:{}", device.device_id),
         revision: sequence,
         device_id: device.device_id.clone(),
-        device_name: device.device_name.clone(),
+        device_name: device.display_name().to_string(),
         platform: device.platform.clone(),
         online: presentation.online,
         pinned: None,
@@ -1235,7 +1377,7 @@ fn image_slot(
         id: format!("device:{}", device.device_id),
         revision: sequence,
         device_id: device.device_id.clone(),
-        device_name: device.device_name.clone(),
+        device_name: device.display_name().to_string(),
         platform: device.platform.clone(),
         online: true,
         pinned: None,
@@ -1312,7 +1454,7 @@ fn rich_slot(
         id: format!("device:{}", device.device_id),
         revision: rich.sequence,
         device_id: device.device_id.clone(),
-        device_name: device.device_name.clone(),
+        device_name: device.display_name().to_string(),
         platform: device.platform.clone(),
         online: true,
         pinned: None,
@@ -1353,7 +1495,7 @@ fn file_slot(
         id: format!("device:{}", device.device_id),
         revision: files.sequence,
         device_id: device.device_id.clone(),
-        device_name: device.device_name.clone(),
+        device_name: device.display_name().to_string(),
         platform: device.platform.clone(),
         online: true,
         pinned: None,
@@ -1478,6 +1620,42 @@ fn group_view(manifest: &SignedGroupManifest, local_device_id: &str) -> SyncGrou
         policy: manifest.manifest.policy.clone(),
         members: manifest.manifest.members.clone(),
     }
+}
+
+fn device_display_names<'a>(
+    local_device_id: &str,
+    local_device_name: &str,
+    devices: impl IntoIterator<Item = &'a TrustedDevice>,
+) -> HashMap<String, String> {
+    let mut names = devices
+        .into_iter()
+        .map(|device| (device.device_id.clone(), device.display_name().to_string()))
+        .collect::<HashMap<_, _>>();
+    names.insert(local_device_id.to_string(), local_device_name.to_string());
+    names
+}
+
+fn apply_group_display_names(group: &mut SyncGroupView, display_names: &HashMap<String, String>) {
+    for member in &mut group.members {
+        if let Some(name) = display_names.get(&member.device_id) {
+            member.device_name = name.clone();
+        }
+    }
+}
+
+fn normalize_device_label(value: &str, field: &str) -> Result<String, String> {
+    let value = value.trim();
+    let length = value.chars().count();
+    if length == 0 {
+        return Err(format!("{field}不能为空"));
+    }
+    if length > 48 {
+        return Err(format!("{field}不能超过 48 个字符"));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(format!("{field}不能包含控制字符"));
+    }
+    Ok(value.to_string())
 }
 
 fn pending_group_invite_view(invite: &StoredGroupInvite) -> PendingGroupInviteView {
@@ -1847,7 +2025,10 @@ pub fn upsert_nearby_device(
     app: &AppHandle,
     mut nearby: NearbyDevice,
 ) -> Result<(), String> {
-    nearby.paired = state.authorized_device(&nearby.device_id)?.is_some();
+    if let Some(trusted) = state.authorized_device(&nearby.device_id)? {
+        nearby.paired = true;
+        nearby.device_name = trusted.display_name().to_string();
+    }
     update(state, app, |snapshot| {
         if let Some(existing) = snapshot
             .nearby_devices
@@ -1915,10 +2096,13 @@ pub(crate) fn pairing_completed(
             .retain(|item| item.device_id != device.device_id);
         snapshot.trusted_devices.push(TrustedDeviceView {
             device_id: device.device_id.clone(),
-            device_name: device.device_name.clone(),
+            device_name: device.display_name().to_string(),
+            advertised_name: device.device_name.clone(),
+            local_alias: device.local_alias.clone(),
             platform: device.platform.clone(),
             paired_at: device.paired_at.clone(),
-            online: true,
+            // 配对完成只代表身份已持久化；可信 QUIC 连接建立后才算真正在线。
+            online: false,
             sync_enabled: device.sync_enabled,
         });
         if let Some(nearby) = snapshot
@@ -1927,6 +2111,7 @@ pub(crate) fn pairing_completed(
             .find(|item| item.device_id == device.device_id)
         {
             nearby.paired = true;
+            nearby.device_name = device.display_name().to_string();
         }
         Ok(())
     })?;
@@ -1972,6 +2157,87 @@ pub(crate) fn set_trusted_online(
         Ok(())
     })?;
     Ok(())
+}
+
+pub(crate) fn update_trusted_device_profile(
+    state: &ServiceState,
+    app: &AppHandle,
+    device_id: &str,
+    device_name: &str,
+    platform: &str,
+) -> Result<(String, String), String> {
+    let advertised_name = normalize_device_label(device_name, "对方设备名称")?;
+    let platform = match platform {
+        "macos" | "windows" | "linux" | "android" => platform.to_string(),
+        _ => "unknown".to_string(),
+    };
+    if state.store.trusted_device(device_id)?.is_some() {
+        state
+            .store
+            .update_trusted_device_profile(device_id, &advertised_name, &platform)?;
+    }
+    update(state, app, |snapshot| {
+        let local_alias = snapshot
+            .trusted_devices
+            .iter()
+            .find(|device| device.device_id == device_id)
+            .and_then(|device| device.local_alias.clone());
+        let display_name = local_alias
+            .as_deref()
+            .unwrap_or(&advertised_name)
+            .to_string();
+        if let Some(device) = snapshot
+            .trusted_devices
+            .iter_mut()
+            .find(|device| device.device_id == device_id)
+        {
+            device.device_name = display_name.clone();
+            device.advertised_name = advertised_name.clone();
+            device.platform = platform.clone();
+        }
+        for nearby in snapshot
+            .nearby_devices
+            .iter_mut()
+            .filter(|device| device.device_id == device_id && device.paired)
+        {
+            nearby.device_name = display_name.clone();
+            nearby.platform = platform.clone();
+        }
+        for slot in snapshot
+            .slots
+            .iter_mut()
+            .filter(|slot| slot.device_id == device_id)
+        {
+            slot.device_name = display_name.clone();
+            slot.platform = platform.clone();
+        }
+        for group in &mut snapshot.sync_groups {
+            for member in group
+                .members
+                .iter_mut()
+                .filter(|member| member.device_id == device_id)
+            {
+                member.device_name = display_name.clone();
+                member.platform = platform.clone();
+            }
+        }
+        for invite in snapshot
+            .pending_group_invites
+            .iter_mut()
+            .filter(|invite| invite.owner_device_id == device_id)
+        {
+            invite.owner_name = display_name.clone();
+        }
+        for operation in snapshot
+            .imports
+            .iter_mut()
+            .filter(|operation| operation.slot_id == format!("device:{device_id}"))
+        {
+            operation.device_name = display_name.clone();
+        }
+        Ok(())
+    })?;
+    Ok((advertised_name, platform))
 }
 
 pub(crate) fn receive_remote_text(
@@ -2357,7 +2623,9 @@ fn upsert_group_snapshot(
     app: &AppHandle,
     manifest: &SignedGroupManifest,
 ) -> Result<(), String> {
-    let view = group_view(manifest, state.device_id());
+    let display_names = state.displayed_device_names()?;
+    let mut view = group_view(manifest, state.device_id());
+    apply_group_display_names(&mut view, &display_names);
     update(state, app, |snapshot| {
         snapshot
             .sync_groups
@@ -2544,7 +2812,7 @@ pub fn create_sync_group(
     let now = current_time();
     let owner = GroupMember {
         device_id: state.device_id().into(),
-        device_name: state.device_name().into(),
+        device_name: state.device_name()?,
         platform: crate::platform::platform_name().into(),
         public_key: BASE64.encode(&state.identity().public_key_bytes()),
         certificate: BASE64.encode(transport.certificate_der()),
@@ -2599,16 +2867,39 @@ pub fn create_sync_group(
             invite_id: uuid::Uuid::new_v4().to_string(),
             target_device_id: device_id.clone(),
             expires_at: expires_at.clone(),
-            status: "sent".into(),
+            status: "queued".into(),
             manifest: signed.clone(),
         };
         state.store.save_group_invite(&invite)?;
-        let _ = transport.send_group_invite(
+        match transport.send_group_invite(
             &device_id,
-            invite.invite_id,
-            invite.expires_at,
+            invite.invite_id.clone(),
+            invite.expires_at.clone(),
             signed.clone(),
-        );
+        ) {
+            Ok(()) => {
+                if let Err(error) = state
+                    .store
+                    .set_group_invite_status(&invite.invite_id, "sent")
+                {
+                    tracing::warn!(
+                        invite_id = %invite.invite_id,
+                        error = %error,
+                        "group invite delivery state update deferred"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    device_id,
+                    error = %error,
+                    "group invite queued until trusted connection is available"
+                );
+                if let Some(nearby) = state.nearby_device(&device_id) {
+                    transport.connect_trusted(app.clone(), nearby);
+                }
+            }
+        }
     }
     Ok(group_id)
 }
@@ -2656,7 +2947,10 @@ pub(crate) fn receive_group_invite(
     if already_processed {
         return Ok(());
     }
-    let view = pending_group_invite_view(&invite);
+    let mut view = pending_group_invite_view(&invite);
+    if let Some(name) = state.displayed_device_names()?.get(&view.owner_device_id) {
+        view.owner_name = name.clone();
+    }
     update(state, app, |snapshot| {
         snapshot
             .pending_group_invites
@@ -2689,12 +2983,21 @@ pub fn confirm_group_invite(
             .retain(|item| item.invite_id != invite_id);
         Ok(())
     })?;
-    let _ = transport.send_group_accept(
+    if let Err(error) = transport.send_group_accept(
         &invite.manifest.manifest.owner_device_id,
         invite_id,
-        invite.manifest.manifest.group_id,
+        invite.manifest.manifest.group_id.clone(),
         accepted,
-    );
+    ) {
+        tracing::warn!(
+            owner_device_id = %invite.manifest.manifest.owner_device_id,
+            error = %error,
+            "group invite response queued until trusted connection is available"
+        );
+        if let Some(nearby) = state.nearby_device(&invite.manifest.manifest.owner_device_id) {
+            transport.connect_trusted(app, nearby);
+        }
+    }
     Ok(())
 }
 
@@ -3144,9 +3447,15 @@ pub(crate) fn receive_group_tombstone(
 
 #[tauri::command]
 pub fn allow_pairing(
+    state: State<'_, ServiceState>,
     transport: State<'_, super::transport::TransportHandle>,
+    app: AppHandle,
 ) -> Result<(), String> {
-    transport.allow_pairing(120);
+    let expiry = transport.allow_pairing(120)?;
+    update(&state, &app, |snapshot| {
+        snapshot.pairing_allowed_until = Some(expiry);
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -3219,6 +3528,121 @@ pub fn set_device_sync_enabled(
             state.clipboard_cache.remove(&object_name);
         }
     }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_local_device_name(
+    state: State<'_, ServiceState>,
+    transport: State<'_, super::transport::TransportHandle>,
+    discovery: State<'_, super::discovery::DiscoveryHandle>,
+    app: AppHandle,
+    device_name: String,
+) -> Result<(), String> {
+    let device_name = normalize_device_label(&device_name, "本机名称")?;
+    if state.device_name()? == device_name {
+        return Ok(());
+    }
+    state.store.save_device_name(&device_name)?;
+    *state
+        .device_name
+        .lock()
+        .map_err(|_| "本机设备名称状态锁已损坏".to_string())? = device_name.clone();
+    update(&state, &app, |snapshot| {
+        snapshot.local_device_name = device_name.clone();
+        for group in &mut snapshot.sync_groups {
+            for member in group
+                .members
+                .iter_mut()
+                .filter(|member| member.device_id == state.device_id())
+            {
+                member.device_name = device_name.clone();
+            }
+        }
+        Ok(())
+    })?;
+    transport.refresh_local_profile();
+    discovery.refresh(app)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_device_alias(
+    state: State<'_, ServiceState>,
+    app: AppHandle,
+    device_id: String,
+    local_alias: Option<String>,
+) -> Result<(), String> {
+    let local_alias = local_alias
+        .as_deref()
+        .map(str::trim)
+        .filter(|alias| !alias.is_empty())
+        .map(|alias| normalize_device_label(alias, "设备备注名"))
+        .transpose()?;
+    state
+        .store
+        .set_device_local_alias(&device_id, local_alias.as_deref())?;
+    update(&state, &app, |snapshot| {
+        let advertised_name = snapshot
+            .trusted_devices
+            .iter()
+            .find(|device| device.device_id == device_id)
+            .map(|device| device.advertised_name.clone())
+            .ok_or_else(|| "可信设备不存在".to_string())?;
+        let display_name = local_alias
+            .as_deref()
+            .unwrap_or(&advertised_name)
+            .to_string();
+        if let Some(device) = snapshot
+            .trusted_devices
+            .iter_mut()
+            .find(|device| device.device_id == device_id)
+        {
+            device.device_name = display_name.clone();
+            device.local_alias = local_alias.clone();
+        }
+        for nearby in snapshot
+            .nearby_devices
+            .iter_mut()
+            .filter(|device| device.device_id == device_id && device.paired)
+        {
+            nearby.device_name = display_name.clone();
+        }
+        for slot in snapshot
+            .slots
+            .iter_mut()
+            .filter(|slot| slot.device_id == device_id)
+        {
+            slot.device_name = display_name.clone();
+        }
+        for group in &mut snapshot.sync_groups {
+            for member in group
+                .members
+                .iter_mut()
+                .filter(|member| member.device_id == device_id)
+            {
+                member.device_name = display_name.clone();
+            }
+        }
+        for invite in snapshot
+            .pending_group_invites
+            .iter_mut()
+            .filter(|invite| invite.owner_device_id == device_id)
+        {
+            invite.owner_name = display_name.clone();
+        }
+        for operation in snapshot
+            .imports
+            .iter_mut()
+            .filter(|operation| operation.slot_id == format!("device:{device_id}"))
+        {
+            operation.device_name = display_name.clone();
+        }
+        snapshot
+            .trusted_devices
+            .sort_by(|left, right| left.device_name.cmp(&right.device_name));
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -3301,6 +3725,12 @@ pub fn get_snapshot(
     snapshot
         .pending_pairings
         .retain(|pairing| pairing.expires_at.as_str() > now.as_str());
+    if snapshot
+        .pairing_allowed_until
+        .is_some_and(|expiry| expiry <= unix_seconds())
+    {
+        snapshot.pairing_allowed_until = None;
+    }
     if snapshot.last_synchronized_at.starts_with("1970-") {
         snapshot.last_synchronized_at = now.clone();
         snapshot.current_clipboard.changed_at = now;
@@ -3388,6 +3818,7 @@ pub(crate) fn set_mobile_activity(
         snapshot.platform = "android".into();
         snapshot.activity = activity.into();
         if activity == "suspended" {
+            snapshot.pairing_allowed_until = None;
             for device in &mut snapshot.trusted_devices {
                 device.online = false;
             }
@@ -3691,27 +4122,31 @@ pub fn create_import_intent(
     slot_id: String,
     revision: u64,
 ) -> Result<String, String> {
-    let body = state
-        .remote_bodies
-        .lock()
-        .map_err(|_| "远端正文缓存锁已损坏".to_string())?
-        .get(&slot_id)
-        .cloned()
-        .ok_or_else(|| "远端正文当前不可用".to_string())?;
-    if body.sequence() != revision {
-        return Err("设备槽位正文已经更新，请重新选择".into());
-    }
+    let (_, slot, _) = validated_remote_slot(&state, &slot_id, revision)?;
     let mut snapshot = state
         .snapshot
         .lock()
         .map_err(|_| "Rust 服务状态锁已损坏".to_string())?;
-    let slot = snapshot
-        .slots
-        .iter()
-        .find(|slot| slot.id == slot_id && slot.revision == revision)
-        .cloned()
-        .ok_or_else(|| "设备槽位不存在或已经更新".to_string())?;
-    let content_type = if slot
+    let import_id = uuid::Uuid::new_v4().simple().to_string();
+    snapshot.imports.push(ImportOperation {
+        id: import_id.clone(),
+        slot_id: slot.id.clone(),
+        revision,
+        device_name: slot.device_name.clone(),
+        source_summary: truncate_text(&slot.preview, 80),
+        status: "awaiting_confirmation".into(),
+        progress: 100,
+        message: Some("确认后才会写入本机系统剪贴板".into()),
+    });
+    snapshot.bump();
+    let emitted = snapshot.clone();
+    drop(snapshot);
+    emit_snapshot(&app, &emitted)?;
+    Ok(import_id)
+}
+
+fn slot_content_type(slot: &DeviceSlot) -> &'static str {
+    if slot
         .representations
         .iter()
         .any(|representation| representation.kind == "files")
@@ -3737,7 +4172,35 @@ pub fn create_import_intent(
         "url"
     } else {
         "text"
-    };
+    }
+}
+
+fn validated_remote_slot(
+    state: &ServiceState,
+    slot_id: &str,
+    revision: u64,
+) -> Result<(RemoteClipboardBody, DeviceSlot, &'static str), String> {
+    let body = state
+        .remote_bodies
+        .lock()
+        .map_err(|_| "远端正文缓存锁已损坏".to_string())?
+        .get(slot_id)
+        .cloned()
+        .ok_or_else(|| "远端正文当前不可用".to_string())?;
+    if body.sequence() != revision {
+        return Err("设备槽位正文已经更新，请重新选择".into());
+    }
+    let snapshot = state
+        .snapshot
+        .lock()
+        .map_err(|_| "Rust 服务状态锁已损坏".to_string())?;
+    let slot = snapshot
+        .slots
+        .iter()
+        .find(|slot| slot.id == slot_id && slot.revision == revision)
+        .cloned()
+        .ok_or_else(|| "设备槽位不存在或已经更新".to_string())?;
+    let content_type = slot_content_type(&slot);
     state.validate_group_delivery(&slot.device_id, &slot.group_ids, content_type)?;
     let allowed = match content_type {
         "image" => snapshot.settings.allow_images,
@@ -3749,22 +4212,90 @@ pub fn create_import_intent(
     if !allowed {
         return Err("本机策略已停用此内容类型的取用".into());
     }
-    let import_id = uuid::Uuid::new_v4().simple().to_string();
-    snapshot.imports.push(ImportOperation {
-        id: import_id.clone(),
-        slot_id: slot.id.clone(),
-        revision,
-        device_name: slot.device_name.clone(),
-        source_summary: truncate_text(&slot.preview, 80),
-        status: "awaiting_confirmation".into(),
-        progress: 100,
-        message: Some("确认后才会写入本机系统剪贴板".into()),
-    });
-    snapshot.bump();
-    let emitted = snapshot.clone();
     drop(snapshot);
-    emit_snapshot(&app, &emitted)?;
-    Ok(import_id)
+    Ok((body, slot, content_type))
+}
+
+#[tauri::command]
+pub fn prepare_slot_drag(
+    state: State<'_, ServiceState>,
+    slot_id: String,
+    revision: u64,
+) -> Result<PreparedSlotDrag, String> {
+    let (body, _, content_type) = validated_remote_slot(&state, &slot_id, revision)?;
+    let mut lease_id = None;
+    let item = match body {
+        RemoteClipboardBody::Text { text, .. } => {
+            if content_type == "url" {
+                let mut data = HashMap::new();
+                data.insert("text/plain".into(), text.clone());
+                data.insert("text/uri-list".into(), format!("{}\r\n", text.trim()));
+                PreparedDragItem::Data {
+                    data: PreparedDragData::Map(data),
+                    types: vec!["text/plain".into(), "text/uri-list".into()],
+                }
+            } else {
+                PreparedDragItem::Data {
+                    data: PreparedDragData::Fixed(text),
+                    types: vec!["text/plain".into()],
+                }
+            }
+        }
+        RemoteClipboardBody::Rich {
+            text, html, rtf, ..
+        } => {
+            let mut data = HashMap::new();
+            let mut types = Vec::new();
+            if let Some(html) = html {
+                data.insert("text/html".into(), html);
+                types.push("text/html".into());
+            }
+            if let Some(rtf) = rtf {
+                data.insert("text/rtf".into(), rtf);
+                types.push("text/rtf".into());
+            }
+            data.insert("text/plain".into(), text);
+            types.push("text/plain".into());
+            PreparedDragItem::Data {
+                data: PreparedDragData::Map(data),
+                types,
+            }
+        }
+        RemoteClipboardBody::Files { bundle, .. } => {
+            let now = unix_seconds();
+            let id = uuid::Uuid::new_v4().simple().to_string();
+            let mut leases = state
+                .drag_file_leases
+                .lock()
+                .map_err(|_| "拖放文件租约锁已损坏".to_string())?;
+            leases.retain(|_, (_, created_at)| created_at.saturating_add(600) > now);
+            leases.insert(id.clone(), (bundle.clone(), now));
+            lease_id = Some(id);
+            PreparedDragItem::Files(bundle.clipboard_paths())
+        }
+        RemoteClipboardBody::Image {
+            rgba,
+            width,
+            height,
+            ..
+        } => PreparedDragItem::Files(vec![prepare_drag_image_file(&state, &rgba, width, height)?]),
+    };
+    Ok(PreparedSlotDrag { item, lease_id })
+}
+
+#[tauri::command]
+pub fn release_slot_drag(app: AppHandle, lease_id: String) -> Result<(), String> {
+    if lease_id.is_empty() || lease_id.len() > 64 {
+        return Err("拖放文件租约无效".into());
+    }
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+        let state = app.state::<ServiceState>();
+        if let Ok(mut leases) = state.drag_file_leases.lock() {
+            leases.remove(&lease_id);
+        };
+    });
+    Ok(())
 }
 
 #[tauri::command]
@@ -4019,6 +4550,7 @@ mod tests {
         let device = TrustedDevice {
             device_id: "ld1_peer".into(),
             device_name: "Peer".into(),
+            local_alias: None,
             platform: "linux".into(),
             public_key: vec![0; 32],
             certificate_der: vec![1],
@@ -4067,7 +4599,7 @@ mod tests {
             preview_file_names: false,
             ..AppSettings::default()
         };
-        let mut snapshot = UiSnapshot::initial(settings, None, Vec::new());
+        let mut snapshot = UiSnapshot::initial("Local Device".into(), settings, None, Vec::new());
         snapshot.current_clipboard.preview = "local secret".into();
         snapshot.current_clipboard.types = vec!["纯文本".into()];
         snapshot.current_clipboard.image_preview = Some("data:image/png;base64,secret".into());

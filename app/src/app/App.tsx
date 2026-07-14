@@ -28,8 +28,8 @@ export function App({ client }: { client: DesktopClient }) {
       if (!mounted) return;
       setSnapshot((current) => !current || value.revision > current.revision ? value : current);
     };
-    void client.getSnapshot().then(applySnapshot).catch((reason: unknown) => setError(reason instanceof Error ? reason.message : "AirDrop 启动失败"));
     const unsubscribe = client.subscribe(applySnapshot);
+    void client.getSnapshot().then(applySnapshot).catch((reason: unknown) => setError(reason instanceof Error ? reason.message : "AirDrop 启动失败"));
     return () => { mounted = false; unsubscribe(); };
   }, [client]);
 

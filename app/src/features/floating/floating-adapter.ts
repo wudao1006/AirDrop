@@ -114,6 +114,7 @@ export class TauriFloatingAdapter implements FloatingAdapter {
       skipTaskbar: true,
       shadow: false,
       focus: false,
+      dragDropEnabled: false,
       resizable: false,
       width: COLLAPSED_ORB_SIZE.width,
       height: COLLAPSED_ORB_SIZE.height,

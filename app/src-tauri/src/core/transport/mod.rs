@@ -128,13 +128,16 @@ pub(crate) struct TransportHandle {
 }
 
 impl TransportHandle {
-    pub(crate) fn allow_pairing(&self, seconds: u64) {
+    pub(crate) fn allow_pairing(&self, seconds: u64) -> Result<u64, String> {
         if !self.is_active() {
-            return;
+            return Err("回到前台后才能开放配对窗口".into());
         }
-        if let Ok(mut expiry) = self.pairing_allowed_until.lock() {
-            *expiry = unix_seconds().saturating_add(seconds.min(120));
-        }
+        let expiry = unix_seconds().saturating_add(seconds.min(120));
+        *self
+            .pairing_allowed_until
+            .lock()
+            .map_err(|_| "配对窗口状态锁已损坏".to_string())? = expiry;
+        Ok(expiry)
     }
 
     fn is_active(&self) -> bool {
@@ -394,6 +397,22 @@ impl TransportHandle {
         }
         if let Ok(mut connecting) = self.connecting.lock() {
             connecting.remove(device_id);
+        }
+    }
+
+    pub(crate) fn refresh_local_profile(&self) {
+        let connections = self
+            .peers
+            .lock()
+            .map(|mut peers| {
+                peers
+                    .drain()
+                    .map(|(_, peer)| peer.connection)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for connection in connections {
+            connection.close(5u32.into(), b"local device profile changed");
         }
     }
 
@@ -780,7 +799,7 @@ impl TransportHandle {
                     pairing_id: pairing_id.clone(),
                     nonce: BASE64.encode(&initiator_nonce),
                     device_id: state.device_id().to_string(),
-                    device_name: state.device_name().to_string(),
+                    device_name: state.device_name()?,
                     platform: platform::platform_name().to_string(),
                     public_key: BASE64.encode(&state.identity().public_key_bytes()),
                     certificate: BASE64.encode(&self.certificate_der),
@@ -820,6 +839,7 @@ impl TransportHandle {
         let device = TrustedDevice {
             device_id,
             device_name,
+            local_alias: None,
             platform,
             public_key,
             certificate_der,
@@ -1052,7 +1072,7 @@ impl TransportHandle {
             TrustedMessage::Hello {
                 schema_version: 1,
                 device_id: state.device_id().to_string(),
-                device_name: state.device_name().to_string(),
+                device_name: state.device_name()?,
                 platform: platform::platform_name().to_string(),
                 nonce,
                 public_key: BASE64.encode(&state.identity().public_key_bytes()),
@@ -1065,8 +1085,8 @@ impl TransportHandle {
         let TrustedMessage::Hello {
             schema_version: 1,
             device_id,
-            device_name: _,
-            platform: _,
+            device_name: remote_device_name,
+            platform: remote_platform,
             nonce,
             public_key,
             signature,
@@ -1088,7 +1108,7 @@ impl TransportHandle {
         let presented_certificate = peer_certificate(&connection)?;
         let trusted = {
             let state = app.state::<ServiceState>();
-            let trusted = state
+            let mut trusted = state
                 .authorized_device(&device_id)?
                 .ok_or_else(|| "对端身份不在可信设备中".to_string())?;
             if !trusted.sync_enabled {
@@ -1098,6 +1118,15 @@ impl TransportHandle {
                 return Err("可信连接的 TLS 客户端证书与固定身份不一致".into());
             }
             verify_hello(&trusted, &nonce, &public_key, &signature)?;
+            let (advertised_name, platform) = service::update_trusted_device_profile(
+                &state,
+                &app,
+                &device_id,
+                &remote_device_name,
+                &remote_platform,
+            )?;
+            trusted.device_name = advertised_name;
+            trusted.platform = platform;
             trusted
         };
         let (sender, mut outbound) = mpsc::unbounded_channel::<TrustedMessage>();
@@ -2198,7 +2227,7 @@ async fn accept_pairing(
                 initiator_nonce: nonce,
                 responder_nonce: BASE64.encode(&responder_nonce),
                 device_id: state.device_id().to_string(),
-                device_name: state.device_name().to_string(),
+                device_name: state.device_name()?,
                 platform: platform::platform_name().to_string(),
                 public_key: BASE64.encode(&state.identity().public_key_bytes()),
                 certificate: BASE64.encode(&handle.certificate_der),
@@ -2217,6 +2246,7 @@ async fn accept_pairing(
     let device = TrustedDevice {
         device_id,
         device_name,
+        local_alias: None,
         platform,
         public_key,
         certificate_der,

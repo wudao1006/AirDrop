@@ -90,13 +90,17 @@ describe("FloatingOrbManager", () => {
     render(<FloatingOrbManager client={demo} snapshot={snapshot} setPage={vi.fn()} onError={vi.fn()} adapter={adapter} />);
     await waitFor(() => expect(adapter.ensureOrb).toHaveBeenCalled());
     handlers.get(FLOATING_EVENTS.layout)?.({ requestId: "layout-1", expanded: true });
-    await waitFor(() => expect(adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.layoutState, {
+    await waitFor(() => expect(adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.layoutState, expect.objectContaining({
       requestId: "layout-1",
       expanded: true,
       success: true,
       side: "right",
       bounds: { x: 644, y: 100, width: 356, height: 420 },
-    }));
+      anchor: expect.objectContaining({ x: expect.any(Number), y: expect.any(Number) }),
+    })));
+    const payload = vi.mocked(adapter.emit).mock.calls.find(([event]) => event === FLOATING_EVENTS.layoutState)?.[1] as { anchor?: { x: number; y: number } };
+    expect(payload.anchor?.x).toBeCloseTo(320 / 356);
+    expect(payload.anchor?.y).toBeCloseTo(34 / 420);
   });
 
   it("always emits a failure ack when layout geometry is unavailable", async () => {

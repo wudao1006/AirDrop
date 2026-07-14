@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { DesktopClient } from "../../ipc/client";
 import type { AppSettings, UiSnapshot } from "../../model";
 import { Toggle } from "../../components/Toggle";
@@ -52,10 +52,42 @@ function ShortcutRecorder({ value, onSave, onError }: { value: string; onSave: (
   </button>;
 }
 
+function DeviceNameEditor({ value, onSave, onError }: {
+  value: string;
+  onSave: (deviceName: string) => Promise<void>;
+  onError: (message: string) => void;
+}) {
+  const [draft, setDraft] = useState(value);
+  const [saving, setSaving] = useState(false);
+  useEffect(() => setDraft(value), [value]);
+  const changed = draft.trim() !== value;
+  const save = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!changed || saving) return;
+    setSaving(true);
+    try {
+      await onSave(draft);
+    } catch (reason) {
+      onError(reason instanceof Error ? reason.message : "本机名称保存失败");
+    } finally {
+      setSaving(false);
+    }
+  };
+  return <form className="device-name-editor" onSubmit={save}>
+    <label className="field-label" htmlFor="local-device-name">本机对外名称</label>
+    <div className="device-name-editor-row">
+      <input id="local-device-name" className="text-field" value={draft} maxLength={48} onChange={(event) => setDraft(event.target.value)} aria-describedby="local-device-name-help" />
+      <button className="button primary" type="submit" disabled={!changed || !draft.trim() || saving}>{saving ? "保存中" : "保存名称"}</button>
+    </div>
+    <span id="local-device-name-help">此名称会广播给已连接设备；设备 ID 与密钥不会改变，也无需重新配对。</span>
+  </form>;
+}
+
 export function SettingsPage({ snapshot, client, onError }: { snapshot: UiSnapshot; client: DesktopClient; onError: (message: string) => void }) {
   const update = (settings: Partial<AppSettings>) => { void client.updateSettings(settings).catch((reason: unknown) => onError(reason instanceof Error ? reason.message : "设置保存失败")); };
   return <div className="page">
     <header className="page-header"><div><p className="page-eyebrow">本地策略</p><h1 className="page-title">设置</h1><p className="page-subtitle">支持复制的类型会按 capability 自动出现，由你决定哪些类型允许发布、订阅和预取。</p></div></header>
+    <section className="page-section device-profile-section"><h2>设备名称</h2><div className="card device-profile-card"><div className="device-profile-icon"><Icon name="devices" size={22} /></div><div className="device-profile-copy"><strong>让其他设备认出这台设备</strong><p>设置一个稳定、易辨认的名称。其他设备仍可在各自本地为你添加单向备注名。</p><DeviceNameEditor value={snapshot.localDeviceName} onSave={(deviceName) => client.setLocalDeviceName(deviceName)} onError={onError} /></div></div></section>
     <div className="grid-2">
       <section><div className="section-title"><h2>同步控制</h2></div><div className="card settings-card"><Toggle label="发布本机剪贴板槽位" description="只同步本机新复制的内容，不转发从其他设备取用的内容" checked={!snapshot.publishPaused} onChange={(checked) => void client.setPause("publish", !checked)} /><Toggle label="订阅远端设备槽位" description="实时更新设备卡片，但不会自动写入本机剪贴板" checked={!snapshot.subscribePaused} onChange={(checked) => void client.setPause("subscribe", !checked)} /></div></section>
       <section><div className="section-title"><h2>{snapshot.platform === "desktop" ? "快捷操作" : "运行模式"}</h2></div><div className="card settings-card">{snapshot.platform === "desktop" ? <div className="toggle-row"><div className="toggle-copy"><strong>唤起悬浮球</strong><span>优先打开悬浮球快捷菜单；悬浮球关闭时打开主窗口</span></div><ShortcutRecorder value={snapshot.settings.globalShortcut} onSave={(shortcut) => client.setGlobalShortcut(shortcut)} onError={onError} /></div> : <div className="toggle-row"><div className="toggle-copy"><strong>前台实时模式</strong><span>退到后台允许系统暂停，回到前台自动恢复</span></div><span className="tag">轻量模式</span></div>}</div></section>

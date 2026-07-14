@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   EXPANDED_ORB_SIZE,
+  anchorForRect,
   clampedRect,
   horizontalFractionForRect,
   resizedRect,
@@ -42,5 +43,14 @@ describe("floating geometry", () => {
     expect(clampedRect(current, workArea)).toEqual(current);
     expect(horizontalFractionForRect(current, workArea)).toBeCloseTo(360 / 928);
     expect(clampedRect({ ...current, x: 1200 }, workArea)).toEqual({ ...current, x: 1028 });
+  });
+
+  it("keeps the visual transition anchored to the original orb center", () => {
+    const anchor = anchorForRect(
+      { x: 1028, y: 100, width: 72, height: 68 },
+      { x: 744, y: 100, ...EXPANDED_ORB_SIZE },
+    );
+    expect(anchor.x).toBeCloseTo(320 / 356);
+    expect(anchor.y).toBeCloseTo(34 / 420);
   });
 });

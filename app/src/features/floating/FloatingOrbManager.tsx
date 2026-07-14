@@ -15,6 +15,7 @@ import {
 } from "./floating-events";
 import {
   COLLAPSED_ORB_SIZE,
+  anchorForRect,
   clampedRect,
   horizontalFractionForRect,
   resizedRect,
@@ -72,6 +73,7 @@ export const snapshotToFloatingState = (snapshot: UiSnapshot): FloatingOrbStateP
       revision: slot.revision,
       deviceName: slot.deviceName,
       platform: slot.platform,
+      online: slot.online,
       kind: slot.representations.find((item) => item.enabled)?.kind ?? "private",
       preview: slot.preview,
       imagePreview: snapshot.settings.previewImages ? slot.imagePreview : undefined,
@@ -168,8 +170,9 @@ export function FloatingOrbManager({ client, snapshot, setPage, onError, adapter
           const placement = readFloatingPlacement();
           const side = sideForRect(current, workArea) ?? placement.side;
           const bounds = resizedRect(current, workArea, side, expanded, { width, height });
+          const anchor = expanded ? anchorForRect(current, bounds) : undefined;
           await adapter.setOrbBounds(bounds);
-          await adapter.emit(FLOATING_EVENTS.layoutState, { requestId, expanded, success: true, side, bounds });
+          await adapter.emit(FLOATING_EVENTS.layoutState, { requestId, expanded, success: true, side, bounds, anchor });
         } catch (error) {
           const message = errorMessage(error);
           await adapter.emit(FLOATING_EVENTS.layoutState, { requestId, expanded, success: false, message });

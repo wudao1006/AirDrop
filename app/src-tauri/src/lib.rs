@@ -12,6 +12,7 @@ pub fn run() {
     let builder = tauri::Builder::default().plugin(tauri_plugin_clipboard_manager::init());
     #[cfg(desktop)]
     let builder = builder
+        .plugin(tauri_plugin_drag::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
@@ -92,6 +93,8 @@ pub fn run() {
             core::service::begin_pairing,
             core::service::confirm_pairing,
             core::service::set_device_sync_enabled,
+            core::service::set_local_device_name,
+            core::service::set_device_alias,
             core::service::revoke_device,
             core::service::create_sync_group,
             core::service::confirm_group_invite,
@@ -100,6 +103,8 @@ pub fn run() {
             core::service::update_group_policy,
             core::service::leave_sync_group,
             core::service::delete_sync_group,
+            core::service::prepare_slot_drag,
+            core::service::release_slot_drag,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build AirDrop desktop application");
