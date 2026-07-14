@@ -5,7 +5,7 @@ use super::{
 use rusqlite::{params, Connection, OptionalExtension};
 use std::{fs, path::Path, sync::Mutex};
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 #[derive(Clone, Debug)]
 pub(crate) struct TrustedDevice {
@@ -97,6 +97,11 @@ impl Store {
                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                    next_origin_sequence INTEGER NOT NULL
                  );
+                 CREATE TABLE IF NOT EXISTS remote_sequence_state (
+                   device_id TEXT PRIMARY KEY,
+                   highest_sequence INTEGER NOT NULL CHECK (highest_sequence >= 0),
+                   content_hash BLOB NOT NULL CHECK (length(content_hash) = 32)
+                 );
                  CREATE TABLE IF NOT EXISTS local_revocations (
                    device_id TEXT PRIMARY KEY,
                    revoked_at TEXT NOT NULL
@@ -162,6 +167,24 @@ impl Store {
                      ALTER TABLE clipboard_slots_v6 RENAME TO clipboard_slots;",
                 )
                 .map_err(|error| format!("无法升级剪贴板缓存授权结构：{error}"))?;
+        }
+        if !column_exists(&connection, "remote_sequence_state", "content_hash")? {
+            connection
+                .execute_batch(
+                    "BEGIN IMMEDIATE;
+                     ALTER TABLE remote_sequence_state RENAME TO remote_sequence_state_v8;
+                     CREATE TABLE remote_sequence_state (
+                       device_id TEXT PRIMARY KEY,
+                       highest_sequence INTEGER NOT NULL CHECK (highest_sequence >= 0),
+                       content_hash BLOB NOT NULL CHECK (length(content_hash) = 32)
+                     );
+                     INSERT INTO remote_sequence_state(device_id, highest_sequence, content_hash)
+                       SELECT device_id, highest_sequence, zeroblob(32)
+                       FROM remote_sequence_state_v8;
+                     DROP TABLE remote_sequence_state_v8;
+                     COMMIT;",
+                )
+                .map_err(|error| format!("无法升级远端序号正文校验结构：{error}"))?;
         }
         connection
             .pragma_update(None, "user_version", SCHEMA_VERSION)
@@ -269,6 +292,95 @@ impl Store {
             .commit()
             .map_err(|error| format!("无法提交剪贴板序号：{error}"))?;
         u64::try_from(next).map_err(|_| "剪贴板序号状态无效".to_string())
+    }
+
+    pub(crate) fn remote_sequences(
+        &self,
+    ) -> Result<std::collections::HashMap<String, u64>, String> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "本地数据库锁已损坏".to_string())?;
+        let mut statement = connection
+            .prepare("SELECT device_id, highest_sequence FROM remote_sequence_state")
+            .map_err(|error| format!("无法读取远端序号状态：{error}"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|error| format!("无法查询远端序号状态：{error}"))?;
+        let mut sequences = std::collections::HashMap::new();
+        for row in rows {
+            let (device_id, sequence) =
+                row.map_err(|error| format!("远端序号状态已损坏：{error}"))?;
+            let sequence = u64::try_from(sequence).map_err(|_| "远端序号状态无效".to_string())?;
+            sequences.insert(device_id, sequence);
+        }
+        Ok(sequences)
+    }
+
+    pub(crate) fn advance_remote_sequence(
+        &self,
+        device_id: &str,
+        sequence: u64,
+        content_hash: &[u8; 32],
+    ) -> Result<bool, String> {
+        let sequence = i64::try_from(sequence).map_err(|_| "远端序号超过存储上限".to_string())?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| "本地数据库锁已损坏".to_string())?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("无法开始远端序号事务：{error}"))?;
+        let current = transaction
+            .query_row(
+                "SELECT highest_sequence FROM remote_sequence_state WHERE device_id = ?1",
+                params![device_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| format!("无法读取远端序号：{error}"))?;
+        if current.is_some_and(|current| sequence <= current) {
+            return Ok(false);
+        }
+        transaction
+            .execute(
+                "INSERT INTO remote_sequence_state(device_id, highest_sequence, content_hash)
+                 VALUES(?1, ?2, ?3)
+                 ON CONFLICT(device_id) DO UPDATE SET
+                   highest_sequence = excluded.highest_sequence,
+                   content_hash = excluded.content_hash",
+                params![device_id, sequence, content_hash.as_slice()],
+            )
+            .map_err(|error| format!("无法保存远端序号：{error}"))?;
+        transaction
+            .commit()
+            .map_err(|error| format!("无法提交远端序号：{error}"))?;
+        Ok(true)
+    }
+
+    pub(crate) fn remote_sequence_matches(
+        &self,
+        device_id: &str,
+        sequence: u64,
+        content_hash: &[u8; 32],
+    ) -> Result<bool, String> {
+        let sequence = i64::try_from(sequence).map_err(|_| "远端序号超过存储上限".to_string())?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "本地数据库锁已损坏".to_string())?;
+        connection
+            .query_row(
+                "SELECT 1 FROM remote_sequence_state
+                 WHERE device_id = ?1 AND highest_sequence = ?2 AND content_hash = ?3",
+                params![device_id, sequence, content_hash.as_slice()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|match_| match_.is_some())
+            .map_err(|error| format!("无法校验远端序号正文：{error}"))
     }
 
     pub(crate) fn save_pending_pairing(
@@ -1326,6 +1438,32 @@ mod tests {
         assert!(!runtime.subscribe_paused);
         assert_eq!(reopened.next_origin_sequence().unwrap(), 1);
         assert_eq!(reopened.next_origin_sequence().unwrap(), 2);
+        let hash_7 = [7_u8; 32];
+        let hash_8 = [8_u8; 32];
+        assert!(reopened
+            .advance_remote_sequence("ld1_peer", 7, &hash_7)
+            .unwrap());
+        assert!(!reopened
+            .advance_remote_sequence("ld1_peer", 7, &hash_7)
+            .unwrap());
+        assert!(!reopened
+            .advance_remote_sequence("ld1_peer", 6, &hash_7)
+            .unwrap());
+        assert!(reopened
+            .advance_remote_sequence("ld1_peer", 8, &hash_8)
+            .unwrap());
+        assert!(reopened
+            .remote_sequence_matches("ld1_peer", 8, &hash_8)
+            .unwrap());
+        assert!(!reopened
+            .remote_sequence_matches("ld1_peer", 8, &hash_7)
+            .unwrap());
+        drop(reopened);
+        let reopened = Store::open(&directory).unwrap();
+        assert_eq!(
+            reopened.remote_sequences().unwrap().get("ld1_peer"),
+            Some(&8)
+        );
 
         let pending = TrustedDevice {
             device_id: "ld1_test".into(),
@@ -1374,6 +1512,33 @@ mod tests {
         assert!(reopened.trusted_device("ld1_test").unwrap().is_none());
         assert!(reopened.cached_slots(1).unwrap().is_empty());
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn migrates_remote_sequence_hash_without_losing_high_water_mark() {
+        let directory = temporary_directory();
+        std::fs::create_dir_all(&directory).unwrap();
+        let connection = Connection::open(directory.join("airdrop.sqlite3")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE remote_sequence_state (
+                   device_id TEXT PRIMARY KEY,
+                   highest_sequence INTEGER NOT NULL CHECK (highest_sequence >= 0)
+                 );
+                 INSERT INTO remote_sequence_state(device_id, highest_sequence)
+                   VALUES('ld1_peer', 7);
+                 PRAGMA user_version = 9;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = Store::open(&directory).unwrap();
+        assert_eq!(store.remote_sequences().unwrap().get("ld1_peer"), Some(&7));
+        assert!(store
+            .remote_sequence_matches("ld1_peer", 7, &[0_u8; 32])
+            .unwrap());
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]

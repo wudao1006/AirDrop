@@ -60,3 +60,40 @@ jobs:
       - run: cargo test --manifest-path app/src-tauri/Cargo.toml
       - run: cargo check --manifest-path app/src-tauri/Cargo.toml
       - run: cargo clippy --manifest-path app/src-tauri/Cargo.toml --all-targets -- -D warnings
+
+  android:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - name: Install Android SDK and NDK
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;27.2.12479018"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+      - run: npm ci
+        working-directory: app
+      - name: Build Android ARM64 debug APK
+        run: npx tauri android build --debug --target aarch64 --apk --ci
+        working-directory: app
+        env:
+          CARGO_PROFILE_DEV_DEBUG: 0
+          CARGO_PROFILE_DEV_STRIP: debuginfo
+      - uses: actions/upload-artifact@v4
+        with:
+          name: airdrop-android-arm64-debug
+          path: app/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
+          if-no-files-found: error

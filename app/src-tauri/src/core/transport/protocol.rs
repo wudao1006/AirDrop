@@ -7,6 +7,41 @@ pub(crate) const PAIR_ALPN: &[u8] = b"localdrop-pair/1";
 pub(crate) const TRUSTED_ALPN: &[u8] = b"localdrop/1";
 const MAX_FRAME: usize = 1024 * 1024;
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ClipboardCapabilities {
+    pub(crate) text: bool,
+    pub(crate) rich_text: bool,
+    pub(crate) images: bool,
+    pub(crate) files: bool,
+}
+
+impl ClipboardCapabilities {
+    pub(crate) fn local() -> Self {
+        if cfg!(target_os = "android") {
+            Self {
+                text: true,
+                rich_text: false,
+                images: false,
+                files: false,
+            }
+        } else {
+            Self::default()
+        }
+    }
+}
+
+impl Default for ClipboardCapabilities {
+    fn default() -> Self {
+        Self {
+            text: true,
+            rich_text: true,
+            images: true,
+            files: true,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum PairMessage {
@@ -59,6 +94,8 @@ pub(crate) enum TrustedMessage {
         nonce: String,
         public_key: String,
         signature: String,
+        #[serde(default)]
+        capabilities: ClipboardCapabilities,
     },
     ClipboardSlotOffer {
         schema_version: u8,
@@ -187,4 +224,31 @@ pub(crate) async fn read_frame<T: DeserializeOwned>(
         .await
         .map_err(|error| format!("协议帧读取失败：{error}"))?;
     serde_json::from_slice(&payload).map_err(|error| format!("协议帧格式无效：{error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trusted_hello_without_capabilities_keeps_desktop_compatibility() {
+        let message: TrustedMessage = serde_json::from_value(serde_json::json!({
+            "type": "hello",
+            "schema_version": 1,
+            "device_id": "ld1_peer",
+            "device_name": "Peer",
+            "platform": "windows",
+            "nonce": "nonce",
+            "public_key": "key",
+            "signature": "signature"
+        }))
+        .unwrap();
+        let TrustedMessage::Hello { capabilities, .. } = message else {
+            panic!("expected trusted hello");
+        };
+        assert!(capabilities.text);
+        assert!(capabilities.rich_text);
+        assert!(capabilities.images);
+        assert!(capabilities.files);
+    }
 }

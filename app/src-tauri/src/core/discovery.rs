@@ -1,6 +1,11 @@
 use crate::{core::service, platform};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
-use std::{collections::HashMap, net::IpAddr, thread};
+use std::{
+    collections::HashMap,
+    net::IpAddr,
+    sync::{Arc, Mutex},
+    thread,
+};
 use tauri::{AppHandle, Manager};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use uuid::Uuid;
@@ -8,7 +13,50 @@ use uuid::Uuid;
 const SERVICE_TYPE: &str = "_localdrop._udp.local.";
 pub(crate) const TRANSPORT_PORT: u16 = 43_721;
 
-pub(crate) fn start(app: AppHandle) -> Result<(), String> {
+struct DiscoverySession {
+    daemon: ServiceDaemon,
+    fullname: String,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct DiscoveryHandle {
+    session: Arc<Mutex<Option<DiscoverySession>>>,
+}
+
+impl DiscoveryHandle {
+    pub(crate) fn start(_app: AppHandle) -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn resume(&self, app: AppHandle) -> Result<(), String> {
+        let mut session = self
+            .session
+            .lock()
+            .map_err(|_| "局域网发现状态锁已损坏".to_string())?;
+        if session.is_some() {
+            return Ok(());
+        }
+        *session = Some(start_session(app)?);
+        Ok(())
+    }
+
+    pub(crate) fn suspend(&self) {
+        let session = self
+            .session
+            .lock()
+            .ok()
+            .and_then(|mut session| session.take());
+        let Some(session) = session else { return };
+        if let Err(error) = session.daemon.unregister(&session.fullname) {
+            tracing::debug!(error = %error, "mDNS service unregister deferred to shutdown");
+        }
+        if let Err(error) = session.daemon.shutdown() {
+            tracing::warn!(error = %error, "mDNS discovery shutdown failed");
+        }
+    }
+}
+
+fn start_session(app: AppHandle) -> Result<DiscoverySession, String> {
     let (device_id, device_name) = {
         let state = app.state::<service::ServiceState>();
         (
@@ -40,6 +88,7 @@ pub(crate) fn start(app: AppHandle) -> Result<(), String> {
     )
     .map_err(|error| format!("无法创建局域网服务信息：{error}"))?
     .enable_addr_auto();
+    let fullname = info.get_fullname().to_string();
     daemon
         .register(info)
         .map_err(|error| format!("无法发布局域网服务：{error}"))?;
@@ -47,8 +96,9 @@ pub(crate) fn start(app: AppHandle) -> Result<(), String> {
         .browse(SERVICE_TYPE)
         .map_err(|error| format!("无法浏览局域网设备：{error}"))?;
 
+    let worker_daemon = daemon.clone();
     thread::spawn(move || {
-        let _daemon = daemon;
+        let _daemon = worker_daemon;
         let mut resolved_instances = HashMap::<String, String>::new();
         while let Ok(event) = receiver.recv() {
             match event {
@@ -115,7 +165,7 @@ pub(crate) fn start(app: AppHandle) -> Result<(), String> {
         }
         tracing::warn!("mDNS discovery loop stopped");
     });
-    Ok(())
+    Ok(DiscoverySession { daemon, fullname })
 }
 
 fn now() -> String {

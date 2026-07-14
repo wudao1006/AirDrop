@@ -17,4 +17,18 @@ describe("SettingsPage shortcut recorder", () => {
 
     await waitFor(() => expect(save).toHaveBeenCalledWith("Ctrl+Alt+KeyX"));
   });
+
+  it("shows only text capabilities on Android", async () => {
+    const client = new DemoDesktopClient(async () => undefined, async () => "", "android");
+    const snapshot = await client.getSnapshot();
+
+    render(<SettingsPage snapshot={snapshot} client={client} onError={vi.fn()} />);
+
+    expect(screen.getByText("Android 文本同步模式")).toBeInTheDocument();
+    expect(screen.getByText("纯文本")).toBeInTheDocument();
+    expect(screen.getByText("URL")).toBeInTheDocument();
+    expect(screen.queryByText("富文本与 HTML")).not.toBeInTheDocument();
+    expect(screen.queryByText("图片")).not.toBeInTheDocument();
+    expect(screen.queryByText("文件与目录")).not.toBeInTheDocument();
+  });
 });

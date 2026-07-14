@@ -31,18 +31,11 @@ impl Identity {
             key
         };
         let device_id = device_id_for_key(&signing_key.verifying_key());
-        let device_name = gethostname::gethostname()
-            .to_string_lossy()
-            .trim()
-            .to_string();
+        let device_name = crate::platform::device_name();
         Ok(Self {
             signing_key,
             device_id,
-            device_name: if device_name.is_empty() {
-                "AirDrop Device".into()
-            } else {
-                device_name
-            },
+            device_name,
         })
     }
 

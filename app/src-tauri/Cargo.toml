@@ -1,6 +1,6 @@
 [package]
 name = "airdrop-app"
-version = "0.1.7"
+version = "0.1.8"
 description = "Local-first multi-device clipboard switcher"
 authors = ["AirDrop contributors"]
 edition = "2021"
@@ -31,9 +31,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = [] }
 tauri-plugin-clipboard-manager = "2"
-tauri-plugin-process = "2"
-tauri-plugin-single-instance = "2"
-tauri-plugin-updater = "2"
 time = { version = "0.3", features = ["formatting"] }
 sha2 = "0.10"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
@@ -47,8 +44,14 @@ url = "2"
 [target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
 clipboard-rs = { version = "0.3.5", default-features = false, features = ["image", "wayland"] }
 
+[target.'cfg(target_os = "android")'.dependencies]
+android_system_properties = "0.1"
+
 [target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))'.dependencies]
 tauri-plugin-global-shortcut = "2"
+tauri-plugin-process = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-updater = "2"
 
 [profile.release]
 panic = "abort"

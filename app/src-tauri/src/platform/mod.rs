@@ -42,6 +42,8 @@ use unsupported as current;
 #[cfg(target_os = "windows")]
 use windows as current;
 
+#[cfg(mobile)]
+pub(crate) use clipboard_monitor::ClipboardMonitorHandle;
 pub(crate) use clipboard_monitor::{read_system_clipboard, start_clipboard_monitor};
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 pub(crate) use extended_clipboard::{
@@ -82,4 +84,53 @@ pub(crate) fn clipboard_poll_interval() -> std::time::Duration {
 
 pub(crate) fn platform_name() -> &'static str {
     current::platform_name()
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn device_name() -> String {
+    current::device_name()
+}
+
+#[cfg(not(target_os = "android"))]
+pub(crate) fn device_name() -> String {
+    let name = gethostname::gethostname()
+        .to_string_lossy()
+        .trim()
+        .to_string();
+    if name.is_empty() {
+        "AirDrop Device".into()
+    } else {
+        name
+    }
+}
+
+#[cfg(mobile)]
+pub(crate) fn suspend_mobile_runtime(app: &tauri::AppHandle) {
+    use tauri::Manager;
+
+    app.state::<ClipboardMonitorHandle>().set_active(false);
+    app.state::<crate::core::discovery::DiscoveryHandle>()
+        .suspend();
+    app.state::<crate::core::transport::TransportHandle>()
+        .suspend(app.clone());
+    let state = app.state::<crate::core::service::ServiceState>();
+    let _ = crate::core::service::set_mobile_activity(&state, app, "suspended");
+}
+
+#[cfg(mobile)]
+pub(crate) fn resume_mobile_runtime(app: &tauri::AppHandle) {
+    use tauri::Manager;
+
+    let state = app.state::<crate::core::service::ServiceState>();
+    let _ = crate::core::service::set_mobile_activity(&state, app, "reconnecting");
+    app.state::<crate::core::transport::TransportHandle>()
+        .resume();
+    if let Err(error) = app
+        .state::<crate::core::discovery::DiscoveryHandle>()
+        .resume(app.clone())
+    {
+        tracing::warn!(error = %error, "LAN discovery unavailable after mobile resume");
+    }
+    app.state::<ClipboardMonitorHandle>().set_active(true);
+    let _ = crate::core::service::set_mobile_activity(&state, app, "foreground_live");
 }

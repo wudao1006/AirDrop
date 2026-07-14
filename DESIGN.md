@@ -47,6 +47,23 @@ AirDrop 是一个使用 Rust 实现的跨平台局域网设备协作工具。设
 
 本轮尚未宣称完成的 v1 项目包括：跨重启持久化远端 sequence/session_epoch、完整连接仲裁、按 GroupPolicy 执行离线 TTL、配对尝试限速、从完整证书固定迁移为可安全续签的 SPKI 固定，以及长期身份私钥优先迁移到系统凭据存储。这些仍按后续章节的目标模型继续实现。
 
+### 1.3 2026-07-14 Android 前台客户端落地记录（v0.1.8）
+
+本轮把此前只有 React 触控布局和模拟生命周期的 Android 目标推进为可编译的原生 Tauri 客户端：
+
+- 仓库纳入 `app/src-tauri/gen/android` Gradle 工程，并拆分 Android capability。单实例、Updater、全局快捷键和进程重启插件只在桌面构建，Android 不再链接明确不受支持的桌面插件。
+- Android Activity 在创建和恢复前获取非引用计数的 Wi-Fi MulticastLock，在暂停和销毁时释放；Manifest 只增加 Internet、网络状态、Wi-Fi 状态和组播状态权限，不申请辅助功能、设备管理、默认输入法或永久前台服务。
+- Rust Core 通过 Tauri 原生 `WindowEvent::Suspended/Resumed` 驱动移动端运行状态。暂停时停止剪贴板读取、注销并关闭 mDNS daemon、取消配对、关闭现有可信 QUIC 连接并拒绝后台建立的新会话；恢复时提升 runtime generation、重新开放传输、启动新的发现会话、重置剪贴板观察基线并推送完整 Snapshot。QUIC Endpoint 当前仍绑定在进程内，但后台 generation 不能通过授权检查或进入业务状态。
+- 每次移动端 suspend 以及从暂停态实际 resume 都递增 runtime generation；拨号重试、入站握手、配对和可信会话都绑定创建时的 generation。入站等待在进入握手前就固定 generation，因此后台到达、恢复后才被调度的连接也不能混入新 runtime。快速切换前后台时，旧任务不能恢复业务连接、误删新连接状态或清理新任务的连接仲裁标记。
+- Trusted Hello 增加向后兼容的 `ClipboardCapabilities`。缺失字段按旧桌面全能力解释；Android v0.1.8 只声明 text=true，richText/images/files=false。v0.1.8 发布端按对端能力过滤正文并把富文本降级为允许的纯文本；Android 接收端仍会拒绝旧客户端发送的图片和文件流。
+- Android 的本机策略强制关闭 HTML/RTF、图片、文件和私有格式，设置页只展示文本与 URL。Tauri Android clipboard-manager 当前只承担纯文本读写；前台轮询在 resume 后先建立新基线，避免把后台期间的旧剪贴板误当成新复制发布。
+- SQLite schema 提升到 9，新增 `remote_sequence_state`。远端设备 sequence 高水位现在与内容类型、采集时间、规范化同步组和正文哈希一同在接受正文前原子持久化。若进程在高水位落盘后、内存正文建立前被系统杀死，重启后只允许相同 sequence 且哈希完全一致的正文恢复重放一次；更低 sequence、同 sequence 的不同正文以及恢复成功后的再次重放仍会被拒绝。
+- Android 设备名优先读取 `ro.product.marketname`，其次使用 `ro.product.model`，不再把移动设备错误显示为 localhost。缓存凭据存储不可用时仍按既有安全降级保持仅内存缓存。
+
+已在 Linux 主机完成 JDK 17、Android SDK Platform 36、Build Tools 36、NDK 27、Rust `aarch64-linux-android` 工具链下的 ARM64 Debug APK 构建；CI 构建移除 Rust 调试符号，并使用安装时解压 native library 的兼容打包方式，把可安装 APK 从数百 MiB 的直接映射调试包压缩到约 20 MiB。APK 的 applicationId 为 `io.github.wudao1006.airdrop`，minSdk 24、targetSdk 36，权限核验只包含上述局域网所需权限和 AndroidX 自动声明的 receiver 权限。
+
+本轮没有真机，因此不宣称 Android 已完成发布验收。正式发布前仍必须以 Android 真机和 Windows/Linux 设备验证：同一 Wi-Fi mDNS 发现、双向证书配对、同步组邀请、文本/URL 双向槽位、导入回环抑制、快速切换前后台、锁屏、切换 Wi-Fi、进程强杀和重启身份保持。Android 图片、富文本、Share Intent、Content URI 文件快照、硬件支持的 Keystore 身份保护和受系统认可的后台模式仍不在本轮范围。
+
 ## 2. 目标
 
 - 支持 Windows、macOS、Linux 和 Android 之间的局域网直连；Android 第一阶段只保证应用前台期间实时同步。

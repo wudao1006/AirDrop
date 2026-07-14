@@ -18,8 +18,8 @@ use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use image::{codecs::png::PngEncoder, ExtendedColorType, ImageEncoder};
 use protocol::{
-    read_frame, write_frame, FileBlobHeader, FileResumePlan, FileTransferAck, ImageBlobHeader,
-    PairMessage, TrustedMessage, PAIR_ALPN, TRUSTED_ALPN,
+    read_frame, write_frame, ClipboardCapabilities, FileBlobHeader, FileResumePlan,
+    FileTransferAck, ImageBlobHeader, PairMessage, TrustedMessage, PAIR_ALPN, TRUSTED_ALPN,
 };
 use quinn::{crypto::rustls::QuicClientConfig, Connection, Endpoint};
 use rcgen::{CertificateParams, KeyPair};
@@ -33,7 +33,10 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager};
@@ -54,6 +57,7 @@ struct PairCommandRegistration {
 struct PeerConnection {
     sender: mpsc::UnboundedSender<TrustedMessage>,
     connection: Connection,
+    capabilities: ClipboardCapabilities,
 }
 
 #[derive(Clone)]
@@ -110,11 +114,13 @@ pub(crate) struct TransportHandle {
     endpoint: Endpoint,
     certificate_der: Vec<u8>,
     private_key_der: Vec<u8>,
+    active: Arc<AtomicBool>,
+    runtime_generation: Arc<AtomicU64>,
     pairing_allowed_until: Arc<Mutex<u64>>,
     pair_commands: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<bool>>>>,
-    pairing_connecting: Arc<Mutex<HashSet<String>>>,
+    pairing_connecting: Arc<Mutex<HashMap<String, u64>>>,
     peers: Arc<Mutex<HashMap<String, PeerConnection>>>,
-    connecting: Arc<Mutex<HashSet<String>>>,
+    connecting: Arc<Mutex<HashMap<String, u64>>>,
     latest_offer: Arc<Mutex<Option<LocalTextOffer>>>,
     latest_rich: Arc<Mutex<Option<LocalRichOffer>>>,
     latest_image: Arc<Mutex<Option<LocalImageOffer>>>,
@@ -123,9 +129,68 @@ pub(crate) struct TransportHandle {
 
 impl TransportHandle {
     pub(crate) fn allow_pairing(&self, seconds: u64) {
+        if !self.is_active() {
+            return;
+        }
         if let Ok(mut expiry) = self.pairing_allowed_until.lock() {
             *expiry = unix_seconds().saturating_add(seconds.min(120));
         }
+    }
+
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    fn runtime_generation(&self) -> u64 {
+        self.runtime_generation.load(Ordering::Acquire)
+    }
+
+    fn is_active_generation(&self, generation: u64) -> bool {
+        self.is_active() && self.runtime_generation() == generation
+    }
+
+    #[cfg(mobile)]
+    pub(crate) fn suspend(&self, _app: AppHandle) {
+        self.active.store(false, Ordering::Release);
+        self.runtime_generation.fetch_add(1, Ordering::AcqRel);
+        if let Ok(mut expiry) = self.pairing_allowed_until.lock() {
+            *expiry = 0;
+        }
+        let pairing_commands = self
+            .pair_commands
+            .lock()
+            .map(|commands| commands.values().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for command in pairing_commands {
+            let _ = command.send(false);
+        }
+        let connections = self
+            .peers
+            .lock()
+            .map(|mut peers| {
+                peers
+                    .drain()
+                    .map(|(_, peer)| peer.connection)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for connection in connections {
+            connection.close(4u32.into(), b"mobile runtime suspended");
+        }
+        if let Ok(mut connecting) = self.connecting.lock() {
+            connecting.clear();
+        }
+        if let Ok(mut connecting) = self.pairing_connecting.lock() {
+            connecting.clear();
+        }
+    }
+
+    #[cfg(mobile)]
+    pub(crate) fn resume(&self) {
+        if !self.active.load(Ordering::Acquire) {
+            self.runtime_generation.fetch_add(1, Ordering::AcqRel);
+        }
+        self.active.store(true, Ordering::Release);
     }
 
     pub(crate) fn confirm_pairing(&self, pairing_id: &str, accepted: bool) -> Result<(), String> {
@@ -147,7 +212,7 @@ impl TransportHandle {
         captured_at: String,
         targets: &HashMap<String, Vec<String>>,
     ) {
-        if text.len() > 1024 * 1024 {
+        if !self.is_active() || text.len() > 1024 * 1024 {
             return;
         }
         let offer = LocalTextOffer {
@@ -164,15 +229,17 @@ impl TransportHandle {
         self.clear_latest_files();
         if let Ok(peers) = self.peers.lock() {
             for (device_id, peer) in peers.iter() {
-                if let Some(group_ids) = targets.get(device_id) {
-                    let _ = peer.sender.send(TrustedMessage::ClipboardSlotOffer {
-                        schema_version: 1,
-                        message_id: uuid::Uuid::new_v4().simple().to_string(),
-                        origin_sequence: offer.sequence,
-                        captured_at: offer.captured_at.clone(),
-                        text: offer.text.clone(),
-                        group_ids: group_ids.clone(),
-                    });
+                if peer.capabilities.text {
+                    if let Some(group_ids) = targets.get(device_id) {
+                        let _ = peer.sender.send(TrustedMessage::ClipboardSlotOffer {
+                            schema_version: 1,
+                            message_id: uuid::Uuid::new_v4().simple().to_string(),
+                            origin_sequence: offer.sequence,
+                            captured_at: offer.captured_at.clone(),
+                            text: offer.text.clone(),
+                            group_ids: group_ids.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -195,7 +262,7 @@ impl TransportHandle {
             .len()
             .saturating_add(html.as_ref().map_or(0, String::len))
             .saturating_add(rtf.as_ref().map_or(0, String::len));
-        if (html.is_none() && rtf.is_none()) || total_size > 1024 * 1024 {
+        if !self.is_active() || (html.is_none() && rtf.is_none()) || total_size > 1024 * 1024 {
             return;
         }
         let offer = LocalRichOffer {
@@ -214,32 +281,41 @@ impl TransportHandle {
         self.clear_latest_files();
         if let Ok(peers) = self.peers.lock() {
             for (device_id, peer) in peers.iter() {
-                if let Some(group_ids) = rich_targets.get(device_id) {
-                    let mut group_ids = group_ids.clone();
-                    if let Some(text_group_ids) = text_targets.get(device_id) {
-                        group_ids.extend(text_group_ids.iter().cloned());
-                        group_ids.sort();
-                        group_ids.dedup();
+                if peer.capabilities.rich_text {
+                    if let Some(group_ids) = rich_targets.get(device_id) {
+                        let _ = peer.sender.send(TrustedMessage::RichClipboardSlotOffer {
+                            schema_version: 1,
+                            message_id: uuid::Uuid::new_v4().simple().to_string(),
+                            origin_sequence: offer.sequence,
+                            captured_at: offer.captured_at.clone(),
+                            text: offer.text.clone(),
+                            html: offer.html.clone(),
+                            rtf: offer.rtf.clone(),
+                            group_ids: group_ids.clone(),
+                        });
+                    } else if peer.capabilities.text {
+                        if let Some(group_ids) = text_targets.get(device_id) {
+                            let _ = peer.sender.send(TrustedMessage::ClipboardSlotOffer {
+                                schema_version: 1,
+                                message_id: uuid::Uuid::new_v4().simple().to_string(),
+                                origin_sequence: offer.sequence,
+                                captured_at: offer.captured_at.clone(),
+                                text: offer.text.clone(),
+                                group_ids: group_ids.clone(),
+                            });
+                        }
                     }
-                    let _ = peer.sender.send(TrustedMessage::RichClipboardSlotOffer {
-                        schema_version: 1,
-                        message_id: uuid::Uuid::new_v4().simple().to_string(),
-                        origin_sequence: offer.sequence,
-                        captured_at: offer.captured_at.clone(),
-                        text: offer.text.clone(),
-                        html: offer.html.clone(),
-                        rtf: offer.rtf.clone(),
-                        group_ids,
-                    });
-                } else if let Some(group_ids) = text_targets.get(device_id) {
-                    let _ = peer.sender.send(TrustedMessage::ClipboardSlotOffer {
-                        schema_version: 1,
-                        message_id: uuid::Uuid::new_v4().simple().to_string(),
-                        origin_sequence: offer.sequence,
-                        captured_at: offer.captured_at.clone(),
-                        text: offer.text.clone(),
-                        group_ids: group_ids.clone(),
-                    });
+                } else if peer.capabilities.text {
+                    if let Some(group_ids) = text_targets.get(device_id) {
+                        let _ = peer.sender.send(TrustedMessage::ClipboardSlotOffer {
+                            schema_version: 1,
+                            message_id: uuid::Uuid::new_v4().simple().to_string(),
+                            origin_sequence: offer.sequence,
+                            captured_at: offer.captured_at.clone(),
+                            text: offer.text.clone(),
+                            group_ids: group_ids.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -254,6 +330,9 @@ impl TransportHandle {
         captured_at: String,
         targets: &HashMap<String, Vec<String>>,
     ) {
+        if !self.is_active() {
+            return;
+        }
         let mut png = Vec::new();
         if PngEncoder::new(&mut png)
             .write_image(&rgba, width, height, ExtendedColorType::Rgba8)
@@ -287,9 +366,11 @@ impl TransportHandle {
                 peers
                     .iter()
                     .filter_map(|(device_id, peer)| {
-                        targets
-                            .get(device_id)
-                            .map(|groups| (peer.connection.clone(), groups.clone()))
+                        peer.capabilities.images.then(|| {
+                            targets
+                                .get(device_id)
+                                .map(|groups| (peer.connection.clone(), groups.clone()))
+                        })?
                     })
                     .collect::<Vec<_>>()
             })
@@ -316,6 +397,21 @@ impl TransportHandle {
         }
     }
 
+    fn remove_peer_if_current(&self, device_id: &str, connection: &Connection) -> bool {
+        let Ok(mut peers) = self.peers.lock() else {
+            return false;
+        };
+        if peers
+            .get(device_id)
+            .is_some_and(|peer| peer.connection.stable_id() == connection.stable_id())
+        {
+            peers.remove(device_id);
+            true
+        } else {
+            false
+        }
+    }
+
     pub(crate) fn broadcast_files(
         &self,
         sequence: u64,
@@ -323,6 +419,9 @@ impl TransportHandle {
         captured_at: String,
         targets: &HashMap<String, Vec<String>>,
     ) {
+        if !self.is_active() {
+            return;
+        }
         let offer = LocalFileOffer {
             transfer_id: uuid::Uuid::new_v4().simple().to_string(),
             sequence,
@@ -342,9 +441,11 @@ impl TransportHandle {
                 peers
                     .iter()
                     .filter_map(|(device_id, peer)| {
-                        targets
-                            .get(device_id)
-                            .map(|groups| (peer.connection.clone(), groups.clone()))
+                        peer.capabilities.files.then(|| {
+                            targets
+                                .get(device_id)
+                                .map(|groups| (peer.connection.clone(), groups.clone()))
+                        })?
                     })
                     .collect::<Vec<_>>()
             })
@@ -423,6 +524,9 @@ impl TransportHandle {
     }
 
     pub(crate) fn send_to(&self, device_id: &str, message: TrustedMessage) -> Result<(), String> {
+        if !self.is_active() {
+            return Err("移动端当前处于后台暂停状态".into());
+        }
         let peers = self
             .peers
             .lock()
@@ -526,28 +630,38 @@ impl TransportHandle {
         app: AppHandle,
         nearby: service::NearbyDevice,
     ) -> Result<(), String> {
+        if !self.is_active() {
+            return Err("回到前台后才能发起配对".into());
+        }
         let device_id = nearby.device_id.clone();
-        if !self
+        let generation = self.runtime_generation();
+        let mut connecting = self
             .pairing_connecting
             .lock()
-            .map_err(|_| "配对连接状态锁已损坏".to_string())?
-            .insert(device_id.clone())
-        {
+            .map_err(|_| "配对连接状态锁已损坏".to_string())?;
+        if connecting.contains_key(&device_id) {
             return Err("该设备的配对请求正在进行".into());
         }
+        connecting.insert(device_id.clone(), generation);
+        drop(connecting);
         let handle = self.clone();
         self.runtime.spawn(async move {
-            if let Err(error) = handle.connect_pairing_inner(app, nearby).await {
+            if let Err(error) = handle.connect_pairing_inner(app, nearby, generation).await {
                 tracing::warn!(error = %error, "pairing connection failed");
             }
             if let Ok(mut connecting) = handle.pairing_connecting.lock() {
-                connecting.remove(&device_id);
+                if connecting.get(&device_id) == Some(&generation) {
+                    connecting.remove(&device_id);
+                }
             }
         });
         Ok(())
     }
 
     pub(crate) fn connect_trusted(&self, app: AppHandle, nearby: service::NearbyDevice) {
+        if !self.is_active() {
+            return;
+        }
         let device_id = nearby.device_id.clone();
         let local_should_dial = {
             let state = app.state::<ServiceState>();
@@ -571,7 +685,8 @@ impl TransportHandle {
         let Ok(mut connecting) = self.connecting.lock() else {
             return;
         };
-        if !connecting.insert(device_id.clone()) {
+        let generation = self.runtime_generation();
+        if connecting.insert(device_id.clone(), generation).is_some() {
             return;
         }
         drop(connecting);
@@ -579,8 +694,14 @@ impl TransportHandle {
         self.runtime.spawn(async move {
             let mut retry_delay = 0u64;
             loop {
+                if !handle.is_active_generation(generation) {
+                    break;
+                }
                 if retry_delay > 0 {
                     tokio::time::sleep(Duration::from_secs(retry_delay)).await;
+                    if !handle.is_active_generation(generation) {
+                        break;
+                    }
                 }
                 let current = {
                     let state = app.state::<ServiceState>();
@@ -598,7 +719,10 @@ impl TransportHandle {
                 let Some(current) = current else {
                     break;
                 };
-                if let Err(error) = handle.connect_trusted_inner(app.clone(), current).await {
+                if let Err(error) = handle
+                    .connect_trusted_inner(app.clone(), current, generation)
+                    .await
+                {
                     tracing::debug!(device_id = %device_id, error = %error, retry_delay, "trusted connection unavailable");
                 }
                 retry_delay = if retry_delay == 0 {
@@ -608,7 +732,9 @@ impl TransportHandle {
                 };
             }
             if let Ok(mut connecting) = handle.connecting.lock() {
-                connecting.remove(&device_id);
+                if connecting.get(&device_id) == Some(&generation) {
+                    connecting.remove(&device_id);
+                }
             }
         });
     }
@@ -617,7 +743,11 @@ impl TransportHandle {
         &self,
         app: AppHandle,
         nearby: service::NearbyDevice,
+        generation: u64,
     ) -> Result<(), String> {
+        if !self.is_active_generation(generation) {
+            return Err("回到前台后才能发起配对".into());
+        }
         let address = preferred_address(&nearby)?;
         let config = client_config(
             None,
@@ -631,6 +761,10 @@ impl TransportHandle {
             .map_err(|error| format!("无法创建配对连接：{error}"))?
             .await
             .map_err(|error| format!("无法连接附近设备：{error}"))?;
+        if !self.is_active_generation(generation) {
+            connection.close(4u32.into(), b"mobile runtime suspended");
+            return Err("移动端当前处于后台暂停状态".into());
+        }
         let peer_certificate = peer_certificate(&connection)?;
         let (mut send, mut receive) = connection
             .open_bi()
@@ -656,6 +790,10 @@ impl TransportHandle {
         };
         write_frame(&mut send, &init).await?;
         let hello: PairMessage = read_frame(&mut receive).await?;
+        if !self.is_active_generation(generation) {
+            connection.close(4u32.into(), b"mobile runtime suspended");
+            return Err("移动端当前处于后台暂停状态".into());
+        }
         let PairMessage::Hello {
             schema_version: 1,
             pairing_id: echoed_id,
@@ -696,7 +834,7 @@ impl TransportHandle {
             &device.device_id,
         );
         self.run_pair_confirmation(
-            app, connection, send, receive, device, pairing_id, context, "outgoing",
+            app, connection, send, receive, device, pairing_id, context, "outgoing", generation,
         )
         .await
     }
@@ -705,7 +843,11 @@ impl TransportHandle {
         &self,
         app: AppHandle,
         nearby: service::NearbyDevice,
+        generation: u64,
     ) -> Result<(), String> {
+        if !self.is_active_generation(generation) {
+            return Err("移动端当前处于后台暂停状态".into());
+        }
         let trusted = {
             let state = app.state::<ServiceState>();
             state
@@ -731,7 +873,7 @@ impl TransportHandle {
             .open_bi()
             .await
             .map_err(|error| format!("无法打开可信控制流：{error}"))?;
-        self.run_trusted(app, connection, send, receive, Some(trusted))
+        self.run_trusted(app, connection, send, receive, Some(trusted), generation)
             .await
     }
 
@@ -746,7 +888,12 @@ impl TransportHandle {
         pairing_id: String,
         context: Vec<u8>,
         direction: &str,
+        generation: u64,
     ) -> Result<(), String> {
+        if !self.is_active_generation(generation) {
+            connection.close(4u32.into(), b"mobile runtime suspended");
+            return Err("移动端当前处于后台暂停状态".into());
+        }
         let mut exporter = [0u8; 32];
         connection
             .export_keying_material(&mut exporter, b"EXPORTER-localdrop-pairing-v1", &context)
@@ -765,6 +912,10 @@ impl TransportHandle {
             commands: self.pair_commands.clone(),
             pairing_id: pairing_id.clone(),
         };
+        if !self.is_active_generation(generation) {
+            connection.close(4u32.into(), b"mobile runtime suspended");
+            return Err("移动端当前处于后台暂停状态".into());
+        }
         {
             let state = app.state::<ServiceState>();
             state.save_pending_pairing(&pairing_id, &device, &expires_at)?;
@@ -888,7 +1039,12 @@ impl TransportHandle {
         mut send: quinn::SendStream,
         mut receive: quinn::RecvStream,
         expected: Option<TrustedDevice>,
+        generation: u64,
     ) -> Result<(), String> {
+        if !self.is_active_generation(generation) {
+            connection.close(4u32.into(), b"mobile runtime suspended");
+            return Err("移动端当前处于后台暂停状态".into());
+        }
         let nonce = uuid::Uuid::new_v4().simple().to_string();
         let hello = {
             let state = app.state::<ServiceState>();
@@ -901,6 +1057,7 @@ impl TransportHandle {
                 nonce,
                 public_key: BASE64.encode(&state.identity().public_key_bytes()),
                 signature: BASE64.encode(&state.identity().sign(&payload).to_bytes()),
+                capabilities: ClipboardCapabilities::local(),
             }
         };
         write_frame(&mut send, &hello).await?;
@@ -913,6 +1070,7 @@ impl TransportHandle {
             nonce,
             public_key,
             signature,
+            capabilities: remote_capabilities,
         } = remote
         else {
             return Err("可信连接缺少有效 Hello".into());
@@ -922,6 +1080,10 @@ impl TransportHandle {
             .is_some_and(|item| item.device_id != device_id)
         {
             return Err("可信连接返回了不同设备身份".into());
+        }
+        if !self.is_active_generation(generation) {
+            connection.close(4u32.into(), b"mobile runtime suspended");
+            return Err("移动端当前处于后台暂停状态".into());
         }
         let presented_certificate = peer_certificate(&connection)?;
         let trusted = {
@@ -936,53 +1098,74 @@ impl TransportHandle {
                 return Err("可信连接的 TLS 客户端证书与固定身份不一致".into());
             }
             verify_hello(&trusted, &nonce, &public_key, &signature)?;
-            service::set_trusted_online(&state, &app, &device_id, true)?;
             trusted
         };
         let (sender, mut outbound) = mpsc::unbounded_channel::<TrustedMessage>();
-        self.peers
-            .lock()
-            .map_err(|_| "可信连接表锁已损坏".to_string())?
-            .insert(
+        {
+            let mut peers = self
+                .peers
+                .lock()
+                .map_err(|_| "可信连接表锁已损坏".to_string())?;
+            if !self.is_active_generation(generation) {
+                connection.close(4u32.into(), b"mobile runtime suspended");
+                return Err("移动端当前处于后台暂停状态".into());
+            }
+            peers.insert(
                 device_id.clone(),
                 PeerConnection {
                     sender,
                     connection: connection.clone(),
+                    capabilities: remote_capabilities.clone(),
                 },
             );
+        }
+        {
+            let state = app.state::<ServiceState>();
+            service::set_trusted_online(&state, &app, &device_id, true)?;
+        }
+        if !self.is_active_generation(generation) {
+            if self.remove_peer_if_current(&device_id, &connection) {
+                let state = app.state::<ServiceState>();
+                let _ = service::set_trusted_online(&state, &app, &device_id, false);
+            }
+            connection.close(4u32.into(), b"mobile runtime suspended");
+            return Err("移动端当前处于后台暂停状态".into());
+        }
         {
             let state = app.state::<ServiceState>();
             state.replay_group_state(self, &device_id);
         }
-        if let Some(latest) = self
-            .latest_offer
-            .lock()
-            .ok()
-            .and_then(|latest| latest.clone())
-        {
-            let groups = {
-                let state = app.state::<ServiceState>();
-                state
-                    .can_publish_content(&latest.content_type)
-                    .then(|| {
-                        state
-                            .delivery_targets(&latest.content_type)
-                            .ok()
-                            .and_then(|targets| targets.get(&device_id).cloned())
-                    })
-                    .flatten()
-            };
-            if let Some(group_ids) = groups {
-                if let Ok(peers) = self.peers.lock() {
-                    if let Some(peer) = peers.get(&device_id) {
-                        let _ = peer.sender.send(TrustedMessage::ClipboardSlotOffer {
-                            schema_version: 1,
-                            message_id: uuid::Uuid::new_v4().simple().to_string(),
-                            origin_sequence: latest.sequence,
-                            captured_at: latest.captured_at,
-                            text: latest.text,
-                            group_ids,
-                        });
+        if remote_capabilities.text {
+            if let Some(latest) = self
+                .latest_offer
+                .lock()
+                .ok()
+                .and_then(|latest| latest.clone())
+            {
+                let groups = {
+                    let state = app.state::<ServiceState>();
+                    state
+                        .can_publish_content(&latest.content_type)
+                        .then(|| {
+                            state
+                                .delivery_targets(&latest.content_type)
+                                .ok()
+                                .and_then(|targets| targets.get(&device_id).cloned())
+                        })
+                        .flatten()
+                };
+                if let Some(group_ids) = groups {
+                    if let Ok(peers) = self.peers.lock() {
+                        if let Some(peer) = peers.get(&device_id) {
+                            let _ = peer.sender.send(TrustedMessage::ClipboardSlotOffer {
+                                schema_version: 1,
+                                message_id: uuid::Uuid::new_v4().simple().to_string(),
+                                origin_sequence: latest.sequence,
+                                captured_at: latest.captured_at,
+                                text: latest.text,
+                                group_ids,
+                            });
+                        }
                     }
                 }
             }
@@ -1017,91 +1200,104 @@ impl TransportHandle {
             };
             if let Ok(peers) = self.peers.lock() {
                 if let Some(peer) = peers.get(&device_id) {
-                    if let Some(group_ids) = rich_groups {
-                        let mut group_ids = group_ids;
-                        if let Some(text_group_ids) = &text_groups {
-                            group_ids.extend(text_group_ids.iter().cloned());
-                            group_ids.sort();
-                            group_ids.dedup();
+                    if remote_capabilities.rich_text {
+                        if let Some(group_ids) = rich_groups {
+                            let _ = peer.sender.send(TrustedMessage::RichClipboardSlotOffer {
+                                schema_version: 1,
+                                message_id: uuid::Uuid::new_v4().simple().to_string(),
+                                origin_sequence: latest.sequence,
+                                captured_at: latest.captured_at,
+                                text: latest.text,
+                                html: latest.html,
+                                rtf: latest.rtf,
+                                group_ids,
+                            });
+                        } else if remote_capabilities.text {
+                            if let Some(group_ids) = text_groups {
+                                let _ = peer.sender.send(TrustedMessage::ClipboardSlotOffer {
+                                    schema_version: 1,
+                                    message_id: uuid::Uuid::new_v4().simple().to_string(),
+                                    origin_sequence: latest.sequence,
+                                    captured_at: latest.captured_at,
+                                    text: latest.text,
+                                    group_ids,
+                                });
+                            }
                         }
-                        let _ = peer.sender.send(TrustedMessage::RichClipboardSlotOffer {
-                            schema_version: 1,
-                            message_id: uuid::Uuid::new_v4().simple().to_string(),
-                            origin_sequence: latest.sequence,
-                            captured_at: latest.captured_at,
-                            text: latest.text,
-                            html: latest.html,
-                            rtf: latest.rtf,
-                            group_ids,
-                        });
-                    } else if let Some(group_ids) = text_groups {
-                        let _ = peer.sender.send(TrustedMessage::ClipboardSlotOffer {
-                            schema_version: 1,
-                            message_id: uuid::Uuid::new_v4().simple().to_string(),
-                            origin_sequence: latest.sequence,
-                            captured_at: latest.captured_at,
-                            text: latest.text,
-                            group_ids,
-                        });
+                    } else if remote_capabilities.text {
+                        if let Some(group_ids) = text_groups {
+                            let _ = peer.sender.send(TrustedMessage::ClipboardSlotOffer {
+                                schema_version: 1,
+                                message_id: uuid::Uuid::new_v4().simple().to_string(),
+                                origin_sequence: latest.sequence,
+                                captured_at: latest.captured_at,
+                                text: latest.text,
+                                group_ids,
+                            });
+                        }
                     }
                 }
             }
         }
-        if let Some(image) = self
-            .latest_image
-            .lock()
-            .ok()
-            .and_then(|latest| latest.clone())
-        {
-            let connection = connection.clone();
-            let groups = {
-                let state = app.state::<ServiceState>();
-                state
-                    .can_publish_content("image")
-                    .then(|| {
-                        state
-                            .delivery_targets("image")
-                            .ok()
-                            .and_then(|targets| targets.get(&device_id).cloned())
-                    })
-                    .flatten()
-            };
-            self.runtime.spawn(async move {
-                if let Some(group_ids) = groups {
-                    if let Err(error) = send_image_blob(connection, image, group_ids).await {
-                        tracing::debug!(error = %error, "cached clipboard image send failed");
+        if remote_capabilities.images {
+            if let Some(image) = self
+                .latest_image
+                .lock()
+                .ok()
+                .and_then(|latest| latest.clone())
+            {
+                let connection = connection.clone();
+                let groups = {
+                    let state = app.state::<ServiceState>();
+                    state
+                        .can_publish_content("image")
+                        .then(|| {
+                            state
+                                .delivery_targets("image")
+                                .ok()
+                                .and_then(|targets| targets.get(&device_id).cloned())
+                        })
+                        .flatten()
+                };
+                self.runtime.spawn(async move {
+                    if let Some(group_ids) = groups {
+                        if let Err(error) = send_image_blob(connection, image, group_ids).await {
+                            tracing::debug!(error = %error, "cached clipboard image send failed");
+                        }
                     }
-                }
-            });
+                });
+            }
         }
-        if let Some(files) = self
-            .latest_files
-            .lock()
-            .ok()
-            .and_then(|latest| latest.clone())
-        {
-            let connection = connection.clone();
-            let groups = {
-                let state = app.state::<ServiceState>();
-                state
-                    .can_publish_content("files")
-                    .then(|| {
-                        state
-                            .delivery_targets("files")
-                            .ok()
-                            .and_then(|targets| targets.get(&device_id).cloned())
-                    })
-                    .flatten()
-            };
-            self.runtime.spawn(async move {
-                if let Some(group_ids) = groups {
-                    if let Err(error) =
-                        send_file_blob_with_retry(connection, files, group_ids).await
-                    {
-                        tracing::warn!(error = %error, "cached clipboard file send failed");
+        if remote_capabilities.files {
+            if let Some(files) = self
+                .latest_files
+                .lock()
+                .ok()
+                .and_then(|latest| latest.clone())
+            {
+                let connection = connection.clone();
+                let groups = {
+                    let state = app.state::<ServiceState>();
+                    state
+                        .can_publish_content("files")
+                        .then(|| {
+                            state
+                                .delivery_targets("files")
+                                .ok()
+                                .and_then(|targets| targets.get(&device_id).cloned())
+                        })
+                        .flatten()
+                };
+                self.runtime.spawn(async move {
+                    if let Some(group_ids) = groups {
+                        if let Err(error) =
+                            send_file_blob_with_retry(connection, files, group_ids).await
+                        {
+                            tracing::warn!(error = %error, "cached clipboard file send failed");
+                        }
                     }
-                }
-            });
+                });
+            }
         }
         let writer_connection = connection.clone();
         let writer = tokio::spawn(async move {
@@ -1156,19 +1352,35 @@ impl TransportHandle {
                     ..
                 }) => {
                     let state = app.state::<ServiceState>();
-                    if let Err(error) = service::receive_remote_rich(
-                        &state,
-                        &app,
-                        &trusted,
-                        service::RemoteRich {
-                            sequence: origin_sequence,
+                    let capabilities = ClipboardCapabilities::local();
+                    let result = if capabilities.rich_text {
+                        service::receive_remote_rich(
+                            &state,
+                            &app,
+                            &trusted,
+                            service::RemoteRich {
+                                sequence: origin_sequence,
+                                text,
+                                html,
+                                rtf,
+                                captured_at,
+                                group_ids,
+                            },
+                        )
+                    } else if capabilities.text {
+                        service::receive_remote_text(
+                            &state,
+                            &app,
+                            &trusted,
+                            origin_sequence,
                             text,
-                            html,
-                            rtf,
                             captured_at,
                             group_ids,
-                        },
-                    ) {
+                        )
+                    } else {
+                        Err("本机不支持接收文本剪贴板".into())
+                    };
+                    if let Err(error) = result {
                         tracing::warn!(device_id = %device_id, error = %error, "remote rich clipboard rejected");
                     }
                 }
@@ -1252,16 +1464,10 @@ impl TransportHandle {
                     writer.abort();
                     blob_reader.abort();
                     file_reader.abort();
-                    if let Ok(mut peers) = self.peers.lock() {
-                        let is_current = peers.get(&device_id).is_some_and(|peer| {
-                            peer.connection.stable_id() == connection.stable_id()
-                        });
-                        if is_current {
-                            peers.remove(&device_id);
-                        }
+                    if self.remove_peer_if_current(&device_id, &connection) {
+                        let state = app.state::<ServiceState>();
+                        let _ = service::set_trusted_online(&state, &app, &device_id, false);
                     }
-                    let state = app.state::<ServiceState>();
-                    let _ = service::set_trusted_online(&state, &app, &device_id, false);
                     connection.close(0u32.into(), b"closed");
                     return Err(error);
                 }
@@ -1440,6 +1646,9 @@ async fn receive_image_blob(
     device: &TrustedDevice,
     receive: &mut quinn::RecvStream,
 ) -> Result<(), String> {
+    if !ClipboardCapabilities::local().images {
+        return Err("本机平台不支持图片剪贴板".into());
+    }
     let header: ImageBlobHeader = read_frame(receive).await?;
     if header.schema_version != 1
         || header.png_length == 0
@@ -1491,6 +1700,9 @@ async fn receive_file_blob(
     send: &mut quinn::SendStream,
     receive: &mut quinn::RecvStream,
 ) -> Result<(), String> {
+    if !ClipboardCapabilities::local().files {
+        return Err("本机平台不支持文件剪贴板".into());
+    }
     let header: FileBlobHeader = read_frame(receive).await?;
     validate_file_header(&header)?;
     let transfer_id = uuid::Uuid::parse_str(&header.message_id)
@@ -1858,22 +2070,30 @@ pub(crate) fn start(app: AppHandle) -> Result<TransportHandle, String> {
                     endpoint: endpoint.clone(),
                     certificate_der: certificate_for_thread,
                     private_key_der,
+                    active: Arc::new(AtomicBool::new(true)),
+                    runtime_generation: Arc::new(AtomicU64::new(0)),
                     pairing_allowed_until: Arc::new(Mutex::new(0)),
                     pair_commands: Arc::new(Mutex::new(HashMap::new())),
-                    pairing_connecting: Arc::new(Mutex::new(HashSet::new())),
+                    pairing_connecting: Arc::new(Mutex::new(HashMap::new())),
                     peers: Arc::new(Mutex::new(HashMap::new())),
-                    connecting: Arc::new(Mutex::new(HashSet::new())),
+                    connecting: Arc::new(Mutex::new(HashMap::new())),
                     latest_offer: Arc::new(Mutex::new(None)),
                     latest_rich: Arc::new(Mutex::new(None)),
                     latest_image: Arc::new(Mutex::new(None)),
                     latest_files: Arc::new(Mutex::new(None)),
                 };
                 let _ = ready_tx.send(Ok(handle.clone()));
-                while let Some(incoming) = endpoint.accept().await {
+                loop {
+                    let generation = handle.runtime_generation();
+                    let Some(incoming) = endpoint.accept().await else {
+                        break;
+                    };
                     let handle = handle.clone();
                     let app = app_for_thread.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = accept_connection(handle, app, incoming).await {
+                        if let Err(error) =
+                            accept_connection(handle, app, incoming, generation).await
+                        {
                             tracing::debug!(error = %error, "incoming connection rejected");
                         }
                     });
@@ -1890,10 +2110,18 @@ async fn accept_connection(
     handle: TransportHandle,
     app: AppHandle,
     incoming: quinn::Incoming,
+    generation: u64,
 ) -> Result<(), String> {
+    if !handle.is_active_generation(generation) {
+        return Err("移动端当前处于后台暂停状态".into());
+    }
     let connection = incoming
         .await
         .map_err(|error| format!("QUIC 握手失败：{error}"))?;
+    if !handle.is_active_generation(generation) {
+        connection.close(4u32.into(), b"mobile runtime suspended");
+        return Err("移动端当前处于后台暂停状态".into());
+    }
     let handshake = connection
         .handshake_data()
         .ok_or_else(|| "缺少 TLS 握手信息".to_string())?
@@ -1912,14 +2140,14 @@ async fn accept_connection(
             connection.close(1u32.into(), b"pairing window closed");
             return Err("当前未开放配对窗口".into());
         }
-        accept_pairing(handle, app, connection).await
+        accept_pairing(handle, app, connection, generation).await
     } else if alpn == Some(TRUSTED_ALPN) {
         let (send, receive) = connection
             .accept_bi()
             .await
             .map_err(|error| format!("无法接受可信控制流：{error}"))?;
         handle
-            .run_trusted(app, connection, send, receive, None)
+            .run_trusted(app, connection, send, receive, None, generation)
             .await
     } else {
         connection.close(2u32.into(), b"unsupported alpn");
@@ -1931,6 +2159,7 @@ async fn accept_pairing(
     handle: TransportHandle,
     app: AppHandle,
     connection: Connection,
+    generation: u64,
 ) -> Result<(), String> {
     let (mut send, mut receive) = connection
         .accept_bi()
@@ -1996,7 +2225,7 @@ async fn accept_pairing(
     };
     handle
         .run_pair_confirmation(
-            app, connection, send, receive, device, pairing_id, context, "incoming",
+            app, connection, send, receive, device, pairing_id, context, "incoming", generation,
         )
         .await
 }

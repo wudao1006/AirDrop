@@ -1,17 +1,25 @@
 mod core;
 mod platform;
 
-use tauri::{Emitter, Manager};
+#[cfg(desktop)]
+use tauri::Emitter;
+use tauri::Manager;
 #[cfg(desktop)]
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default()
-        .plugin(tauri_plugin_clipboard_manager::init())
-        .plugin(tauri_plugin_process::init());
+    let builder = tauri::Builder::default().plugin(tauri_plugin_clipboard_manager::init());
     #[cfg(desktop)]
     let builder = builder
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
@@ -34,13 +42,6 @@ pub fn run() {
                 .build(),
         );
     let app = builder
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.unminimize();
-                let _ = window.set_focus();
-            }
-        }))
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             let log_guard = core::logging::initialize(&data_dir).map_err(std::io::Error::other)?;
@@ -66,10 +67,13 @@ pub fn run() {
                 core::transport::start(app.handle().clone()).map_err(std::io::Error::other)?;
             app.manage(transport);
             tracing::info!(data_dir = %data_dir.display(), "AirDrop core started");
-            platform::start_clipboard_monitor(app.handle().clone());
-            if let Err(error) = core::discovery::start(app.handle().clone()) {
+            let clipboard_monitor = platform::start_clipboard_monitor(app.handle().clone());
+            app.manage(clipboard_monitor);
+            let discovery = core::discovery::DiscoveryHandle::start(app.handle().clone());
+            if let Err(error) = discovery.resume(app.handle().clone()) {
                 tracing::warn!(error = %error, "LAN discovery unavailable");
             }
+            app.manage(discovery);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -101,9 +105,33 @@ pub fn run() {
         .expect("failed to build AirDrop desktop application");
 
     app.run(|app_handle, event| {
-        if let tauri::RunEvent::WindowEvent { label, event, .. } = event {
-            if label == "main" && matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+        if matches!(&event, tauri::RunEvent::Exit) {
+            app_handle
+                .state::<core::discovery::DiscoveryHandle>()
+                .suspend();
+        }
+        if let tauri::RunEvent::WindowEvent {
+            label: window_label,
+            event,
+            ..
+        } = event
+        {
+            #[cfg(desktop)]
+            if window_label == "main" && matches!(event, tauri::WindowEvent::CloseRequested { .. })
+            {
                 app_handle.exit(0);
+            }
+            #[cfg(mobile)]
+            let _ = window_label;
+            #[cfg(mobile)]
+            match event {
+                tauri::WindowEvent::Suspended => {
+                    platform::suspend_mobile_runtime(app_handle);
+                }
+                tauri::WindowEvent::Resumed => {
+                    platform::resume_mobile_runtime(app_handle);
+                }
+                _ => {}
             }
         }
     });

@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -27,6 +27,7 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
 const SNAPSHOT_EVENT: &str = "airdrop://snapshot";
+const ANDROID_CLIPBOARD_LIMITATION: &str = "Android 首版仅支持前台纯文本和 URL 剪贴板";
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -354,20 +355,32 @@ impl UiSnapshot {
         runtime: Option<StoredRuntime>,
         trusted_devices: Vec<TrustedDevice>,
     ) -> Self {
+        let mut settings = settings;
+        if cfg!(target_os = "android") {
+            settings.allow_html = false;
+            settings.allow_images = false;
+            settings.allow_files = false;
+            settings.allow_private = false;
+        }
         let runtime = runtime.unwrap_or(StoredRuntime {
             publish_paused: false,
             subscribe_paused: false,
         });
         Self {
             revision: 1,
-            platform: "desktop".into(),
+            platform: if cfg!(target_os = "android") {
+                "android".into()
+            } else {
+                "desktop".into()
+            },
             activity: "foreground_live".into(),
             last_synchronized_at: "1970-01-01T00:00:00.000Z".into(),
             clipboard_capability: ClipboardCapability {
                 can_read_text: true,
                 can_write_text: true,
                 foreground_capture: true,
-                limitation: None,
+                limitation: cfg!(target_os = "android")
+                    .then(|| ANDROID_CLIPBOARD_LIMITATION.into()),
             },
             demo_mode: false,
             daemon_connected: true,
@@ -416,6 +429,7 @@ pub struct ServiceState {
     identity: Identity,
     remote_bodies: Mutex<HashMap<String, RemoteClipboardBody>>,
     incoming_sequences: Mutex<HashMap<String, u64>>,
+    recoverable_sequences: Mutex<HashSet<String>>,
     suppress_next_capture: Mutex<Option<String>>,
     suppress_next_rich: Mutex<Option<[u8; 32]>>,
     suppress_next_image: Mutex<Option<[u8; 32]>>,
@@ -533,10 +547,22 @@ impl ServiceState {
                 }
             }
         }
-        let incoming_sequences = snapshot
-            .slots
+        let mut incoming_sequences = store.remote_sequences()?;
+        for slot in &snapshot.slots {
+            incoming_sequences
+                .entry(slot.device_id.clone())
+                .and_modify(|sequence| *sequence = (*sequence).max(slot.sequence))
+                .or_insert(slot.sequence);
+        }
+        let recoverable_sequences = incoming_sequences
             .iter()
-            .map(|slot| (slot.device_id.clone(), slot.sequence))
+            .filter(|(device_id, sequence)| {
+                !snapshot
+                    .slots
+                    .iter()
+                    .any(|slot| slot.device_id == **device_id && slot.sequence == **sequence)
+            })
+            .map(|(device_id, _)| device_id.clone())
             .collect();
         Ok(Self {
             snapshot: Mutex::new(snapshot),
@@ -544,6 +570,7 @@ impl ServiceState {
             identity,
             remote_bodies: Mutex::new(remote_bodies),
             incoming_sequences: Mutex::new(incoming_sequences),
+            recoverable_sequences: Mutex::new(recoverable_sequences),
             suppress_next_capture: Mutex::new(None),
             suppress_next_rich: Mutex::new(None),
             suppress_next_image: Mutex::new(None),
@@ -563,6 +590,7 @@ impl ServiceState {
         self.identity.device_name()
     }
 
+    #[cfg(desktop)]
     pub(crate) fn configured_global_shortcut(&self) -> Result<String, String> {
         self.snapshot
             .lock()
@@ -746,11 +774,16 @@ impl ServiceState {
             .incoming_sequences
             .lock()
             .map_err(|_| "远端剪贴板序号锁已损坏".to_string())?;
-        if sequences
-            .get(origin_device_id)
-            .is_some_and(|current| sequence <= *current)
-        {
-            return Err("远端剪贴板数据流已经过期".into());
+        if let Some(current) = sequences.get(origin_device_id) {
+            let recoverable = sequence == *current
+                && self
+                    .recoverable_sequences
+                    .lock()
+                    .map_err(|_| "远端剪贴板恢复状态锁已损坏".to_string())?
+                    .contains(origin_device_id);
+            if sequence < *current || (sequence == *current && !recoverable) {
+                return Err("远端剪贴板数据流已经过期".into());
+            }
         }
         Ok(())
     }
@@ -759,18 +792,44 @@ impl ServiceState {
         &self,
         origin_device_id: &str,
         sequence: u64,
+        content_hash: &[u8; 32],
     ) -> Result<bool, String> {
         let mut sequences = self
             .incoming_sequences
             .lock()
             .map_err(|_| "远端剪贴板序号锁已损坏".to_string())?;
-        if sequences
-            .get(origin_device_id)
-            .is_some_and(|current| sequence <= *current)
+        if let Some(current) = sequences.get(origin_device_id).copied() {
+            if sequence < current {
+                return Ok(false);
+            }
+            if sequence == current {
+                let mut recoverable = self
+                    .recoverable_sequences
+                    .lock()
+                    .map_err(|_| "远端剪贴板恢复状态锁已损坏".to_string())?;
+                if !recoverable.contains(origin_device_id)
+                    || !self.store.remote_sequence_matches(
+                        origin_device_id,
+                        sequence,
+                        content_hash,
+                    )?
+                {
+                    return Ok(false);
+                }
+                recoverable.remove(origin_device_id);
+                return Ok(true);
+            }
+        }
+        if !self
+            .store
+            .advance_remote_sequence(origin_device_id, sequence, content_hash)?
         {
             return Ok(false);
         }
         sequences.insert(origin_device_id.to_string(), sequence);
+        if let Ok(mut recoverable) = self.recoverable_sequences.lock() {
+            recoverable.remove(origin_device_id);
+        }
         Ok(true)
     }
 
@@ -1349,6 +1408,31 @@ pub(crate) fn rich_hash(text: &str, html: Option<&str>, rtf: Option<&str>) -> [u
     hash.finalize().into()
 }
 
+fn incoming_content_hash(
+    kind: &str,
+    captured_at: &str,
+    group_ids: &[String],
+    body_hash: &[u8; 32],
+) -> [u8; 32] {
+    let mut normalized_group_ids = group_ids.to_vec();
+    normalized_group_ids.sort();
+    normalized_group_ids.dedup();
+
+    let mut hash = Sha256::new();
+    hash.update(b"localdrop-incoming-clipboard-v1\0");
+    hash.update((kind.len() as u64).to_be_bytes());
+    hash.update(kind.as_bytes());
+    hash.update((captured_at.len() as u64).to_be_bytes());
+    hash.update(captured_at.as_bytes());
+    hash.update((normalized_group_ids.len() as u64).to_be_bytes());
+    for group_id in normalized_group_ids {
+        hash.update((group_id.len() as u64).to_be_bytes());
+        hash.update(group_id.as_bytes());
+    }
+    hash.update(body_hash);
+    hash.finalize().into()
+}
+
 pub(crate) fn file_list_hash(files: &[String]) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(b"localdrop-file-list-v1\0");
@@ -1473,7 +1557,8 @@ pub fn capture_local_clipboard(
         snapshot.last_synchronized_at = now.clone();
         snapshot.clipboard_capability.can_read_text = true;
         snapshot.clipboard_capability.foreground_capture = true;
-        snapshot.clipboard_capability.limitation = None;
+        snapshot.clipboard_capability.limitation =
+            cfg!(target_os = "android").then(|| ANDROID_CLIPBOARD_LIMITATION.into());
         Ok(())
     })?;
     let allowed = if content_type == "url" {
@@ -1927,7 +2012,9 @@ pub(crate) fn receive_remote_text(
         }
         snapshot.settings.preview_text
     };
-    if !state.accept_incoming_sequence(&device.device_id, sequence)? {
+    let body_hash: [u8; 32] = Sha256::digest(text.as_bytes()).into();
+    let content_hash = incoming_content_hash("text", &captured_at, &group_ids, &body_hash);
+    if !state.accept_incoming_sequence(&device.device_id, sequence, &content_hash)? {
         return Ok(());
     }
     let slot_id = format!("device:{}", device.device_id);
@@ -2049,7 +2136,10 @@ pub(crate) fn receive_remote_rich(
         }
         snapshot.settings.preview_text
     };
-    if !state.accept_incoming_sequence(&device.device_id, rich.sequence)? {
+    let body_hash = rich_hash(&rich.text, rich.html.as_deref(), rich.rtf.as_deref());
+    let content_hash =
+        incoming_content_hash("rich", &rich.captured_at, &rich.group_ids, &body_hash);
+    if !state.accept_incoming_sequence(&device.device_id, rich.sequence, &content_hash)? {
         return Ok(());
     }
     let slot_id = format!("device:{}", device.device_id);
@@ -2122,7 +2212,10 @@ pub(crate) fn receive_remote_files(
         }
         snapshot.settings.preview_file_names
     };
-    if !state.accept_incoming_sequence(&device.device_id, files.sequence)? {
+    let body_hash = files.bundle.content_hash();
+    let content_hash =
+        incoming_content_hash("files", &files.captured_at, &files.group_ids, &body_hash);
+    if !state.accept_incoming_sequence(&device.device_id, files.sequence, &content_hash)? {
         return Ok(());
     }
     let slot_id = format!("device:{}", device.device_id);
@@ -2201,7 +2294,10 @@ pub(crate) fn receive_remote_image(
         }
         snapshot.settings.preview_images
     };
-    if !state.accept_incoming_sequence(&device.device_id, image.sequence)? {
+    let body_hash = image_hash(&image.rgba, image.width, image.height);
+    let content_hash =
+        incoming_content_hash("image", &image.captured_at, &image.group_ids, &body_hash);
+    if !state.accept_incoming_sequence(&device.device_id, image.sequence, &content_hash)? {
         return Ok(());
     }
     let slot_id = format!("device:{}", device.device_id);
@@ -3196,7 +3292,8 @@ pub fn get_snapshot(
         .snapshot
         .lock()
         .map_err(|_| "Rust 服务状态锁已损坏".to_string())?;
-    snapshot.platform = if platform == "android" {
+    let _ = platform;
+    snapshot.platform = if cfg!(target_os = "android") {
         "android".into()
     } else {
         "desktop".into()
@@ -3257,6 +3354,9 @@ pub fn set_app_activity(
     activity: String,
     now: String,
 ) -> Result<(), String> {
+    if cfg!(target_os = "android") {
+        return Ok(());
+    }
     update(&state, &app, |snapshot| {
         if snapshot.platform != "android" {
             return Ok(());
@@ -3269,6 +3369,33 @@ pub fn set_app_activity(
         .into();
         if activity == "foreground" {
             snapshot.last_synchronized_at = now;
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+#[cfg(mobile)]
+pub(crate) fn set_mobile_activity(
+    state: &ServiceState,
+    app: &AppHandle,
+    activity: &str,
+) -> Result<(), String> {
+    if !matches!(activity, "foreground_live" | "reconnecting" | "suspended") {
+        return Err("未知移动端运行状态".into());
+    }
+    update(state, app, |snapshot| {
+        snapshot.platform = "android".into();
+        snapshot.activity = activity.into();
+        if activity == "suspended" {
+            for device in &mut snapshot.trusted_devices {
+                device.online = false;
+            }
+            for slot in &mut snapshot.slots {
+                slot.online = false;
+            }
+        } else if activity == "foreground_live" {
+            snapshot.last_synchronized_at = current_time();
         }
         Ok(())
     })?;
@@ -3351,6 +3478,12 @@ pub fn update_settings(
         }
         snapshot.settings =
             serde_json::from_value(current).map_err(|error| format!("设置值无效：{error}"))?;
+        if cfg!(target_os = "android") {
+            snapshot.settings.allow_html = false;
+            snapshot.settings.allow_images = false;
+            snapshot.settings.allow_files = false;
+            snapshot.settings.allow_private = false;
+        }
         if !snapshot.settings.allow_text {
             snapshot.slots.retain(|slot| {
                 let has_text = slot
@@ -3491,7 +3624,7 @@ pub fn set_global_shortcut(
     #[cfg(not(desktop))]
     {
         let _ = (state, app, shortcut);
-        return Err("移动端不支持桌面全局快捷键".into());
+        Err("移动端不支持桌面全局快捷键".into())
     }
     #[cfg(desktop)]
     {
@@ -3849,11 +3982,35 @@ mod tests {
             "airdrop-sequence-test-{}",
             uuid::Uuid::new_v4().simple()
         ));
+        let hash_7 = [7_u8; 32];
+        let changed_hash_7 = [17_u8; 32];
+        let hash_8 = [8_u8; 32];
         let state = ServiceState::open(&directory).unwrap();
-        assert!(state.accept_incoming_sequence("ld1_peer", 7).unwrap());
-        assert!(!state.accept_incoming_sequence("ld1_peer", 7).unwrap());
-        assert!(!state.accept_incoming_sequence("ld1_peer", 6).unwrap());
-        assert!(state.accept_incoming_sequence("ld1_peer", 8).unwrap());
+        assert!(state
+            .accept_incoming_sequence("ld1_peer", 7, &hash_7)
+            .unwrap());
+        assert!(!state
+            .accept_incoming_sequence("ld1_peer", 7, &hash_7)
+            .unwrap());
+        drop(state);
+
+        let state = ServiceState::open(&directory).unwrap();
+        assert!(!state
+            .accept_incoming_sequence("ld1_peer", 7, &changed_hash_7)
+            .unwrap());
+        assert!(state
+            .accept_incoming_sequence("ld1_peer", 7, &hash_7)
+            .unwrap());
+        assert!(!state
+            .accept_incoming_sequence("ld1_peer", 7, &hash_7)
+            .unwrap());
+        assert!(!state
+            .accept_incoming_sequence("ld1_peer", 6, &hash_7)
+            .unwrap());
+        assert!(state
+            .accept_incoming_sequence("ld1_peer", 8, &hash_8)
+            .unwrap());
+        drop(state);
         let _ = fs::remove_dir_all(directory);
     }
 

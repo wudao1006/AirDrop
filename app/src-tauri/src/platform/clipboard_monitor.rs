@@ -1,5 +1,11 @@
 use crate::{core::service, platform};
-use std::thread;
+use std::{
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
+    thread,
+};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -31,7 +37,27 @@ pub(crate) fn read_system_clipboard(
     }
 }
 
-pub(crate) fn start_clipboard_monitor(app: AppHandle) {
+#[derive(Clone)]
+pub(crate) struct ClipboardMonitorHandle {
+    active: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
+}
+
+impl ClipboardMonitorHandle {
+    #[cfg(mobile)]
+    pub(crate) fn set_active(&self, active: bool) {
+        if self.active.swap(active, Ordering::AcqRel) != active {
+            self.generation.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+}
+
+pub(crate) fn start_clipboard_monitor(app: AppHandle) -> ClipboardMonitorHandle {
+    let handle = ClipboardMonitorHandle {
+        active: Arc::new(AtomicBool::new(true)),
+        generation: Arc::new(AtomicU64::new(0)),
+    };
+    let worker = handle.clone();
     thread::spawn(move || {
         let mut previous_text = None::<String>;
         let mut previous_image = None::<[u8; 32]>;
@@ -40,16 +66,31 @@ pub(crate) fn start_clipboard_monitor(app: AppHandle) {
         let extended_clipboard = match platform::ExtendedClipboard::new() {
             Ok(clipboard) => Some(clipboard),
             Err(error) => {
-                let state = app.state::<service::ServiceState>();
-                let _ = service::report_clipboard_limitation(&state, &app, error);
+                if !cfg!(target_os = "android") {
+                    let state = app.state::<service::ServiceState>();
+                    let _ = service::report_clipboard_limitation(&state, &app, error);
+                }
                 None
             }
         };
         let mut initialized = false;
+        let mut observed_generation = worker.generation.load(Ordering::Acquire);
         let mut consecutive_failures = 0_u8;
         let mut failure_reported = false;
         loop {
             thread::sleep(platform::clipboard_poll_interval());
+            if !worker.active.load(Ordering::Acquire) {
+                continue;
+            }
+            let generation = worker.generation.load(Ordering::Acquire);
+            if generation != observed_generation {
+                observed_generation = generation;
+                initialized = false;
+                previous_text = None;
+                previous_image = None;
+                previous_rich = None;
+                previous_files = None;
+            }
             let content_result = extended_clipboard.as_ref().map_or_else(
                 || read_basic_clipboard(&app),
                 |clipboard| {
@@ -164,4 +205,5 @@ pub(crate) fn start_clipboard_monitor(app: AppHandle) {
                 (!current_files.is_empty()).then(|| service::file_list_hash(&current_files));
         }
     });
+    handle
 }

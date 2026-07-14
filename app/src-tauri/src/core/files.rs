@@ -71,6 +71,20 @@ impl ReceivedFileBundle {
             })
             .collect()
     }
+
+    pub(crate) fn content_hash(&self) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash.update(b"localdrop-file-bundle-v1\0");
+        for entry in &self.entries {
+            hash.update((entry.relative_path.len() as u64).to_be_bytes());
+            hash.update(entry.relative_path.as_bytes());
+            hash.update(entry.size.to_be_bytes());
+            hash.update([u8::from(entry.is_directory)]);
+            hash.update((entry.sha256.len() as u64).to_be_bytes());
+            hash.update(entry.sha256.as_bytes());
+        }
+        hash.finalize().into()
+    }
 }
 
 impl Drop for ReceivedFileBundle {
