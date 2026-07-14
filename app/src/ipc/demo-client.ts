@@ -184,6 +184,7 @@ export class DemoDesktopClient implements DesktopClient {
     const operation: ImportOperation = {
       id: importId,
       slotId,
+      revision,
       deviceName: slot.deviceName,
       sourceSummary: `${slot.deviceName} · ${slot.groups.join(" + ")} · #${slot.sequence}`,
       status: immediate ? "awaiting_confirmation" : "fetching",

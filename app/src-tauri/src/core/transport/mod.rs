@@ -26,7 +26,8 @@ use rcgen::{CertificateParams, KeyPair};
 use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime},
-    DigitallySignedStruct, SignatureScheme,
+    server::danger::{ClientCertVerified, ClientCertVerifier},
+    DigitallySignedStruct, DistinguishedName, SignatureScheme,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -108,6 +109,7 @@ pub(crate) struct TransportHandle {
     runtime: tokio::runtime::Handle,
     endpoint: Endpoint,
     certificate_der: Vec<u8>,
+    private_key_der: Vec<u8>,
     pairing_allowed_until: Arc<Mutex<u64>>,
     pair_commands: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<bool>>>>,
     pairing_connecting: Arc<Mutex<HashSet<String>>>,
@@ -617,7 +619,12 @@ impl TransportHandle {
         nearby: service::NearbyDevice,
     ) -> Result<(), String> {
         let address = preferred_address(&nearby)?;
-        let config = client_config(None, PAIR_ALPN)?;
+        let config = client_config(
+            None,
+            PAIR_ALPN,
+            self.certificate_der.clone(),
+            self.private_key_der.clone(),
+        )?;
         let connection = self
             .endpoint
             .connect_with(config, address, "localdrop")
@@ -708,7 +715,12 @@ impl TransportHandle {
         if !trusted.sync_enabled {
             return Err("该设备的剪贴板同步已停用".into());
         }
-        let config = client_config(Some(trusted.certificate_der.clone()), TRUSTED_ALPN)?;
+        let config = client_config(
+            Some(trusted.certificate_der.clone()),
+            TRUSTED_ALPN,
+            self.certificate_der.clone(),
+            self.private_key_der.clone(),
+        )?;
         let connection = self
             .endpoint
             .connect_with(config, preferred_address(&nearby)?, "localdrop")
@@ -773,7 +785,8 @@ impl TransportHandle {
         }
         let mut local_confirmed = false;
         let mut remote_confirmed = false;
-        let mut pairing_finalized = false;
+        let mut local_complete_sent = false;
+        let mut remote_completed = false;
         let result: Result<(), String> = async {
             loop {
                 tokio::select! {
@@ -797,7 +810,6 @@ impl TransportHandle {
                     }
                     message = read_frame::<PairMessage>(&mut receive) => {
                         match message {
-                            Err(_) if pairing_finalized => return Ok(()),
                             Err(error) => return Err(error),
                             Ok(message) => match message {
                             PairMessage::Confirm { schema_version: 1, pairing_id: remote_id, context_hash: remote_hash, accepted }
@@ -810,18 +822,41 @@ impl TransportHandle {
                                     }
                             }
                             PairMessage::Complete { schema_version: 1, pairing_id: remote_id }
-                                if remote_id == pairing_id && pairing_finalized => return Ok(()),
+                                if remote_id == pairing_id && local_confirmed && remote_confirmed => {
+                                    remote_completed = true;
+                            }
                             PairMessage::Abort { reason, .. } => return Err(reason),
                             _ => return Err("配对确认消息无效".into()),
                             }
                         }
                     }
-                    _ = tokio::time::sleep(Duration::from_secs(if pairing_finalized { 3 } else { 120 })) => {
-                        if pairing_finalized { return Ok(()); }
-                        return Err("配对确认已超时".into());
+                    _ = tokio::time::sleep(Duration::from_secs(if local_complete_sent { 10 } else { 120 })) => {
+                        return Err(if local_complete_sent {
+                            "未收到对端配对完成确认".into()
+                        } else {
+                            "配对确认已超时".into()
+                        });
                     },
                 }
-                if local_confirmed && remote_confirmed && !pairing_finalized {
+                if local_confirmed && remote_confirmed && !local_complete_sent {
+                    write_frame(
+                        &mut send,
+                        &PairMessage::Complete {
+                            schema_version: 1,
+                            pairing_id: pairing_id.clone(),
+                        },
+                    )
+                    .await?;
+                    local_complete_sent = true;
+                    let state = app.state::<ServiceState>();
+                    let _ = service::pairing_status(
+                        &state,
+                        &app,
+                        &pairing_id,
+                        "waiting_for_peer_complete",
+                    );
+                }
+                if local_complete_sent && remote_completed {
                     let paired_at = now();
                     let nearby = {
                         let state = app.state::<ServiceState>();
@@ -829,19 +864,11 @@ impl TransportHandle {
                         service::pairing_completed(&state, &app, &pairing_id, promoted)?;
                         state.nearby_device(&device.device_id)
                     };
-                    pairing_finalized = true;
-                    let _ = write_frame(
-                        &mut send,
-                        &PairMessage::Complete {
-                            schema_version: 1,
-                            pairing_id: pairing_id.clone(),
-                        },
-                    )
-                    .await;
                     let _ = send.finish();
                     if let Some(nearby) = nearby {
                         self.connect_trusted(app.clone(), nearby);
                     }
+                    return Ok(());
                 }
             }
         }
@@ -896,6 +923,7 @@ impl TransportHandle {
         {
             return Err("可信连接返回了不同设备身份".into());
         }
+        let presented_certificate = peer_certificate(&connection)?;
         let trusted = {
             let state = app.state::<ServiceState>();
             let trusted = state
@@ -903,6 +931,9 @@ impl TransportHandle {
                 .ok_or_else(|| "对端身份不在可信设备中".to_string())?;
             if !trusted.sync_enabled {
                 return Err("该设备的剪贴板同步已停用".into());
+            }
+            if trusted.certificate_der != presented_certificate {
+                return Err("可信连接的 TLS 客户端证书与固定身份不一致".into());
             }
             verify_hello(&trusted, &nonce, &public_key, &signature)?;
             service::set_trusted_online(&state, &app, &device_id, true)?;
@@ -1782,18 +1813,16 @@ async fn write_private_file(path: &std::path::Path, contents: &[u8]) -> Result<(
 }
 
 pub(crate) fn start(app: AppHandle) -> Result<TransportHandle, String> {
-    let (certificate_der, private_key) = {
+    let (certificate_der, private_key_der) = {
         let state = app.state::<ServiceState>();
-        let key_pair = KeyPair::try_from(state.identity().pkcs8_der())
+        let private_key_der = state.identity().pkcs8_der();
+        let key_pair = KeyPair::try_from(private_key_der.clone())
             .map_err(|error| format!("无法载入 TLS 身份密钥：{error}"))?;
         let certificate = CertificateParams::new(vec![state.device_id().to_string()])
             .map_err(|error| format!("无法创建 TLS 证书参数：{error}"))?
             .self_signed(&key_pair)
             .map_err(|error| format!("无法签发 TLS 证书：{error}"))?;
-        (
-            certificate.der().to_vec(),
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der())),
-        )
+        (certificate.der().to_vec(), private_key_der)
     };
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     let app_for_thread = app.clone();
@@ -1813,7 +1842,10 @@ pub(crate) fn start(app: AppHandle) -> Result<TransportHandle, String> {
                 }
             };
             runtime.block_on(async move {
-                let result = create_endpoint(certificate_for_thread.clone(), private_key);
+                let result = create_endpoint(
+                    certificate_for_thread.clone(),
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(private_key_der.clone())),
+                );
                 let endpoint = match result {
                     Ok(endpoint) => endpoint,
                     Err(error) => {
@@ -1825,6 +1857,7 @@ pub(crate) fn start(app: AppHandle) -> Result<TransportHandle, String> {
                     runtime: tokio::runtime::Handle::current(),
                     endpoint: endpoint.clone(),
                     certificate_der: certificate_for_thread,
+                    private_key_der,
                     pairing_allowed_until: Arc::new(Mutex::new(0)),
                     pair_commands: Arc::new(Mutex::new(HashMap::new())),
                     pairing_connecting: Arc::new(Mutex::new(HashSet::new())),
@@ -1923,6 +1956,9 @@ async fn accept_pairing(
     }
     let public_key = validate_identity(&device_id, &public_key)?;
     let certificate_der = decode(&certificate, "设备证书")?;
+    if certificate_der != peer_certificate(&connection)? {
+        return Err("配对身份与 TLS 客户端证书不一致".into());
+    }
     let responder_nonce = random_bytes(32);
     let (hello, local_device_id) = {
         let state = app.state::<ServiceState>();
@@ -1985,7 +2021,7 @@ fn server_config(
     let mut crypto = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|error| format!("无法限定 TLS 1.3：{error}"))?
-        .with_no_client_auth()
+        .with_client_cert_verifier(Arc::new(AnyEd25519ClientCertificate::new()))
         .with_single_cert(vec![CertificateDer::from(certificate_der)], private_key)
         .map_err(|error| format!("无法配置 TLS 证书：{error}"))?;
     crypto.alpn_protocols = vec![TRUSTED_ALPN.to_vec(), PAIR_ALPN.to_vec()];
@@ -1998,6 +2034,8 @@ fn server_config(
 fn client_config(
     expected_certificate: Option<Vec<u8>>,
     alpn: &[u8],
+    certificate_der: Vec<u8>,
+    private_key_der: Vec<u8>,
 ) -> Result<quinn::ClientConfig, String> {
     let verifier = Arc::new(PinnedCertificateVerifier::new(expected_certificate));
     let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -2006,12 +2044,105 @@ fn client_config(
         .map_err(|error| format!("无法限定 TLS 1.3：{error}"))?
         .dangerous()
         .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth();
+        .with_client_auth_cert(
+            vec![CertificateDer::from(certificate_der)],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(private_key_der)),
+        )
+        .map_err(|error| format!("无法配置 TLS 客户端身份：{error}"))?;
     crypto.alpn_protocols = vec![alpn.to_vec()];
     crypto.enable_early_data = false;
     let quic = QuicClientConfig::try_from(crypto)
         .map_err(|error| format!("无法配置 QUIC 客户端：{error}"))?;
     Ok(quinn::ClientConfig::new(Arc::new(quic)))
+}
+
+#[derive(Debug)]
+struct AnyEd25519ClientCertificate {
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl AnyEd25519ClientCertificate {
+    fn new() -> Self {
+        Self {
+            provider: Arc::new(rustls::crypto::ring::default_provider()),
+        }
+    }
+}
+
+impl ClientCertVerifier for AnyEd25519ClientCertificate {
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        if end_entity.is_empty() || end_entity.len() > 64 * 1024 || !intermediates.is_empty() {
+            return Err(rustls::Error::General(
+                "客户端必须提供单个有界 Ed25519 证书".into(),
+            ));
+        }
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_ed25519_tls12_signature(message, cert, dss, &self.provider)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_ed25519_tls13_signature(message, cert, dss, &self.provider)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![SignatureScheme::ED25519]
+    }
+}
+
+fn verify_ed25519_tls12_signature(
+    message: &[u8],
+    cert: &CertificateDer<'_>,
+    dss: &DigitallySignedStruct,
+    provider: &rustls::crypto::CryptoProvider,
+) -> Result<HandshakeSignatureValid, rustls::Error> {
+    if dss.scheme != SignatureScheme::ED25519 {
+        return Err(rustls::Error::General("只允许 Ed25519 TLS 身份签名".into()));
+    }
+    rustls::crypto::verify_tls12_signature(
+        message,
+        cert,
+        dss,
+        &provider.signature_verification_algorithms,
+    )
+}
+
+fn verify_ed25519_tls13_signature(
+    message: &[u8],
+    cert: &CertificateDer<'_>,
+    dss: &DigitallySignedStruct,
+    provider: &rustls::crypto::CryptoProvider,
+) -> Result<HandshakeSignatureValid, rustls::Error> {
+    if dss.scheme != SignatureScheme::ED25519 {
+        return Err(rustls::Error::General("只允许 Ed25519 TLS 身份签名".into()));
+    }
+    rustls::crypto::verify_tls13_signature(
+        message,
+        cert,
+        dss,
+        &provider.signature_verification_algorithms,
+    )
 }
 
 #[derive(Debug)]
@@ -2033,11 +2164,16 @@ impl ServerCertVerifier for PinnedCertificateVerifier {
     fn verify_server_cert(
         &self,
         end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
+        intermediates: &[CertificateDer<'_>],
         _server_name: &ServerName<'_>,
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
+        if end_entity.is_empty() || end_entity.len() > 64 * 1024 || !intermediates.is_empty() {
+            return Err(rustls::Error::General(
+                "服务端必须提供单个有界 Ed25519 证书".into(),
+            ));
+        }
         if self
             .expected
             .as_ref()
@@ -2054,12 +2190,7 @@ impl ServerCertVerifier for PinnedCertificateVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
+        verify_ed25519_tls12_signature(message, cert, dss, &self.provider)
     }
 
     fn verify_tls13_signature(
@@ -2068,18 +2199,11 @@ impl ServerCertVerifier for PinnedCertificateVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
+        verify_ed25519_tls13_signature(message, cert, dss, &self.provider)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.provider
-            .signature_verification_algorithms
-            .supported_schemes()
+        vec![SignatureScheme::ED25519]
     }
 }
 
@@ -2265,6 +2389,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quic_server_rejects_clients_without_device_certificate() {
+        let directory = std::env::temp_dir().join(format!(
+            "airdrop-mtls-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let identity = Identity::load_or_create(&directory).unwrap();
+        let key_pair = KeyPair::try_from(identity.pkcs8_der()).unwrap();
+        let certificate = CertificateParams::new(vec![identity.device_id().to_string()])
+            .unwrap()
+            .self_signed(&key_pair)
+            .unwrap()
+            .der()
+            .to_vec();
+        let server = Endpoint::server(
+            server_config(
+                certificate.clone(),
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der())),
+            )
+            .unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let verifier = Arc::new(PinnedCertificateVerifier::new(Some(certificate)));
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut crypto = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth();
+        crypto.alpn_protocols = vec![TRUSTED_ALPN.to_vec()];
+        let quic = QuicClientConfig::try_from(crypto).unwrap();
+        let mut client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic)));
+        let server_address = server.local_addr().unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.connect(server_address, "localdrop").unwrap(),
+        )
+        .await;
+        assert!(!matches!(result, Ok(Ok(_))));
+        client.close(0u32.into(), b"done");
+        server.close(0u32.into(), b"done");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
     async fn partial_file_bundle_reports_durable_resume_offsets() {
         let directory = std::env::temp_dir().join(format!(
             "airdrop-resume-test-{}",
@@ -2321,7 +2492,8 @@ mod tests {
             .unwrap()
             .der()
             .to_vec();
-        let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
+        let private_key_der = key_pair.serialize_der();
+        let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(private_key_der.clone()));
         let server = Endpoint::server(
             server_config(certificate.clone(), private_key).unwrap(),
             "127.0.0.1:0".parse().unwrap(),
@@ -2330,6 +2502,7 @@ mod tests {
         let server_address = server.local_addr().unwrap();
         let server_task = tokio::spawn(async move {
             let connection = server.accept().await.unwrap().await.unwrap();
+            assert!(peer_certificate(&connection).is_ok());
             let (mut send, mut receive) = connection.accept_bi().await.unwrap();
             let message: TrustedMessage = read_frame(&mut receive).await.unwrap();
             assert!(matches!(
@@ -2392,7 +2565,15 @@ mod tests {
         });
 
         let mut client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-        client.set_default_client_config(client_config(Some(certificate), TRUSTED_ALPN).unwrap());
+        client.set_default_client_config(
+            client_config(
+                Some(certificate.clone()),
+                TRUSTED_ALPN,
+                certificate,
+                private_key_der,
+            )
+            .unwrap(),
+        );
         let connection = client
             .connect(server_address, "localdrop")
             .unwrap()

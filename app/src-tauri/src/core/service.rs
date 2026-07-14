@@ -99,6 +99,7 @@ pub struct CurrentClipboard {
 pub struct ImportOperation {
     id: String,
     slot_id: String,
+    revision: u64,
     device_name: String,
     source_summary: String,
     status: String,
@@ -191,18 +192,37 @@ pub struct UpdateGroupPolicyInput {
 
 #[derive(Clone)]
 enum RemoteClipboardBody {
-    Text(String),
+    Text {
+        sequence: u64,
+        text: String,
+    },
     Rich {
+        sequence: u64,
         text: String,
         html: Option<String>,
         rtf: Option<String>,
     },
-    Files(Arc<ReceivedFileBundle>),
+    Files {
+        sequence: u64,
+        bundle: Arc<ReceivedFileBundle>,
+    },
     Image {
+        sequence: u64,
         rgba: Vec<u8>,
         width: u32,
         height: u32,
     },
+}
+
+impl RemoteClipboardBody {
+    fn sequence(&self) -> u64 {
+        match self {
+            Self::Text { sequence, .. }
+            | Self::Rich { sequence, .. }
+            | Self::Files { sequence, .. }
+            | Self::Image { sequence, .. } => *sequence,
+        }
+    }
 }
 
 pub(crate) struct RemoteImage {
@@ -234,6 +254,21 @@ pub(crate) struct RemoteFiles {
 struct SlotGroups {
     names: Vec<String>,
     ids: Vec<String>,
+}
+
+struct SlotPresentation {
+    preview_content: bool,
+    online: bool,
+    availability: &'static str,
+}
+
+enum SlotPreviewUpdate {
+    Text(String),
+    Image(Option<String>),
+    Files {
+        preview: String,
+        file_names: Option<Vec<String>>,
+    },
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -380,6 +415,7 @@ pub struct ServiceState {
     store: Store,
     identity: Identity,
     remote_bodies: Mutex<HashMap<String, RemoteClipboardBody>>,
+    incoming_sequences: Mutex<HashMap<String, u64>>,
     suppress_next_capture: Mutex<Option<String>>,
     suppress_next_rich: Mutex<Option<[u8; 32]>>,
     suppress_next_image: Mutex<Option<[u8; 32]>>,
@@ -469,15 +505,23 @@ impl ServiceState {
                             cached.sequence,
                             &cached.text,
                             cached.captured_at,
-                            false,
-                            "stale",
                             SlotGroups {
                                 names: groups,
                                 ids: cached.group_ids.clone(),
                             },
+                            SlotPresentation {
+                                preview_content: snapshot.settings.preview_text,
+                                online: false,
+                                availability: "stale",
+                            },
                         );
-                        remote_bodies
-                            .insert(slot.id.clone(), RemoteClipboardBody::Text(cached.text));
+                        remote_bodies.insert(
+                            slot.id.clone(),
+                            RemoteClipboardBody::Text {
+                                sequence: cached.sequence,
+                                text: cached.text,
+                            },
+                        );
                         snapshot.slots.push(slot);
                     }
                     Ok(_) => {
@@ -489,11 +533,17 @@ impl ServiceState {
                 }
             }
         }
+        let incoming_sequences = snapshot
+            .slots
+            .iter()
+            .map(|slot| (slot.device_id.clone(), slot.sequence))
+            .collect();
         Ok(Self {
             snapshot: Mutex::new(snapshot),
             store,
             identity,
             remote_bodies: Mutex::new(remote_bodies),
+            incoming_sequences: Mutex::new(incoming_sequences),
             suppress_next_capture: Mutex::new(None),
             suppress_next_rich: Mutex::new(None),
             suppress_next_image: Mutex::new(None),
@@ -545,6 +595,18 @@ impl ServiceState {
     fn clear_accepted_file_transfer(&self, device_id: &str) {
         if let Ok(mut transfers) = self.accepted_file_transfers.lock() {
             transfers.remove(device_id);
+        }
+    }
+
+    fn clear_cached_text_best_effort(&self, device_id: &str) {
+        match self.store.remove_cached_slot(device_id) {
+            Ok(Some(object_name)) => self.clipboard_cache.remove(&object_name),
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                device_id,
+                error = %error,
+                "stale encrypted text cache cleanup deferred"
+            ),
         }
     }
 
@@ -680,19 +742,36 @@ impl ServiceState {
         origin_device_id: &str,
         sequence: u64,
     ) -> Result<(), String> {
-        let snapshot = self
-            .snapshot
+        let sequences = self
+            .incoming_sequences
             .lock()
-            .map_err(|_| "Rust 服务状态锁已损坏".to_string())?;
-        if snapshot
-            .slots
-            .iter()
-            .find(|slot| slot.device_id == origin_device_id)
-            .is_some_and(|slot| sequence <= slot.sequence)
+            .map_err(|_| "远端剪贴板序号锁已损坏".to_string())?;
+        if sequences
+            .get(origin_device_id)
+            .is_some_and(|current| sequence <= *current)
         {
             return Err("远端剪贴板数据流已经过期".into());
         }
         Ok(())
+    }
+
+    fn accept_incoming_sequence(
+        &self,
+        origin_device_id: &str,
+        sequence: u64,
+    ) -> Result<bool, String> {
+        let mut sequences = self
+            .incoming_sequences
+            .lock()
+            .map_err(|_| "远端剪贴板序号锁已损坏".to_string())?;
+        if sequences
+            .get(origin_device_id)
+            .is_some_and(|current| sequence <= *current)
+        {
+            return Ok(false);
+        }
+        sequences.insert(origin_device_id.to_string(), sequence);
+        Ok(true)
     }
 
     pub(crate) fn can_publish_content(&self, content_type: &str) -> bool {
@@ -914,14 +993,128 @@ fn copied_file_names(files: &[String]) -> Vec<String> {
         .collect()
 }
 
+fn redact_disallowed_previews(snapshot: &mut UiSnapshot) {
+    if !snapshot.settings.preview_text {
+        for slot in &mut snapshot.slots {
+            if slot.representations.iter().any(|representation| {
+                matches!(representation.kind.as_str(), "text" | "url" | "html")
+            }) {
+                slot.preview = "文本预览已隐藏".into();
+            }
+        }
+        let current_is_text = snapshot
+            .current_clipboard
+            .types
+            .iter()
+            .any(|kind| kind == "URL" || kind.contains("文本") || kind.contains("HTML"));
+        if current_is_text {
+            snapshot.current_clipboard.preview = "文本预览已隐藏".into();
+            snapshot.last_published_preview = "本机最近捕获：文本预览已隐藏".into();
+        }
+    }
+    if !snapshot.settings.preview_images {
+        snapshot.current_clipboard.image_preview = None;
+        for slot in &mut snapshot.slots {
+            slot.image_preview = None;
+        }
+    }
+    if !snapshot.settings.preview_file_names {
+        snapshot.current_clipboard.file_names = None;
+        for slot in &mut snapshot.slots {
+            slot.file_names = None;
+            if let Some(files) = slot
+                .representations
+                .iter()
+                .find(|representation| representation.kind == "files")
+            {
+                slot.preview = files.label.clone();
+            }
+        }
+    }
+}
+
+fn refresh_preview_policy(state: &ServiceState, app: &AppHandle) -> Result<(), String> {
+    let settings = state
+        .snapshot
+        .lock()
+        .map_err(|_| "Rust 服务状态锁已损坏".to_string())?
+        .settings
+        .clone();
+    let previews = {
+        let bodies = state
+            .remote_bodies
+            .lock()
+            .map_err(|_| "远端正文缓存锁已损坏".to_string())?;
+        bodies
+            .iter()
+            .map(|(slot_id, body)| {
+                let preview = match body {
+                    RemoteClipboardBody::Text { text, .. }
+                    | RemoteClipboardBody::Rich { text, .. } => {
+                        SlotPreviewUpdate::Text(if settings.preview_text {
+                            truncate_text(text, 4096)
+                        } else {
+                            "文本预览已隐藏".into()
+                        })
+                    }
+                    RemoteClipboardBody::Image {
+                        rgba,
+                        width,
+                        height,
+                        ..
+                    } => SlotPreviewUpdate::Image(
+                        settings
+                            .preview_images
+                            .then(|| image_preview_data_url(rgba, *width, *height))
+                            .flatten(),
+                    ),
+                    RemoteClipboardBody::Files { bundle, .. } => {
+                        let names = bundle.display_names();
+                        let count = names.len();
+                        SlotPreviewUpdate::Files {
+                            preview: if settings.preview_file_names && !names.is_empty() {
+                                truncate_text(&names.join("、"), 4096)
+                            } else {
+                                format!("{count} 个文件或目录")
+                            },
+                            file_names: settings.preview_file_names.then_some(names),
+                        }
+                    }
+                };
+                (slot_id.clone(), preview)
+            })
+            .collect::<HashMap<_, _>>()
+    };
+    update(state, app, |snapshot| {
+        for slot in &mut snapshot.slots {
+            match previews.get(&slot.id) {
+                Some(SlotPreviewUpdate::Text(preview)) => slot.preview = preview.clone(),
+                Some(SlotPreviewUpdate::Image(image_preview)) => {
+                    slot.image_preview = image_preview.clone()
+                }
+                Some(SlotPreviewUpdate::Files {
+                    preview,
+                    file_names,
+                }) => {
+                    slot.preview = preview.clone();
+                    slot.file_names = file_names.clone();
+                }
+                None => {}
+            }
+        }
+        redact_disallowed_previews(snapshot);
+        Ok(())
+    })?;
+    Ok(())
+}
+
 fn text_slot(
     device: &TrustedDevice,
     sequence: u64,
     text: &str,
     captured_at: String,
-    online: bool,
-    availability: &str,
     groups: SlotGroups,
+    presentation: SlotPresentation,
 ) -> DeviceSlot {
     let content_type = text_content_type(text);
     let (kind, label, mime) = if content_type == "url" {
@@ -935,14 +1128,18 @@ fn text_slot(
         device_id: device.device_id.clone(),
         device_name: device.device_name.clone(),
         platform: device.platform.clone(),
-        online,
+        online: presentation.online,
         pinned: None,
-        availability: availability.into(),
-        preview: truncate_text(text, 4096),
+        availability: presentation.availability.into(),
+        preview: if presentation.preview_content {
+            truncate_text(text, 4096)
+        } else {
+            "文本预览已隐藏".into()
+        },
         image_preview: None,
         file_names: None,
         captured_at,
-        age_label: if online {
+        age_label: if presentation.online {
             "刚刚".into()
         } else {
             "本机缓存".into()
@@ -969,11 +1166,12 @@ fn image_slot(
     device: &TrustedDevice,
     sequence: u64,
     rgba: &[u8],
-    width: u32,
-    height: u32,
+    dimensions: (u32, u32),
+    preview_images: bool,
     captured_at: String,
     groups: SlotGroups,
 ) -> DeviceSlot {
+    let (width, height) = dimensions;
     DeviceSlot {
         id: format!("device:{}", device.device_id),
         revision: sequence,
@@ -984,7 +1182,9 @@ fn image_slot(
         pinned: None,
         availability: "ready".into(),
         preview: format!("图片 · {width} × {height}"),
-        image_preview: image_preview_data_url(rgba, width, height),
+        image_preview: preview_images
+            .then(|| image_preview_data_url(rgba, width, height))
+            .flatten(),
         file_names: None,
         captured_at,
         age_label: "刚刚".into(),
@@ -1006,7 +1206,12 @@ fn image_slot(
     }
 }
 
-fn rich_slot(device: &TrustedDevice, rich: &RemoteRich, groups: SlotGroups) -> DeviceSlot {
+fn rich_slot(
+    device: &TrustedDevice,
+    rich: &RemoteRich,
+    preview_text: bool,
+    groups: SlotGroups,
+) -> DeviceSlot {
     let fallback_type = text_content_type(&rich.text);
     let (fallback_kind, fallback_label, fallback_mime) = if fallback_type == "url" {
         ("url", "URL 降级", "text/uri-list;charset=utf-8")
@@ -1053,7 +1258,11 @@ fn rich_slot(device: &TrustedDevice, rich: &RemoteRich, groups: SlotGroups) -> D
         online: true,
         pinned: None,
         availability: "ready".into(),
-        preview: truncate_text(&rich.text, 4096),
+        preview: if preview_text {
+            truncate_text(&rich.text, 4096)
+        } else {
+            "文本预览已隐藏".into()
+        },
         image_preview: None,
         file_names: None,
         captured_at: rich.captured_at.clone(),
@@ -1092,7 +1301,7 @@ fn file_slot(
         availability: "ready".into(),
         preview,
         image_preview: None,
-        file_names: Some(names),
+        file_names: preview_names.then_some(names),
         captured_at: files.captured_at.clone(),
         age_label: "刚刚".into(),
         groups: groups.names,
@@ -1234,7 +1443,11 @@ pub fn capture_local_clipboard(
             snapshot.current_clipboard = CurrentClipboard {
                 source: "local".into(),
                 source_label: "来自本机系统剪贴板".into(),
-                preview: truncate_text(&text, 4096),
+                preview: if snapshot.settings.preview_text {
+                    truncate_text(&text, 4096)
+                } else {
+                    "文本预览已隐藏".into()
+                },
                 image_preview: None,
                 file_names: None,
                 types: vec![if content_type == "url" {
@@ -1251,8 +1464,11 @@ pub fn capture_local_clipboard(
             snapshot.settings.allow_text
         };
         if !snapshot.publish_paused && allowed && !suppress_publish {
-            let preview = truncate_text(&text, 80);
-            snapshot.last_published_preview = format!("本机最近捕获：{preview}");
+            snapshot.last_published_preview = if snapshot.settings.preview_text {
+                format!("本机最近捕获：{}", truncate_text(&text, 80))
+            } else {
+                "本机最近捕获：文本预览已隐藏".into()
+            };
         }
         snapshot.last_synchronized_at = now.clone();
         snapshot.clipboard_capability.can_read_text = true;
@@ -1312,7 +1528,11 @@ pub fn capture_local_rich(
             snapshot.current_clipboard = CurrentClipboard {
                 source: "local".into(),
                 source_label: "来自本机系统剪贴板".into(),
-                preview: truncate_text(&text, 4096),
+                preview: if snapshot.settings.preview_text {
+                    truncate_text(&text, 4096)
+                } else {
+                    "文本预览已隐藏".into()
+                },
                 image_preview: None,
                 file_names: None,
                 types: vec!["富文本 / HTML".into(), "纯文本降级".into()],
@@ -1328,7 +1548,11 @@ pub fn capture_local_rich(
             && (snapshot.settings.allow_html || fallback_allowed)
             && !suppress_publish
         {
-            snapshot.last_published_preview = format!("本机最近捕获：{}", truncate_text(&text, 80));
+            snapshot.last_published_preview = if snapshot.settings.preview_text {
+                format!("本机最近捕获：{}", truncate_text(&text, 80))
+            } else {
+                "本机最近捕获：文本预览已隐藏".into()
+            };
         }
         snapshot.last_synchronized_at = now.clone();
         Ok(())
@@ -1401,7 +1625,10 @@ pub fn capture_local_files(
                 source_label: "来自本机系统剪贴板".into(),
                 preview: format!("{} 个文件或目录", files.len()),
                 image_preview: None,
-                file_names: Some(file_names.clone()),
+                file_names: snapshot
+                    .settings
+                    .preview_file_names
+                    .then(|| file_names.clone()),
                 types: vec!["文件与目录".into()],
                 changed_at: now.clone(),
             };
@@ -1460,14 +1687,17 @@ pub fn capture_local_image(
             false
         }
     };
-    let image_preview = image_preview_data_url(&rgba, width, height);
     let snapshot = update(state, app, |snapshot| {
         if !suppress_publish {
             snapshot.current_clipboard = CurrentClipboard {
                 source: "local".into(),
                 source_label: "来自本机系统剪贴板".into(),
                 preview: format!("图片 · {width} × {height}"),
-                image_preview: image_preview.clone(),
+                image_preview: snapshot
+                    .settings
+                    .preview_images
+                    .then(|| image_preview_data_url(&rgba, width, height))
+                    .flatten(),
                 file_names: None,
                 types: vec!["图片".into()],
                 changed_at: now.clone(),
@@ -1679,7 +1909,7 @@ pub(crate) fn receive_remote_text(
     }
     let content_type = text_content_type(&text);
     let group_names = state.validate_group_delivery(&device.device_id, &group_ids, content_type)?;
-    {
+    let preview_text = {
         let snapshot = state
             .snapshot
             .lock()
@@ -1695,6 +1925,10 @@ pub(crate) fn receive_remote_text(
         if snapshot.subscribe_paused {
             return Ok(());
         }
+        snapshot.settings.preview_text
+    };
+    if !state.accept_incoming_sequence(&device.device_id, sequence)? {
+        return Ok(());
     }
     let slot_id = format!("device:{}", device.device_id);
     state.clear_accepted_file_transfer(&device.device_id);
@@ -1703,7 +1937,13 @@ pub(crate) fn receive_remote_text(
             .remote_bodies
             .lock()
             .map_err(|_| "远端正文缓存锁已损坏".to_string())?;
-        bodies.insert(slot_id.clone(), RemoteClipboardBody::Text(text.clone()));
+        bodies.insert(
+            slot_id.clone(),
+            RemoteClipboardBody::Text {
+                sequence,
+                text: text.clone(),
+            },
+        );
     }
     match state.clipboard_cache.store(&CachedText {
         device_id: device.device_id.clone(),
@@ -1736,25 +1976,19 @@ pub(crate) fn receive_remote_text(
         }
     }
     update(state, app, |snapshot| {
-        if let Some(existing) = snapshot
-            .slots
-            .iter()
-            .find(|slot| slot.device_id == device.device_id)
-        {
-            if sequence <= existing.sequence {
-                return Ok(());
-            }
-        }
         let slot = text_slot(
             device,
             sequence,
             &text,
             captured_at.clone(),
-            true,
-            "ready",
             SlotGroups {
                 names: group_names,
                 ids: group_ids,
+            },
+            SlotPresentation {
+                preview_content: preview_text,
+                online: true,
+                availability: "ready",
             },
         );
         snapshot
@@ -1797,7 +2031,7 @@ pub(crate) fn receive_remote_rich(
         group_names.sort();
         group_names.dedup();
     }
-    {
+    let preview_text = {
         let snapshot = state
             .snapshot
             .lock()
@@ -1813,6 +2047,10 @@ pub(crate) fn receive_remote_rich(
         {
             return Ok(());
         }
+        snapshot.settings.preview_text
+    };
+    if !state.accept_incoming_sequence(&device.device_id, rich.sequence)? {
+        return Ok(());
     }
     let slot_id = format!("device:{}", device.device_id);
     state.clear_accepted_file_transfer(&device.device_id);
@@ -1823,14 +2061,12 @@ pub(crate) fn receive_remote_rich(
         .insert(
             slot_id,
             RemoteClipboardBody::Rich {
+                sequence: rich.sequence,
                 text: rich.text.clone(),
                 html: rich.html.clone(),
                 rtf: rich.rtf.clone(),
             },
         );
-    if let Some(object_name) = state.store.remove_cached_slot(&device.device_id)? {
-        state.clipboard_cache.remove(&object_name);
-    }
     update(state, app, |snapshot| {
         snapshot
             .slots
@@ -1838,6 +2074,7 @@ pub(crate) fn receive_remote_rich(
         snapshot.slots.push(rich_slot(
             device,
             &rich,
+            preview_text,
             SlotGroups {
                 names: group_names,
                 ids: rich.group_ids.clone(),
@@ -1846,6 +2083,7 @@ pub(crate) fn receive_remote_rich(
         snapshot.last_synchronized_at = rich.captured_at;
         Ok(())
     })?;
+    state.clear_cached_text_best_effort(&device.device_id);
     Ok(())
 }
 
@@ -1884,16 +2122,22 @@ pub(crate) fn receive_remote_files(
         }
         snapshot.settings.preview_file_names
     };
+    if !state.accept_incoming_sequence(&device.device_id, files.sequence)? {
+        return Ok(());
+    }
     let slot_id = format!("device:{}", device.device_id);
     state.clear_accepted_file_transfer(&device.device_id);
     state
         .remote_bodies
         .lock()
         .map_err(|_| "远端正文缓存锁已损坏".to_string())?
-        .insert(slot_id, RemoteClipboardBody::Files(files.bundle.clone()));
-    if let Some(object_name) = state.store.remove_cached_slot(&device.device_id)? {
-        state.clipboard_cache.remove(&object_name);
-    }
+        .insert(
+            slot_id,
+            RemoteClipboardBody::Files {
+                sequence: files.sequence,
+                bundle: files.bundle.clone(),
+            },
+        );
     update(state, app, |snapshot| {
         snapshot
             .slots
@@ -1910,6 +2154,7 @@ pub(crate) fn receive_remote_files(
         snapshot.last_synchronized_at = files.captured_at;
         Ok(())
     })?;
+    state.clear_cached_text_best_effort(&device.device_id);
     Ok(())
 }
 
@@ -1938,7 +2183,7 @@ pub(crate) fn receive_remote_image(
     }
     let group_names =
         state.validate_group_delivery(&device.device_id, &image.group_ids, "image")?;
-    {
+    let preview_images = {
         let snapshot = state
             .snapshot
             .lock()
@@ -1954,6 +2199,10 @@ pub(crate) fn receive_remote_image(
         {
             return Ok(());
         }
+        snapshot.settings.preview_images
+    };
+    if !state.accept_incoming_sequence(&device.device_id, image.sequence)? {
+        return Ok(());
     }
     let slot_id = format!("device:{}", device.device_id);
     state.clear_accepted_file_transfer(&device.device_id);
@@ -1964,14 +2213,12 @@ pub(crate) fn receive_remote_image(
         .insert(
             slot_id,
             RemoteClipboardBody::Image {
+                sequence: image.sequence,
                 rgba: image.rgba.clone(),
                 width: image.width,
                 height: image.height,
             },
         );
-    if let Some(object_name) = state.store.remove_cached_slot(&device.device_id)? {
-        state.clipboard_cache.remove(&object_name);
-    }
     update(state, app, |snapshot| {
         snapshot
             .slots
@@ -1980,8 +2227,8 @@ pub(crate) fn receive_remote_image(
             device,
             image.sequence,
             &image.rgba,
-            image.width,
-            image.height,
+            (image.width, image.height),
+            preview_images,
             image.captured_at.clone(),
             SlotGroups {
                 names: group_names,
@@ -1991,6 +2238,7 @@ pub(crate) fn receive_remote_image(
         snapshot.last_synchronized_at = image.captured_at;
         Ok(())
     })?;
+    state.clear_cached_text_best_effort(&device.device_id);
     Ok(())
 }
 
@@ -2125,9 +2373,11 @@ fn reconcile_group_slots(state: &ServiceState, app: &AppHandle) -> Result<(), St
             .map(|(slot_id, _)| slot_id.clone())
             .collect::<Vec<_>>();
         for slot_id in downgrade_ids {
-            if let Some(RemoteClipboardBody::Rich { text, .. }) = bodies.get(&slot_id).cloned() {
+            if let Some(RemoteClipboardBody::Rich { sequence, text, .. }) =
+                bodies.get(&slot_id).cloned()
+            {
                 downgraded_sizes.insert(slot_id.clone(), text.len() as u64);
-                bodies.insert(slot_id, RemoteClipboardBody::Text(text));
+                bodies.insert(slot_id, RemoteClipboardBody::Text { sequence, text });
             }
         }
         for (slot_id, _) in &removed {
@@ -3079,6 +3329,11 @@ pub fn update_settings(
     app: AppHandle,
     settings: Value,
 ) -> Result<(), String> {
+    let preview_policy_changed = settings.as_object().is_some_and(|patch| {
+        ["previewText", "previewImages", "previewFileNames"]
+            .iter()
+            .any(|key| patch.contains_key(*key))
+    });
     let snapshot = update(&state, &app, |snapshot| {
         let mut current =
             serde_json::to_value(&snapshot.settings).map_err(|error| error.to_string())?;
@@ -3151,9 +3406,13 @@ pub fn update_settings(
             });
             snapshot.imports.clear();
         }
+        redact_disallowed_previews(snapshot);
         Ok(())
     })?;
     state.store.save_settings(&snapshot.settings)?;
+    if preview_policy_changed {
+        refresh_preview_policy(&state, &app)?;
+    }
     if let Some(transport) = app.try_state::<super::transport::TransportHandle>() {
         transport
             .retain_enabled_latest_text(snapshot.settings.allow_text, snapshot.settings.allow_urls);
@@ -3208,7 +3467,7 @@ pub fn update_settings(
             .lock()
             .map_err(|_| "远端正文缓存锁已损坏".to_string())?
             .retain(|_, body| match body {
-                RemoteClipboardBody::Text(text) => {
+                RemoteClipboardBody::Text { text, .. } => {
                     if text_content_type(text) == "url" {
                         snapshot.settings.allow_urls
                     } else {
@@ -3216,7 +3475,7 @@ pub fn update_settings(
                     }
                 }
                 RemoteClipboardBody::Rich { .. } => snapshot.settings.allow_html,
-                RemoteClipboardBody::Files(_) => snapshot.settings.allow_files,
+                RemoteClipboardBody::Files { .. } => snapshot.settings.allow_files,
                 RemoteClipboardBody::Image { .. } => snapshot.settings.allow_images,
             });
     }
@@ -3299,6 +3558,16 @@ pub fn create_import_intent(
     slot_id: String,
     revision: u64,
 ) -> Result<String, String> {
+    let body = state
+        .remote_bodies
+        .lock()
+        .map_err(|_| "远端正文缓存锁已损坏".to_string())?
+        .get(&slot_id)
+        .cloned()
+        .ok_or_else(|| "远端正文当前不可用".to_string())?;
+    if body.sequence() != revision {
+        return Err("设备槽位正文已经更新，请重新选择".into());
+    }
     let mut snapshot = state
         .snapshot
         .lock()
@@ -3347,17 +3616,11 @@ pub fn create_import_intent(
     if !allowed {
         return Err("本机策略已停用此内容类型的取用".into());
     }
-    let bodies = state
-        .remote_bodies
-        .lock()
-        .map_err(|_| "远端正文缓存锁已损坏".to_string())?;
-    if !bodies.contains_key(&slot.id) {
-        return Err(format!("{} 的远端正文当前不可用", slot.device_name));
-    }
     let import_id = uuid::Uuid::new_v4().simple().to_string();
     snapshot.imports.push(ImportOperation {
         id: import_id.clone(),
         slot_id: slot.id.clone(),
+        revision,
         device_name: slot.device_name.clone(),
         source_summary: truncate_text(&slot.preview, 80),
         status: "awaiting_confirmation".into(),
@@ -3366,7 +3629,6 @@ pub fn create_import_intent(
     });
     snapshot.bump();
     let emitted = snapshot.clone();
-    drop(bodies);
     drop(snapshot);
     emit_snapshot(&app, &emitted)?;
     Ok(import_id)
@@ -3378,28 +3640,37 @@ pub fn confirm_import(
     app: AppHandle,
     import_id: String,
 ) -> Result<(), String> {
-    let (slot_id, body) = {
+    let operation = {
         let snapshot = state
             .snapshot
             .lock()
             .map_err(|_| "Rust 服务状态锁已损坏".to_string())?;
-        let operation = snapshot
+        snapshot
             .imports
             .iter()
             .find(|item| item.id == import_id && item.status == "awaiting_confirmation")
-            .ok_or_else(|| "没有可确认的远端剪贴板导入".to_string())?;
-        let bodies = state
-            .remote_bodies
-            .lock()
-            .map_err(|_| "远端正文缓存锁已损坏".to_string())?;
-        let body = bodies
-            .get(&operation.slot_id)
             .cloned()
-            .ok_or_else(|| "远端正文已经不可用".to_string())?;
-        (operation.slot_id.clone(), body)
+            .ok_or_else(|| "没有可确认的远端剪贴板导入".to_string())?
     };
+    let body = state
+        .remote_bodies
+        .lock()
+        .map_err(|_| "远端正文缓存锁已损坏".to_string())?
+        .get(&operation.slot_id)
+        .cloned()
+        .ok_or_else(|| "远端正文已经不可用".to_string())?;
+    if body.sequence() != operation.revision {
+        return Err("远端槽位在确认前已经更新，请重新选择".into());
+    }
+    let slot_id = operation.slot_id;
+    let textual = matches!(
+        &body,
+        RemoteClipboardBody::Text { .. } | RemoteClipboardBody::Rich { .. }
+    );
+    let image_body = matches!(&body, RemoteClipboardBody::Image { .. });
+    let file_body = matches!(&body, RemoteClipboardBody::Files { .. });
     let (preview, types, image_preview, file_names) = match &body {
-        RemoteClipboardBody::Text(text) => {
+        RemoteClipboardBody::Text { text, .. } => {
             *state
                 .suppress_next_capture
                 .lock()
@@ -3422,7 +3693,9 @@ pub fn confirm_import(
                 None,
             )
         }
-        RemoteClipboardBody::Rich { text, html, rtf } => {
+        RemoteClipboardBody::Rich {
+            text, html, rtf, ..
+        } => {
             *state
                 .suppress_next_rich
                 .lock()
@@ -3452,7 +3725,7 @@ pub fn confirm_import(
                 None,
             )
         }
-        RemoteClipboardBody::Files(bundle) => {
+        RemoteClipboardBody::Files { bundle, .. } => {
             let paths = bundle.clipboard_paths();
             *state
                 .suppress_next_files
@@ -3481,6 +3754,7 @@ pub fn confirm_import(
             rgba,
             width,
             height,
+            ..
         } => {
             *state
                 .suppress_next_image
@@ -3514,9 +3788,21 @@ pub fn confirm_import(
             snapshot.current_clipboard = CurrentClipboard {
                 source: "remote".into(),
                 source_label: format!("取自 {}", operation.device_name),
-                preview: preview.clone(),
-                image_preview: image_preview.clone(),
-                file_names: file_names.clone(),
+                preview: if textual && !snapshot.settings.preview_text {
+                    "文本预览已隐藏".into()
+                } else {
+                    preview.clone()
+                },
+                image_preview: if image_body && snapshot.settings.preview_images {
+                    image_preview.clone()
+                } else {
+                    None
+                },
+                file_names: if file_body && snapshot.settings.preview_file_names {
+                    file_names.clone()
+                } else {
+                    None
+                },
                 types: types.clone(),
                 changed_at: time::OffsetDateTime::now_utc()
                     .format(&time::format_description::well_known::Rfc3339)
@@ -3545,7 +3831,8 @@ pub fn cancel_import(
 
 #[cfg(test)]
 mod tests {
-    use super::text_content_type;
+    use super::*;
+    use std::fs;
 
     #[test]
     fn classifies_standalone_network_urls_without_treating_paths_as_urls() {
@@ -3554,5 +3841,116 @@ mod tests {
         assert_eq!(text_content_type("file:///tmp/example.txt"), "text");
         assert_eq!(text_content_type("See https://example.com"), "text");
         assert_eq!(text_content_type("C:\\Temp\\example.txt"), "text");
+    }
+
+    #[test]
+    fn incoming_sequences_only_advance_monotonically() {
+        let directory = std::env::temp_dir().join(format!(
+            "airdrop-sequence-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let state = ServiceState::open(&directory).unwrap();
+        assert!(state.accept_incoming_sequence("ld1_peer", 7).unwrap());
+        assert!(!state.accept_incoming_sequence("ld1_peer", 7).unwrap());
+        assert!(!state.accept_incoming_sequence("ld1_peer", 6).unwrap());
+        assert!(state.accept_incoming_sequence("ld1_peer", 8).unwrap());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn text_slot_respects_preview_policy() {
+        let device = TrustedDevice {
+            device_id: "ld1_peer".into(),
+            device_name: "Peer".into(),
+            platform: "linux".into(),
+            public_key: vec![0; 32],
+            certificate_der: vec![1],
+            paired_at: "2026-07-14T00:00:00Z".into(),
+            sync_enabled: true,
+        };
+        let hidden = text_slot(
+            &device,
+            1,
+            "secret clipboard text",
+            "2026-07-14T00:00:00Z".into(),
+            SlotGroups {
+                names: vec!["Personal".into()],
+                ids: vec!["group".into()],
+            },
+            SlotPresentation {
+                preview_content: false,
+                online: true,
+                availability: "ready",
+            },
+        );
+        assert_eq!(hidden.preview, "文本预览已隐藏");
+        let visible = text_slot(
+            &device,
+            2,
+            "visible clipboard text",
+            "2026-07-14T00:00:01Z".into(),
+            SlotGroups {
+                names: vec!["Personal".into()],
+                ids: vec!["group".into()],
+            },
+            SlotPresentation {
+                preview_content: true,
+                online: true,
+                availability: "ready",
+            },
+        );
+        assert_eq!(visible.preview, "visible clipboard text");
+    }
+
+    #[test]
+    fn preview_redaction_happens_before_snapshot_emission() {
+        let settings = AppSettings {
+            preview_text: false,
+            preview_images: false,
+            preview_file_names: false,
+            ..AppSettings::default()
+        };
+        let mut snapshot = UiSnapshot::initial(settings, None, Vec::new());
+        snapshot.current_clipboard.preview = "local secret".into();
+        snapshot.current_clipboard.types = vec!["纯文本".into()];
+        snapshot.current_clipboard.image_preview = Some("data:image/png;base64,secret".into());
+        snapshot.current_clipboard.file_names = Some(vec!["secret.txt".into()]);
+        snapshot.slots.push(DeviceSlot {
+            id: "device:peer".into(),
+            revision: 1,
+            device_id: "peer".into(),
+            device_name: "Peer".into(),
+            platform: "linux".into(),
+            online: true,
+            pinned: None,
+            availability: "ready".into(),
+            preview: "remote secret".into(),
+            image_preview: Some("data:image/png;base64,secret".into()),
+            file_names: Some(vec!["secret.txt".into()]),
+            captured_at: "2026-07-14T00:00:00Z".into(),
+            age_label: "刚刚".into(),
+            groups: vec!["Personal".into()],
+            group_ids: vec!["group".into()],
+            sequence: 1,
+            size: 13,
+            representations: vec![ClipboardRepresentation {
+                id: "text/plain".into(),
+                kind: "text".into(),
+                label: "纯文本".into(),
+                mime: "text/plain;charset=utf-8".into(),
+                size: 13,
+                status: "ready".into(),
+                enabled: true,
+            }],
+            blocked_reason: None,
+            progress: None,
+        });
+        redact_disallowed_previews(&mut snapshot);
+        assert_eq!(snapshot.current_clipboard.preview, "文本预览已隐藏");
+        assert!(snapshot.current_clipboard.image_preview.is_none());
+        assert!(snapshot.current_clipboard.file_names.is_none());
+        assert_eq!(snapshot.slots[0].preview, "文本预览已隐藏");
+        assert!(snapshot.slots[0].image_preview.is_none());
+        assert!(snapshot.slots[0].file_names.is_none());
     }
 }

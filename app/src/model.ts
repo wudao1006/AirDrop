@@ -90,7 +90,7 @@ export interface PendingPairing {
   sas: string;
   direction: "incoming" | "outgoing";
   expiresAt: string;
-  status: "awaiting_confirmation" | "peer_confirmed" | "waiting_for_peer";
+  status: "awaiting_confirmation" | "peer_confirmed" | "waiting_for_peer" | "waiting_for_peer_complete";
 }
 
 export type GroupMemberState = "invited" | "active" | "removed";
@@ -148,6 +148,7 @@ export interface CurrentClipboard {
 export interface ImportOperation {
   id: string;
   slotId: string;
+  revision: number;
   deviceName: string;
   sourceSummary: string;
   status: ImportStatus;

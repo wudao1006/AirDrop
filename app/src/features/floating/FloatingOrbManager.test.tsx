@@ -80,7 +80,9 @@ describe("FloatingOrbManager", () => {
     const confirmImport = vi.spyOn(demo, "confirmImport");
     handlers.get(FLOATING_EVENTS.action)?.({ action: "use-slot", slotId: "macbook-slot", revision: 7 });
     await waitFor(() => expect(createImport).toHaveBeenCalledWith("macbook-slot", 7));
-    await waitFor(() => expect(confirmImport).toHaveBeenCalled());
+    await waitFor(() => expect(setPage).toHaveBeenCalledWith("clipboard"));
+    expect(adapter.showMain).toHaveBeenCalled();
+    expect(confirmImport).not.toHaveBeenCalled();
   });
 
   it("acknowledges a clamped, side-aware layout transaction", async () => {

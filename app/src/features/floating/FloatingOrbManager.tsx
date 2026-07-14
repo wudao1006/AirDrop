@@ -131,8 +131,9 @@ export function FloatingOrbManager({ client, snapshot, setPage, onError, adapter
 
     const handleAction = async (payload: FloatingOrbActionPayload) => {
       if (payload.action === "use-slot") {
-        const importId = await client.createImportIntent(payload.slotId, payload.revision);
-        await client.confirmImport(importId);
+        await client.createImportIntent(payload.slotId, payload.revision);
+        setPage("clipboard");
+        await adapter.showMain();
         await broadcastState();
         return;
       }
