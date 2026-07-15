@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { FloatingEventPayloads, FloatingOrbStatePayload } from "./floating-events";
 import { FLOATING_EVENTS } from "./floating-events";
@@ -127,8 +127,8 @@ describe("FloatingOrbApp", () => {
     expect(context.adapter.emit).toHaveBeenCalledWith(FLOATING_EVENTS.action, expect.objectContaining({ action: "use-slot", slotId: "slot-1", revision: 8, requestId: expect.any(String) }));
     const request = vi.mocked(context.adapter.emit).mock.calls.find(([event, payload]) => event === FLOATING_EVENTS.action && (payload as { action: string }).action === "use-slot")?.[1] as FloatingEventPayloads[typeof FLOATING_EVENTS.action];
     expect(screen.getByRole("button", { name: "取入中" })).toBeDisabled();
-    context.dispatch(FLOATING_EVENTS.actionResult, { requestId: request.requestId, success: true, message: "已写入本机剪贴板" });
-    expect(await screen.findByRole("button", { name: "使用" })).toBeEnabled();
+    act(() => context.dispatch(FLOATING_EVENTS.actionResult, { requestId: request.requestId, success: true, message: "已写入本机剪贴板" }));
+    expect(screen.getByRole("button", { name: "使用" })).toBeEnabled();
     expect(screen.getByRole("status")).toHaveTextContent("已写入本机剪贴板");
   });
 
