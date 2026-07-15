@@ -6,4 +6,5 @@ pub(crate) mod identity;
 pub(crate) mod logging;
 pub(crate) mod service;
 pub(crate) mod storage;
+pub(crate) mod telemetry;
 pub(crate) mod transport;

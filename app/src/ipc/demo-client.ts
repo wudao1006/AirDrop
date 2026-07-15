@@ -1,5 +1,5 @@
 import type { DesktopClient, Unsubscribe } from "./client";
-import type { AppSettings, DeviceSlot, ImportOperation, PlatformKind, UiSnapshot } from "../model";
+import type { AppSettings, DeviceSlot, ImportOperation, PlatformKind, TelemetrySnapshot, UiSnapshot } from "../model";
 import {
   DEFAULT_APPEARANCE_SETTINGS,
   extractAppearanceSettings,
@@ -8,6 +8,49 @@ import {
 } from "../features/settings/appearance";
 
 const now = new Date().toISOString();
+
+const initialTelemetry: TelemetrySnapshot = {
+  sampledAt: now,
+  peers: [{
+    deviceId: "device-macbook",
+    connected: true,
+    rttMs: 18,
+    uploadBps: 42_000,
+    downloadBps: 118_000,
+    recentUploadBps: 38_000,
+    recentDownloadBps: 104_000,
+    lossPercent: 0.12,
+    totalUploadedBytes: 8_420_000,
+    totalDownloadedBytes: 18_870_000,
+    connectedAt: new Date(Date.now() - 18 * 60_000).toISOString(),
+    lastActivityAt: now,
+    reconnectCount: 1,
+    lastDisconnectReason: null,
+    lastDisconnectCode: null,
+    lastDisconnectedAt: null,
+    lastDisconnectPlanned: false,
+    unexpectedDisconnectCount: 0,
+  }],
+  transfers: [{
+    id: "demo-transfer-1",
+    attemptId: 1,
+    deviceId: "device-macbook",
+    direction: "download",
+    kind: "text",
+    totalBytes: 94,
+    transferredBytes: 94,
+    startedAt: now,
+    completedAt: now,
+    durationMs: 286,
+    networkDurationMs: 112,
+    confirmationDurationMs: 174,
+    remoteProcessingMs: 8,
+    speedBps: 0,
+    averageBps: 329,
+    status: "success",
+    message: "已写入设备槽位",
+  }],
+};
 
 const initialSlots: DeviceSlot[] = [
   {
@@ -145,7 +188,9 @@ type ClipboardReader = () => Promise<string>;
 export class DemoDesktopClient implements DesktopClient {
   readonly platform: PlatformKind;
   private snapshot = structuredClone(initialSnapshot);
+  private telemetry = structuredClone(initialTelemetry);
   private listeners = new Set<(snapshot: UiSnapshot) => void>();
+  private telemetryListeners = new Set<(snapshot: TelemetrySnapshot) => void>();
   private payloads = new Map<string, string>([
     ["macbook-slot", "这段文字来自 MacBook，可以选择后写入当前设备。"],
     ["linux-slot", "https://tauri.app/start/"],
@@ -169,6 +214,21 @@ export class DemoDesktopClient implements DesktopClient {
   subscribe(listener: (snapshot: UiSnapshot) => void): Unsubscribe {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+
+  async getTelemetry(): Promise<TelemetrySnapshot> {
+    return structuredClone(this.telemetry);
+  }
+
+  subscribeTelemetry(listener: (snapshot: TelemetrySnapshot) => void): Unsubscribe {
+    this.telemetryListeners.add(listener);
+    return () => this.telemetryListeners.delete(listener);
+  }
+
+  async setTelemetryObserving(_observing: boolean): Promise<void> {}
+
+  async copyDiagnosticReport(report: string): Promise<void> {
+    await this.writeClipboard(report);
   }
 
   async useSlot(slotId: string, revision: number): Promise<void> {

@@ -14,6 +14,10 @@ pub(crate) struct ClipboardCapabilities {
     pub(crate) rich_text: bool,
     pub(crate) images: bool,
     pub(crate) files: bool,
+    #[serde(default)]
+    pub(crate) delivery_receipts: bool,
+    #[serde(default)]
+    pub(crate) state_reconciliation: bool,
 }
 
 impl ClipboardCapabilities {
@@ -24,9 +28,15 @@ impl ClipboardCapabilities {
                 rich_text: false,
                 images: false,
                 files: false,
+                delivery_receipts: true,
+                state_reconciliation: true,
             }
         } else {
-            Self::default()
+            Self {
+                delivery_receipts: true,
+                state_reconciliation: true,
+                ..Self::default()
+            }
         }
     }
 }
@@ -38,6 +48,8 @@ impl Default for ClipboardCapabilities {
             rich_text: true,
             images: true,
             files: true,
+            delivery_receipts: false,
+            state_reconciliation: false,
         }
     }
 }
@@ -115,6 +127,18 @@ pub(crate) enum TrustedMessage {
         rtf: Option<String>,
         group_ids: Vec<String>,
     },
+    ClipboardDeliveryAck {
+        schema_version: u8,
+        message_id: String,
+        accepted: bool,
+        message: Option<String>,
+        #[serde(default)]
+        processing_ms: Option<u64>,
+    },
+    ClipboardStateSummary {
+        schema_version: u8,
+        last_received_sequence: Option<u64>,
+    },
     GroupInvite {
         schema_version: u8,
         message_id: String,
@@ -189,6 +213,8 @@ pub(crate) struct FileTransferAck {
     pub(crate) transfer_id: String,
     pub(crate) accepted: bool,
     pub(crate) message: Option<String>,
+    #[serde(default)]
+    pub(crate) processing_ms: Option<u64>,
 }
 
 pub(crate) async fn write_frame<T: Serialize>(
@@ -250,5 +276,38 @@ mod tests {
         assert!(capabilities.rich_text);
         assert!(capabilities.images);
         assert!(capabilities.files);
+        assert!(!capabilities.delivery_receipts);
+        assert!(!capabilities.state_reconciliation);
+        assert!(ClipboardCapabilities::local().delivery_receipts);
+        assert!(ClipboardCapabilities::local().state_reconciliation);
+    }
+
+    #[test]
+    fn older_capability_payload_does_not_enable_delivery_receipts() {
+        let capabilities: ClipboardCapabilities = serde_json::from_value(serde_json::json!({
+            "text": true,
+            "richText": true,
+            "images": true,
+            "files": true
+        }))
+        .unwrap();
+        assert!(!capabilities.delivery_receipts);
+        assert!(!capabilities.state_reconciliation);
+    }
+
+    #[test]
+    fn older_delivery_ack_without_processing_time_is_accepted() {
+        let message: TrustedMessage = serde_json::from_value(serde_json::json!({
+            "type": "clipboard_delivery_ack",
+            "schema_version": 1,
+            "message_id": "message-1",
+            "accepted": true,
+            "message": null
+        }))
+        .unwrap();
+        let TrustedMessage::ClipboardDeliveryAck { processing_ms, .. } = message else {
+            panic!("expected clipboard delivery acknowledgement");
+        };
+        assert_eq!(processing_ms, None);
     }
 }

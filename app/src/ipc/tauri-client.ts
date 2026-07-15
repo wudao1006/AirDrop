@@ -2,11 +2,12 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { DesktopClient, Unsubscribe } from "./client";
 import { DemoDesktopClient } from "./demo-client";
-import type { AppSettings, UiSnapshot } from "../model";
+import type { AppSettings, TelemetrySnapshot, UiSnapshot } from "../model";
 import { loadAppearanceSettings, normalizeAppearanceSettings, saveAppearanceSettings } from "../features/settings/appearance";
 import { detectPlatform } from "../platform/runtime";
 
 const SNAPSHOT_EVENT = "airdrop://snapshot";
+const TELEMETRY_EVENT = "airdrop://telemetry";
 
 const browserClipboardWriter = async (text: string): Promise<void> => {
   if (!navigator.clipboard) {
@@ -52,6 +53,32 @@ class TauriAppClient implements DesktopClient {
       active = false;
       dispose?.();
     };
+  }
+
+  getTelemetry(): Promise<TelemetrySnapshot> {
+    return invoke("get_telemetry");
+  }
+
+  subscribeTelemetry(listener: (snapshot: TelemetrySnapshot) => void): Unsubscribe {
+    let active = true;
+    let dispose: Unsubscribe | undefined;
+    void listen<TelemetrySnapshot>(TELEMETRY_EVENT, ({ payload }) => {
+      if (active) listener(payload);
+    }).then((unlisten) => {
+      if (!active) unlisten(); else dispose = unlisten;
+    });
+    return () => {
+      active = false;
+      dispose?.();
+    };
+  }
+
+  setTelemetryObserving(observing: boolean): Promise<void> {
+    return invoke("set_telemetry_observing", { observing });
+  }
+
+  copyDiagnosticReport(report: string): Promise<void> {
+    return invoke("copy_diagnostic_report", { report });
   }
 
   async useSlot(slotId: string, revision: number): Promise<void> {

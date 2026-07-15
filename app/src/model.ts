@@ -84,6 +84,59 @@ export interface TrustedDevice {
   syncEnabled: boolean;
 }
 
+export interface PeerTelemetry {
+  deviceId: string;
+  connected: boolean;
+  rttMs: number | null;
+  uploadBps: number;
+  downloadBps: number;
+  recentUploadBps: number;
+  recentDownloadBps: number;
+  lossPercent: number;
+  totalUploadedBytes: number;
+  totalDownloadedBytes: number;
+  connectedAt: string | null;
+  lastActivityAt: string | null;
+  reconnectCount: number;
+  lastDisconnectReason: string | null;
+  lastDisconnectCode: string | null;
+  lastDisconnectedAt: string | null;
+  lastDisconnectPlanned: boolean;
+  unexpectedDisconnectCount: number;
+}
+
+export interface TransferTelemetry {
+  id: string;
+  attemptId: number;
+  deviceId: string;
+  direction: "upload" | "download";
+  kind: "text" | "url" | "html" | "image" | "files";
+  totalBytes: number;
+  transferredBytes: number;
+  startedAt: string;
+  completedAt: string | null;
+  durationMs: number;
+  networkDurationMs: number | null;
+  confirmationDurationMs: number | null;
+  remoteProcessingMs: number | null;
+  speedBps: number;
+  averageBps: number;
+  status: "active" | "success" | "sent" | "failed";
+  message: string | null;
+}
+
+export interface TelemetrySnapshot {
+  sampledAt: string;
+  peers: PeerTelemetry[];
+  transfers: TransferTelemetry[];
+}
+
+export const EMPTY_TELEMETRY: TelemetrySnapshot = {
+  sampledAt: "1970-01-01T00:00:00Z",
+  peers: [],
+  transfers: [],
+};
+
 export interface PendingPairing {
   pairingId: string;
   deviceId: string;
@@ -209,3 +262,5 @@ export const formatBytes = (bytes: number): string => {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
   return `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
 };
+
+export const formatRate = (bytesPerSecond: number): string => `${formatBytes(bytesPerSecond)}/s`;

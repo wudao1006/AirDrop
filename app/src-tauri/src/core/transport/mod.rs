@@ -10,6 +10,7 @@ use super::{
     identity::device_id_for_key,
     service::{self, PendingPairing, ServiceState},
     storage::TrustedDevice,
+    telemetry::{TelemetrySnapshot, TelemetryStore},
 };
 use crate::platform;
 use data_encoding::{BASE64, HEXLOWER};
@@ -31,18 +32,18 @@ use rustls::{
 };
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, State};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 type HmacSha256 = Hmac<Sha256>;
 const MAX_IMAGE_BLOB: usize = 16 * 1024 * 1024;
@@ -50,6 +51,15 @@ const IMAGE_BLOB_KIND: u8 = 1;
 const FILE_BLOB_KIND: u8 = 2;
 const CONNECTION_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const DELIVERY_RECEIPT_TIMEOUT: Duration = Duration::from_secs(15);
+
+type PendingDeliveryReceipts = Arc<Mutex<HashMap<String, oneshot::Sender<DeliveryReceipt>>>>;
+
+struct DeliveryReceipt {
+    accepted: bool,
+    message: Option<String>,
+    processing_ms: Option<u64>,
+}
 
 struct PairCommandRegistration {
     commands: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<bool>>>>,
@@ -60,6 +70,8 @@ struct PeerConnection {
     sender: mpsc::UnboundedSender<TrustedMessage>,
     connection: Connection,
     capabilities: ClipboardCapabilities,
+    pending_receipts: PendingDeliveryReceipts,
+    blob_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Clone)]
@@ -122,14 +134,52 @@ pub(crate) struct TransportHandle {
     pair_commands: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<bool>>>>,
     pairing_connecting: Arc<Mutex<HashMap<String, u64>>>,
     peers: Arc<Mutex<HashMap<String, PeerConnection>>>,
+    preferred_addresses: Arc<Mutex<HashMap<String, IpAddr>>>,
     connecting: Arc<Mutex<HashMap<String, u64>>>,
     latest_offer: Arc<Mutex<Option<LocalTextOffer>>>,
     latest_rich: Arc<Mutex<Option<LocalRichOffer>>>,
     latest_image: Arc<Mutex<Option<LocalImageOffer>>>,
     latest_files: Arc<Mutex<Option<LocalFileOffer>>>,
+    latest_content_sequence: Arc<AtomicU64>,
+    telemetry_observed: Arc<AtomicBool>,
+    telemetry_notify: Arc<tokio::sync::Notify>,
+    telemetry: TelemetryStore,
 }
 
 impl TransportHandle {
+    pub(crate) fn telemetry_snapshot(&self) -> TelemetrySnapshot {
+        self.telemetry.snapshot()
+    }
+
+    pub(crate) fn flush_telemetry_history(&self) -> Result<(), String> {
+        self.telemetry.flush_history()
+    }
+
+    fn sample_telemetry(&self) {
+        let connections = self
+            .peers
+            .lock()
+            .map(|peers| {
+                peers
+                    .iter()
+                    .map(|(device_id, peer)| (device_id.clone(), peer.connection.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for (device_id, connection) in connections {
+            self.telemetry.sample_connection(&device_id, &connection);
+        }
+    }
+
+    pub(crate) fn set_telemetry_observing(&self, app: &AppHandle, observing: bool) {
+        self.telemetry_observed.store(observing, Ordering::Release);
+        if observing {
+            self.sample_telemetry();
+            self.telemetry.emit(app);
+        }
+        self.telemetry_notify.notify_one();
+    }
+
     pub(crate) fn allow_pairing(&self, seconds: u64) -> Result<u64, String> {
         if !self.is_active() {
             return Err("回到前台后才能开放配对窗口".into());
@@ -155,7 +205,7 @@ impl TransportHandle {
     }
 
     #[cfg(mobile)]
-    pub(crate) fn suspend(&self, _app: AppHandle) {
+    pub(crate) fn suspend(&self, app: AppHandle) {
         self.active.store(false, Ordering::Release);
         self.runtime_generation.fetch_add(1, Ordering::AcqRel);
         if let Ok(mut expiry) = self.pairing_allowed_until.lock() {
@@ -175,13 +225,23 @@ impl TransportHandle {
             .map(|mut peers| {
                 peers
                     .drain()
-                    .map(|(_, peer)| peer.connection)
+                    .map(|(device_id, peer)| (device_id, peer.connection, peer.pending_receipts))
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        for connection in connections {
+        for (device_id, connection, pending_receipts) in connections {
+            fail_pending_delivery_receipts(&pending_receipts, "移动端运行时已暂停");
+            self.telemetry.mark_disconnected(
+                &device_id,
+                &connection,
+                "app_suspended",
+                "移动端运行时已暂停",
+                true,
+            );
             connection.close(4u32.into(), b"mobile runtime suspended");
         }
+        self.telemetry.emit(&app);
+        self.telemetry_notify.notify_one();
         if let Ok(mut connecting) = self.connecting.lock() {
             connecting.clear();
         }
@@ -196,6 +256,7 @@ impl TransportHandle {
             self.runtime_generation.fetch_add(1, Ordering::AcqRel);
         }
         self.active.store(true, Ordering::Release);
+        self.telemetry_notify.notify_one();
     }
 
     pub(crate) fn confirm_pairing(&self, pairing_id: &str, accepted: bool) -> Result<(), String> {
@@ -226,6 +287,8 @@ impl TransportHandle {
             content_type: service::text_content_type(&text).into(),
             text,
         };
+        self.latest_content_sequence
+            .store(sequence, Ordering::Release);
         if let Ok(mut latest) = self.latest_offer.lock() {
             *latest = Some(offer.clone());
         }
@@ -278,6 +341,8 @@ impl TransportHandle {
             html,
             rtf,
         };
+        self.latest_content_sequence
+            .store(sequence, Ordering::Release);
         if let Ok(mut latest) = self.latest_rich.lock() {
             *latest = Some(offer.clone());
         }
@@ -358,6 +423,8 @@ impl TransportHandle {
             height,
             png: Arc::new(png),
         };
+        self.latest_content_sequence
+            .store(sequence, Ordering::Release);
         if let Ok(mut latest) = self.latest_image.lock() {
             *latest = Some(offer.clone());
         }
@@ -372,19 +439,84 @@ impl TransportHandle {
                     .iter()
                     .filter_map(|(device_id, peer)| {
                         peer.capabilities.images.then(|| {
-                            targets
-                                .get(device_id)
-                                .map(|groups| (peer.connection.clone(), groups.clone()))
+                            targets.get(device_id).map(|groups| {
+                                (
+                                    device_id.clone(),
+                                    peer.connection.clone(),
+                                    groups.clone(),
+                                    peer.capabilities
+                                        .delivery_receipts
+                                        .then(|| peer.pending_receipts.clone()),
+                                    peer.blob_semaphore.clone(),
+                                )
+                            })
                         })?
                     })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        for (connection, group_ids) in connections {
+        for (device_id, connection, group_ids, pending_receipts, blob_semaphore) in connections {
             let offer = offer.clone();
+            let telemetry = self.telemetry.clone();
+            let latest_sequence = self.latest_content_sequence.clone();
             self.runtime.spawn(async move {
-                if let Err(error) = send_image_blob(connection, offer, group_ids).await {
+                let Ok(_permit) = blob_semaphore.acquire_owned().await else {
+                    return;
+                };
+                if latest_sequence.load(Ordering::Acquire) != offer.sequence {
+                    return;
+                }
+                let transfer_id = uuid::Uuid::new_v4().simple().to_string();
+                let transfer_key = telemetry.start_transfer(
+                    transfer_id.clone(),
+                    device_id,
+                    "upload",
+                    "image",
+                    offer.png.len() as u64,
+                );
+                let receipt = pending_receipts
+                    .as_ref()
+                    .map(|pending| register_delivery_receipt(pending, &transfer_id))
+                    .transpose();
+                let receipt = match receipt {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        telemetry.finish_transfer(&transfer_key, false, Some(error));
+                        return;
+                    }
+                };
+                let result = send_image_blob(
+                    connection,
+                    offer,
+                    group_ids,
+                    transfer_id.clone(),
+                    &telemetry,
+                    &transfer_key,
+                )
+                .await;
+                if result.is_ok() {
+                    telemetry.mark_network_complete(&transfer_key);
+                }
+                if let Err(error) = result {
+                    if let Some(pending) = pending_receipts.as_ref() {
+                        cancel_delivery_receipt(pending, &transfer_id);
+                    }
+                    telemetry.finish_transfer(&transfer_key, false, Some(error.clone()));
                     tracing::debug!(error = %error, "clipboard image send failed");
+                } else if let (Some(pending), Some(receiver)) = (pending_receipts, receipt) {
+                    finish_after_delivery_receipt(
+                        pending,
+                        transfer_id,
+                        receiver,
+                        telemetry,
+                        transfer_key,
+                    )
+                    .await;
+                } else {
+                    telemetry.finish_unconfirmed(
+                        &transfer_key,
+                        Some("图片已发送；对端版本不支持接收确认".into()),
+                    );
                 }
             });
         }
@@ -393,6 +525,14 @@ impl TransportHandle {
     pub(crate) fn disable_peer(&self, device_id: &str) {
         if let Ok(mut peers) = self.peers.lock() {
             if let Some(peer) = peers.remove(device_id) {
+                fail_pending_delivery_receipts(&peer.pending_receipts, "设备同步已停用");
+                self.telemetry.mark_disconnected(
+                    device_id,
+                    &peer.connection,
+                    "user_disabled",
+                    "设备同步已停用",
+                    true,
+                );
                 peer.connection
                     .close(3u32.into(), b"device synchronization disabled");
             }
@@ -409,11 +549,19 @@ impl TransportHandle {
             .map(|mut peers| {
                 peers
                     .drain()
-                    .map(|(_, peer)| peer.connection)
+                    .map(|(device_id, peer)| (device_id, peer.connection, peer.pending_receipts))
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        for connection in connections {
+        for (device_id, connection, pending_receipts) in connections {
+            fail_pending_delivery_receipts(&pending_receipts, "本机设备资料已更新");
+            self.telemetry.mark_disconnected(
+                &device_id,
+                &connection,
+                "profile_changed",
+                "本机设备资料已更新",
+                true,
+            );
             connection.close(5u32.into(), b"local device profile changed");
         }
     }
@@ -449,6 +597,8 @@ impl TransportHandle {
             captured_at,
             bundle: Arc::new(bundle),
         };
+        self.latest_content_sequence
+            .store(sequence, Ordering::Release);
         if let Ok(mut latest) = self.latest_files.lock() {
             *latest = Some(offer.clone());
         }
@@ -463,18 +613,55 @@ impl TransportHandle {
                     .iter()
                     .filter_map(|(device_id, peer)| {
                         peer.capabilities.files.then(|| {
-                            targets
-                                .get(device_id)
-                                .map(|groups| (peer.connection.clone(), groups.clone()))
+                            targets.get(device_id).map(|groups| {
+                                (
+                                    device_id.clone(),
+                                    peer.connection.clone(),
+                                    groups.clone(),
+                                    peer.blob_semaphore.clone(),
+                                )
+                            })
                         })?
                     })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        for (connection, group_ids) in connections {
+        for (device_id, connection, group_ids, blob_semaphore) in connections {
             let offer = offer.clone();
+            let telemetry = self.telemetry.clone();
+            let latest_sequence = self.latest_content_sequence.clone();
             self.runtime.spawn(async move {
-                if let Err(error) = send_file_blob_with_retry(connection, offer, group_ids).await {
+                let Ok(_permit) = blob_semaphore.acquire_owned().await else {
+                    return;
+                };
+                if latest_sequence.load(Ordering::Acquire) != offer.sequence {
+                    return;
+                }
+                let transfer_key = telemetry.start_transfer(
+                    offer.transfer_id.clone(),
+                    device_id,
+                    "upload",
+                    "files",
+                    offer.bundle.total_size,
+                );
+                let result = send_file_blob_with_retry(
+                    connection,
+                    offer,
+                    group_ids,
+                    &telemetry,
+                    &transfer_key,
+                )
+                .await;
+                telemetry.finish_transfer(
+                    &transfer_key,
+                    result.is_ok(),
+                    result
+                        .as_ref()
+                        .err()
+                        .cloned()
+                        .or_else(|| Some("文件已确认接收".into())),
+                );
+                if let Err(error) = result {
                     tracing::warn!(error = %error, "clipboard file send failed");
                 }
             });
@@ -719,7 +906,7 @@ impl TransportHandle {
                     break;
                 }
                 if retry_delay > 0 {
-                    tokio::time::sleep(Duration::from_secs(retry_delay)).await;
+                    tokio::time::sleep(jittered_retry_delay(retry_delay)).await;
                     if !handle.is_active_generation(generation) {
                         break;
                     }
@@ -740,13 +927,16 @@ impl TransportHandle {
                 let Some(current) = current else {
                     break;
                 };
+                let attempt_started = Instant::now();
                 if let Err(error) = handle
                     .connect_trusted_inner(app.clone(), current, generation)
                     .await
                 {
                     tracing::debug!(device_id = %device_id, error = %error, retry_delay, "trusted connection unavailable");
                 }
-                retry_delay = if retry_delay == 0 {
+                retry_delay = if attempt_started.elapsed() >= Duration::from_secs(30)
+                    || retry_delay == 0
+                {
                     1
                 } else {
                     (retry_delay * 2).min(30)
@@ -760,6 +950,58 @@ impl TransportHandle {
         });
     }
 
+    async fn connect_nearby(
+        &self,
+        nearby: &service::NearbyDevice,
+        config: quinn::ClientConfig,
+        purpose: &str,
+    ) -> Result<Connection, String> {
+        let preferred = self
+            .preferred_addresses
+            .lock()
+            .ok()
+            .and_then(|addresses| addresses.get(&nearby.device_id).copied());
+        let addresses = candidate_addresses(nearby, preferred);
+        if addresses.is_empty() {
+            return Err("附近设备尚未解析出可连接地址".into());
+        }
+        let mut attempts = tokio::task::JoinSet::new();
+        for (index, address) in addresses.into_iter().enumerate() {
+            let endpoint = self.endpoint.clone();
+            let config = config.clone();
+            let delay = Duration::from_millis((index.min(4) as u64) * 175);
+            attempts.spawn(async move {
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                let result = match endpoint.connect_with(config, address, "localdrop") {
+                    Ok(connecting) => connecting.await.map_err(|error| error.to_string()),
+                    Err(error) => Err(error.to_string()),
+                };
+                (address, result)
+            });
+        }
+        let mut errors = Vec::new();
+        while let Some(attempt) = attempts.join_next().await {
+            match attempt {
+                Ok((address, Ok(connection))) => {
+                    attempts.abort_all();
+                    if let Ok(mut preferred) = self.preferred_addresses.lock() {
+                        preferred.insert(nearby.device_id.clone(), address.ip());
+                    }
+                    return Ok(connection);
+                }
+                Ok((address, Err(error))) => errors.push(format!("{address}: {error}")),
+                Err(error) if !error.is_cancelled() => errors.push(error.to_string()),
+                Err(_) => {}
+            }
+        }
+        Err(format!(
+            "{purpose}无法连接任何已发现地址：{}",
+            errors.join("；")
+        ))
+    }
+
     async fn connect_pairing_inner(
         &self,
         app: AppHandle,
@@ -769,19 +1011,13 @@ impl TransportHandle {
         if !self.is_active_generation(generation) {
             return Err("回到前台后才能发起配对".into());
         }
-        let address = preferred_address(&nearby)?;
         let config = client_config(
             None,
             PAIR_ALPN,
             self.certificate_der.clone(),
             self.private_key_der.clone(),
         )?;
-        let connection = self
-            .endpoint
-            .connect_with(config, address, "localdrop")
-            .map_err(|error| format!("无法创建配对连接：{error}"))?
-            .await
-            .map_err(|error| format!("无法连接附近设备：{error}"))?;
+        let connection = self.connect_nearby(&nearby, config, "配对").await?;
         if !self.is_active_generation(generation) {
             connection.close(4u32.into(), b"mobile runtime suspended");
             return Err("移动端当前处于后台暂停状态".into());
@@ -885,12 +1121,7 @@ impl TransportHandle {
             self.certificate_der.clone(),
             self.private_key_der.clone(),
         )?;
-        let connection = self
-            .endpoint
-            .connect_with(config, preferred_address(&nearby)?, "localdrop")
-            .map_err(|error| format!("无法创建可信连接：{error}"))?
-            .await
-            .map_err(|error| format!("可信连接失败：{error}"))?;
+        let connection = self.connect_nearby(&nearby, config, "可信连接").await?;
         let (send, receive) = connection
             .open_bi()
             .await
@@ -1131,8 +1362,34 @@ impl TransportHandle {
             trusted.platform = platform;
             trusted
         };
+        let remote_received_sequence = if remote_capabilities.state_reconciliation {
+            let last_received_sequence = {
+                let state = app.state::<ServiceState>();
+                state.reconciliation_sequence(&device_id)
+            };
+            write_frame(
+                &mut send,
+                &TrustedMessage::ClipboardStateSummary {
+                    schema_version: 1,
+                    last_received_sequence,
+                },
+            )
+            .await?;
+            match read_frame::<TrustedMessage>(&mut receive).await? {
+                TrustedMessage::ClipboardStateSummary {
+                    schema_version: 1,
+                    last_received_sequence,
+                } => last_received_sequence,
+                _ => return Err("可信连接缺少有效剪贴板状态摘要".into()),
+            }
+        } else {
+            None
+        };
         let (sender, mut outbound) = mpsc::unbounded_channel::<TrustedMessage>();
-        {
+        let receipt_sender = sender.clone();
+        let pending_receipts = PendingDeliveryReceipts::default();
+        let blob_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let replaced_peer = {
             let mut peers = self
                 .peers
                 .lock()
@@ -1147,17 +1404,42 @@ impl TransportHandle {
                     sender,
                     connection: connection.clone(),
                     capabilities: remote_capabilities.clone(),
+                    pending_receipts: pending_receipts.clone(),
+                    blob_semaphore: blob_semaphore.clone(),
                 },
+            )
+        };
+        if let Some(replaced) = replaced_peer {
+            fail_pending_delivery_receipts(&replaced.pending_receipts, "可信连接已被新的连接替换");
+            self.telemetry.mark_disconnected(
+                &device_id,
+                &replaced.connection,
+                "connection_replaced",
+                "可信连接已被新的连接替换",
+                true,
             );
+            replaced
+                .connection
+                .close(6u32.into(), b"superseded trusted connection");
         }
         {
             let state = app.state::<ServiceState>();
             service::set_trusted_online(&state, &app, &device_id, true)?;
         }
+        self.telemetry.mark_connected(&device_id, &connection);
+        self.telemetry.emit(&app);
         if !self.is_active_generation(generation) {
             if self.remove_peer_if_current(&device_id, &connection) {
                 let state = app.state::<ServiceState>();
                 let _ = service::set_trusted_online(&state, &app, &device_id, false);
+                self.telemetry.mark_disconnected(
+                    &device_id,
+                    &connection,
+                    "app_suspended",
+                    "移动端运行时已暂停",
+                    true,
+                );
+                self.telemetry.emit(&app);
             }
             connection.close(4u32.into(), b"mobile runtime suspended");
             return Err("移动端当前处于后台暂停状态".into());
@@ -1172,6 +1454,7 @@ impl TransportHandle {
                 .lock()
                 .ok()
                 .and_then(|latest| latest.clone())
+                .filter(|latest| should_replay_sequence(latest.sequence, remote_received_sequence))
             {
                 let groups = {
                     let state = app.state::<ServiceState>();
@@ -1206,6 +1489,7 @@ impl TransportHandle {
             .lock()
             .ok()
             .and_then(|latest| latest.clone())
+            .filter(|latest| should_replay_sequence(latest.sequence, remote_received_sequence))
         {
             let (rich_groups, text_groups) = {
                 let state = app.state::<ServiceState>();
@@ -1276,6 +1560,7 @@ impl TransportHandle {
                 .lock()
                 .ok()
                 .and_then(|latest| latest.clone())
+                .filter(|latest| should_replay_sequence(latest.sequence, remote_received_sequence))
             {
                 let connection = connection.clone();
                 let groups = {
@@ -1290,10 +1575,72 @@ impl TransportHandle {
                         })
                         .flatten()
                 };
+                let telemetry = self.telemetry.clone();
+                let telemetry_device_id = device_id.clone();
+                let image_receipts = remote_capabilities
+                    .delivery_receipts
+                    .then(|| pending_receipts.clone());
+                let image_blob_semaphore = blob_semaphore.clone();
+                let latest_sequence = self.latest_content_sequence.clone();
                 self.runtime.spawn(async move {
                     if let Some(group_ids) = groups {
-                        if let Err(error) = send_image_blob(connection, image, group_ids).await {
+                        let Ok(_permit) = image_blob_semaphore.acquire_owned().await else {
+                            return;
+                        };
+                        if latest_sequence.load(Ordering::Acquire) != image.sequence {
+                            return;
+                        }
+                        let transfer_id = uuid::Uuid::new_v4().simple().to_string();
+                        let transfer_key = telemetry.start_transfer(
+                            transfer_id.clone(),
+                            telemetry_device_id,
+                            "upload",
+                            "image",
+                            image.png.len() as u64,
+                        );
+                        let receipt = image_receipts
+                            .as_ref()
+                            .map(|pending| register_delivery_receipt(pending, &transfer_id))
+                            .transpose();
+                        let receipt = match receipt {
+                            Ok(receipt) => receipt,
+                            Err(error) => {
+                                telemetry.finish_transfer(&transfer_key, false, Some(error));
+                                return;
+                            }
+                        };
+                        let result = send_image_blob(
+                            connection,
+                            image,
+                            group_ids,
+                            transfer_id.clone(),
+                            &telemetry,
+                            &transfer_key,
+                        )
+                        .await;
+                        if result.is_ok() {
+                            telemetry.mark_network_complete(&transfer_key);
+                        }
+                        if let Err(error) = result {
+                            if let Some(pending) = image_receipts.as_ref() {
+                                cancel_delivery_receipt(pending, &transfer_id);
+                            }
+                            telemetry.finish_transfer(&transfer_key, false, Some(error.clone()));
                             tracing::debug!(error = %error, "cached clipboard image send failed");
+                        } else if let (Some(pending), Some(receiver)) = (image_receipts, receipt) {
+                            finish_after_delivery_receipt(
+                                pending,
+                                transfer_id,
+                                receiver,
+                                telemetry,
+                                transfer_key,
+                            )
+                            .await;
+                        } else {
+                            telemetry.finish_unconfirmed(
+                                &transfer_key,
+                                Some("离线图片已补发；对端版本不支持接收确认".into()),
+                            );
                         }
                     }
                 });
@@ -1305,6 +1652,7 @@ impl TransportHandle {
                 .lock()
                 .ok()
                 .and_then(|latest| latest.clone())
+                .filter(|latest| should_replay_sequence(latest.sequence, remote_received_sequence))
             {
                 let connection = connection.clone();
                 let groups = {
@@ -1319,11 +1667,43 @@ impl TransportHandle {
                         })
                         .flatten()
                 };
+                let telemetry = self.telemetry.clone();
+                let telemetry_device_id = device_id.clone();
+                let file_blob_semaphore = blob_semaphore.clone();
+                let latest_sequence = self.latest_content_sequence.clone();
                 self.runtime.spawn(async move {
                     if let Some(group_ids) = groups {
-                        if let Err(error) =
-                            send_file_blob_with_retry(connection, files, group_ids).await
-                        {
+                        let Ok(_permit) = file_blob_semaphore.acquire_owned().await else {
+                            return;
+                        };
+                        if latest_sequence.load(Ordering::Acquire) != files.sequence {
+                            return;
+                        }
+                        let transfer_key = telemetry.start_transfer(
+                            files.transfer_id.clone(),
+                            telemetry_device_id,
+                            "upload",
+                            "files",
+                            files.bundle.total_size,
+                        );
+                        let result = send_file_blob_with_retry(
+                            connection,
+                            files,
+                            group_ids,
+                            &telemetry,
+                            &transfer_key,
+                        )
+                        .await;
+                        telemetry.finish_transfer(
+                            &transfer_key,
+                            result.is_ok(),
+                            result
+                                .as_ref()
+                                .err()
+                                .cloned()
+                                .or_else(|| Some("离线文件已补发".into())),
+                        );
+                        if let Err(error) = result {
                             tracing::warn!(error = %error, "cached clipboard file send failed");
                         }
                     }
@@ -1331,11 +1711,93 @@ impl TransportHandle {
             }
         }
         let writer_connection = connection.clone();
+        let writer_telemetry = self.telemetry.clone();
+        let writer_device_id = device_id.clone();
+        let writer_pending_receipts = pending_receipts.clone();
+        let writer_supports_receipts = remote_capabilities.delivery_receipts;
         let writer = tokio::spawn(async move {
-            while let Some(message) = outbound.recv().await {
-                if write_frame(&mut send, &message).await.is_err() {
-                    writer_connection.close(1u32.into(), b"trusted writer failed");
+            let mut deferred = VecDeque::new();
+            loop {
+                let mut message = if let Some(message) = deferred.pop_front() {
+                    message
+                } else if let Some(message) = outbound.recv().await {
+                    message
+                } else {
                     break;
+                };
+                if is_clipboard_offer(&message) {
+                    while let Ok(next) = outbound.try_recv() {
+                        if is_clipboard_offer(&next) {
+                            message = next;
+                        } else {
+                            deferred.push_back(next);
+                            break;
+                        }
+                    }
+                }
+                let transfer = trusted_message_transfer(&message).map(|(id, kind, size)| {
+                    let key = writer_telemetry.start_transfer(
+                        id.clone(),
+                        writer_device_id.clone(),
+                        "upload",
+                        kind,
+                        size,
+                    );
+                    (id, key)
+                });
+                let receipt = if writer_supports_receipts {
+                    match transfer.as_ref() {
+                        Some((message_id, transfer_key)) => {
+                            match register_delivery_receipt(&writer_pending_receipts, message_id) {
+                                Ok(receiver) => Some(receiver),
+                                Err(error) => {
+                                    writer_telemetry.finish_transfer(
+                                        transfer_key,
+                                        false,
+                                        Some(error),
+                                    );
+                                    writer_connection.close(
+                                        1u32.into(),
+                                        b"delivery receipt registration failed",
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+                match write_frame(&mut send, &message).await {
+                    Ok(()) => {
+                        if let Some((message_id, key)) = transfer {
+                            writer_telemetry.update_transfer(&key, trusted_message_size(&message));
+                            writer_telemetry.mark_network_complete(&key);
+                            if let Some(receiver) = receipt {
+                                tokio::spawn(finish_after_delivery_receipt(
+                                    writer_pending_receipts.clone(),
+                                    message_id,
+                                    receiver,
+                                    writer_telemetry.clone(),
+                                    key,
+                                ));
+                            } else {
+                                writer_telemetry.finish_unconfirmed(
+                                    &key,
+                                    Some("已发送；对端版本不支持接收确认".into()),
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        if let Some((message_id, key)) = transfer {
+                            cancel_delivery_receipt(&writer_pending_receipts, &message_id);
+                            writer_telemetry.finish_transfer(&key, false, Some(error));
+                        }
+                        writer_connection.close(1u32.into(), b"trusted writer failed");
+                        break;
+                    }
                 }
             }
         });
@@ -1343,24 +1805,37 @@ impl TransportHandle {
             app.clone(),
             connection.clone(),
             trusted.clone(),
+            self.telemetry.clone(),
+            remote_capabilities
+                .delivery_receipts
+                .then(|| receipt_sender.clone()),
         ));
         let file_reader = tokio::spawn(receive_file_streams(
             app.clone(),
             connection.clone(),
             trusted.clone(),
+            self.telemetry.clone(),
         ));
         loop {
             match read_frame::<TrustedMessage>(&mut receive).await {
                 Ok(TrustedMessage::ClipboardSlotOffer {
                     schema_version: 1,
+                    message_id,
                     origin_sequence,
                     captured_at,
                     text,
                     group_ids,
-                    ..
                 }) => {
+                    let transfer_key = self.telemetry.start_transfer(
+                        message_id.clone(),
+                        device_id.clone(),
+                        "download",
+                        service::text_content_type(&text),
+                        text.len() as u64,
+                    );
+                    let processing_started = Instant::now();
                     let state = app.state::<ServiceState>();
-                    if let Err(error) = service::receive_remote_text(
+                    let result = service::receive_remote_text(
                         &state,
                         &app,
                         &trusted,
@@ -1368,20 +1843,52 @@ impl TransportHandle {
                         text,
                         captured_at,
                         group_ids,
-                    ) {
+                    );
+                    let processing_ms = elapsed_millis(processing_started.elapsed());
+                    if let Err(error) = &result {
                         tracing::warn!(device_id = %device_id, error = %error, "remote clipboard rejected");
+                    }
+                    let accepted = result.is_ok();
+                    let receipt_message = result.as_ref().err().cloned();
+                    self.telemetry.finish_transfer(
+                        &transfer_key,
+                        accepted,
+                        receipt_message
+                            .clone()
+                            .or_else(|| Some("已写入设备槽位".into())),
+                    );
+                    if remote_capabilities.delivery_receipts {
+                        let _ = receipt_sender.send(TrustedMessage::ClipboardDeliveryAck {
+                            schema_version: 1,
+                            message_id,
+                            accepted,
+                            message: receipt_message,
+                            processing_ms: Some(processing_ms),
+                        });
                     }
                 }
                 Ok(TrustedMessage::RichClipboardSlotOffer {
                     schema_version: 1,
+                    message_id,
                     origin_sequence,
                     captured_at,
                     text,
                     html,
                     rtf,
                     group_ids,
-                    ..
                 }) => {
+                    let total_size = text
+                        .len()
+                        .saturating_add(html.as_ref().map_or(0, String::len))
+                        .saturating_add(rtf.as_ref().map_or(0, String::len));
+                    let transfer_key = self.telemetry.start_transfer(
+                        message_id.clone(),
+                        device_id.clone(),
+                        "download",
+                        "html",
+                        total_size as u64,
+                    );
+                    let processing_started = Instant::now();
                     let state = app.state::<ServiceState>();
                     let capabilities = ClipboardCapabilities::local();
                     let result = if capabilities.rich_text {
@@ -1411,8 +1918,45 @@ impl TransportHandle {
                     } else {
                         Err("本机不支持接收文本剪贴板".into())
                     };
-                    if let Err(error) = result {
+                    let processing_ms = elapsed_millis(processing_started.elapsed());
+                    let accepted = result.is_ok();
+                    let receipt_message = result.as_ref().err().cloned();
+                    if let Some(error) = receipt_message.as_ref() {
                         tracing::warn!(device_id = %device_id, error = %error, "remote rich clipboard rejected");
+                        self.telemetry
+                            .finish_transfer(&transfer_key, false, Some(error.clone()));
+                    } else {
+                        self.telemetry.finish_transfer(
+                            &transfer_key,
+                            true,
+                            Some("已写入设备槽位".into()),
+                        );
+                    }
+                    if remote_capabilities.delivery_receipts {
+                        let _ = receipt_sender.send(TrustedMessage::ClipboardDeliveryAck {
+                            schema_version: 1,
+                            message_id,
+                            accepted,
+                            message: receipt_message,
+                            processing_ms: Some(processing_ms),
+                        });
+                    }
+                }
+                Ok(TrustedMessage::ClipboardDeliveryAck {
+                    schema_version: 1,
+                    message_id,
+                    accepted,
+                    message,
+                    processing_ms,
+                }) => {
+                    if !complete_delivery_receipt(
+                        &pending_receipts,
+                        &message_id,
+                        accepted,
+                        message,
+                        processing_ms,
+                    ) {
+                        tracing::debug!(message_id = %message_id, "received stale clipboard delivery receipt");
                     }
                 }
                 Ok(TrustedMessage::GroupInvite {
@@ -1486,18 +2030,40 @@ impl TransportHandle {
                     }
                 }
                 Ok(_) => {
-                    writer.abort();
-                    blob_reader.abort();
-                    file_reader.abort();
-                    return Err("可信连接收到意外消息".into());
-                }
-                Err(error) => {
+                    fail_pending_delivery_receipts(&pending_receipts, "可信连接收到意外消息");
                     writer.abort();
                     blob_reader.abort();
                     file_reader.abort();
                     if self.remove_peer_if_current(&device_id, &connection) {
                         let state = app.state::<ServiceState>();
                         let _ = service::set_trusted_online(&state, &app, &device_id, false);
+                        self.telemetry.mark_disconnected(
+                            &device_id,
+                            &connection,
+                            "protocol_rejected",
+                            "可信连接收到意外消息",
+                            false,
+                        );
+                        self.telemetry.emit(&app);
+                    }
+                    return Err("可信连接收到意外消息".into());
+                }
+                Err(error) => {
+                    fail_pending_delivery_receipts(&pending_receipts, &error);
+                    writer.abort();
+                    blob_reader.abort();
+                    file_reader.abort();
+                    if self.remove_peer_if_current(&device_id, &connection) {
+                        let state = app.state::<ServiceState>();
+                        let _ = service::set_trusted_online(&state, &app, &device_id, false);
+                        self.telemetry.mark_disconnected(
+                            &device_id,
+                            &connection,
+                            disconnect_code(&error),
+                            error.clone(),
+                            false,
+                        );
+                        self.telemetry.emit(&app);
                     }
                     connection.close(0u32.into(), b"closed");
                     return Err(error);
@@ -1507,10 +2073,150 @@ impl TransportHandle {
     }
 }
 
+fn register_delivery_receipt(
+    pending: &PendingDeliveryReceipts,
+    message_id: &str,
+) -> Result<oneshot::Receiver<DeliveryReceipt>, String> {
+    let (sender, receiver) = oneshot::channel();
+    let mut receipts = pending
+        .lock()
+        .map_err(|_| "传输回执状态锁已损坏".to_string())?;
+    if receipts.contains_key(message_id) {
+        return Err("传输消息 ID 出现重复".into());
+    }
+    receipts.insert(message_id.to_string(), sender);
+    Ok(receiver)
+}
+
+fn cancel_delivery_receipt(pending: &PendingDeliveryReceipts, message_id: &str) {
+    if let Ok(mut receipts) = pending.lock() {
+        receipts.remove(message_id);
+    }
+}
+
+fn complete_delivery_receipt(
+    pending: &PendingDeliveryReceipts,
+    message_id: &str,
+    accepted: bool,
+    message: Option<String>,
+    processing_ms: Option<u64>,
+) -> bool {
+    pending
+        .lock()
+        .ok()
+        .and_then(|mut receipts| receipts.remove(message_id))
+        .is_some_and(|sender| {
+            sender
+                .send(DeliveryReceipt {
+                    accepted,
+                    message,
+                    processing_ms,
+                })
+                .is_ok()
+        })
+}
+
+fn fail_pending_delivery_receipts(pending: &PendingDeliveryReceipts, reason: &str) {
+    let senders = pending
+        .lock()
+        .map(|mut receipts| {
+            receipts
+                .drain()
+                .map(|(_, sender)| sender)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for sender in senders {
+        let _ = sender.send(DeliveryReceipt {
+            accepted: false,
+            message: Some(reason.to_string()),
+            processing_ms: None,
+        });
+    }
+}
+
+async fn finish_after_delivery_receipt(
+    pending: PendingDeliveryReceipts,
+    message_id: String,
+    receiver: oneshot::Receiver<DeliveryReceipt>,
+    telemetry: TelemetryStore,
+    transfer_key: String,
+) {
+    match tokio::time::timeout(DELIVERY_RECEIPT_TIMEOUT, receiver).await {
+        Ok(Ok(receipt)) => {
+            telemetry.set_remote_processing(&transfer_key, receipt.processing_ms);
+            telemetry.finish_transfer(
+                &transfer_key,
+                receipt.accepted,
+                receipt.message.or_else(|| {
+                    Some(if receipt.accepted {
+                        "对端已确认接收".into()
+                    } else {
+                        "对端拒绝了同步内容".into()
+                    })
+                }),
+            );
+        }
+        Ok(Err(_)) => telemetry.finish_transfer(
+            &transfer_key,
+            false,
+            Some("可信连接在返回接收确认前已关闭".into()),
+        ),
+        Err(_) => {
+            cancel_delivery_receipt(&pending, &message_id);
+            telemetry.finish_transfer(&transfer_key, false, Some("等待对端接收确认超时".into()));
+        }
+    }
+}
+
+fn trusted_message_transfer(message: &TrustedMessage) -> Option<(String, &'static str, u64)> {
+    match message {
+        TrustedMessage::ClipboardSlotOffer {
+            message_id, text, ..
+        } => Some((
+            message_id.clone(),
+            service::text_content_type(text),
+            text.len() as u64,
+        )),
+        TrustedMessage::RichClipboardSlotOffer {
+            message_id,
+            text,
+            html,
+            rtf,
+            ..
+        } => Some((
+            message_id.clone(),
+            "html",
+            text.len()
+                .saturating_add(html.as_ref().map_or(0, String::len))
+                .saturating_add(rtf.as_ref().map_or(0, String::len)) as u64,
+        )),
+        _ => None,
+    }
+}
+
+fn is_clipboard_offer(message: &TrustedMessage) -> bool {
+    matches!(
+        message,
+        TrustedMessage::ClipboardSlotOffer { .. } | TrustedMessage::RichClipboardSlotOffer { .. }
+    )
+}
+
+fn trusted_message_size(message: &TrustedMessage) -> u64 {
+    trusted_message_transfer(message).map_or(0, |(_, _, size)| size)
+}
+
+fn should_replay_sequence(sequence: u64, remote_received_sequence: Option<u64>) -> bool {
+    remote_received_sequence.is_none_or(|received| sequence > received)
+}
+
 async fn send_image_blob(
     connection: Connection,
     offer: LocalImageOffer,
     group_ids: Vec<String>,
+    message_id: String,
+    telemetry: &TelemetryStore,
+    transfer_key: &str,
 ) -> Result<(), String> {
     let mut send = connection
         .open_uni()
@@ -1518,7 +2224,7 @@ async fn send_image_blob(
         .map_err(|error| format!("无法打开图片数据流：{error}"))?;
     let header = ImageBlobHeader {
         schema_version: 1,
-        message_id: uuid::Uuid::new_v4().simple().to_string(),
+        message_id,
         origin_sequence: offer.sequence,
         captured_at: offer.captured_at,
         width: offer.width,
@@ -1531,9 +2237,14 @@ async fn send_image_blob(
         .await
         .map_err(|error| format!("图片数据流类型发送失败：{error}"))?;
     write_frame(&mut send, &header).await?;
-    send.write_all(offer.png.as_slice())
-        .await
-        .map_err(|error| format!("图片数据发送失败：{error}"))?;
+    let mut transferred = 0_u64;
+    for chunk in offer.png.chunks(64 * 1024) {
+        send.write_all(chunk)
+            .await
+            .map_err(|error| format!("图片数据发送失败：{error}"))?;
+        transferred = transferred.saturating_add(chunk.len() as u64);
+        telemetry.update_transfer(transfer_key, transferred);
+    }
     send.finish()
         .map_err(|error| format!("图片数据流结束失败：{error}"))
 }
@@ -1542,6 +2253,8 @@ async fn send_file_blob(
     connection: Connection,
     offer: LocalFileOffer,
     group_ids: Vec<String>,
+    telemetry: &TelemetryStore,
+    transfer_key: &str,
 ) -> Result<(), String> {
     let (mut send, mut receive) = connection
         .open_bi()
@@ -1567,6 +2280,13 @@ async fn send_file_blob(
     {
         return Err("文件续传计划无效".into());
     }
+    let mut transferred = header
+        .entries
+        .iter()
+        .zip(&plan.offsets)
+        .map(|(entry, offset)| (*offset).min(entry.size))
+        .sum::<u64>();
+    telemetry.set_transfer_baseline(transfer_key, transferred);
     let mut buffer = vec![0_u8; 64 * 1024];
     for (entry, offset) in header.entries.iter().zip(plan.offsets) {
         if entry.is_directory {
@@ -1600,11 +2320,15 @@ async fn send_file_blob(
                 .await
                 .map_err(|error| format!("文件数据发送失败：{error}"))?;
             remaining -= read as u64;
+            transferred = transferred.saturating_add(read as u64);
+            telemetry.update_transfer(transfer_key, transferred);
         }
     }
     send.finish()
         .map_err(|error| format!("文件数据流结束失败：{error}"))?;
+    telemetry.mark_network_complete(transfer_key);
     let acknowledgement: FileTransferAck = read_frame(&mut receive).await?;
+    telemetry.set_remote_processing(transfer_key, acknowledgement.processing_ms);
     if acknowledgement.schema_version != 1
         || acknowledgement.transfer_id != header.message_id
         || !acknowledgement.accepted
@@ -1620,15 +2344,25 @@ async fn send_file_blob_with_retry(
     connection: Connection,
     offer: LocalFileOffer,
     group_ids: Vec<String>,
+    telemetry: &TelemetryStore,
+    transfer_key: &str,
 ) -> Result<(), String> {
-    match send_file_blob(connection.clone(), offer.clone(), group_ids.clone()).await {
+    match send_file_blob(
+        connection.clone(),
+        offer.clone(),
+        group_ids.clone(),
+        telemetry,
+        transfer_key,
+    )
+    .await
+    {
         Ok(()) => Ok(()),
         Err(first_error) => {
             if connection.close_reason().is_some() {
                 return Err(first_error);
             }
             tokio::time::sleep(Duration::from_millis(350)).await;
-            send_file_blob(connection, offer, group_ids)
+            send_file_blob(connection, offer, group_ids, telemetry, transfer_key)
                 .await
                 .map_err(|second_error| {
                     format!("文件流首次发送失败：{first_error}；重试失败：{second_error}")
@@ -1637,14 +2371,29 @@ async fn send_file_blob_with_retry(
     }
 }
 
-async fn receive_clipboard_blobs(app: AppHandle, connection: Connection, device: TrustedDevice) {
+async fn receive_clipboard_blobs(
+    app: AppHandle,
+    connection: Connection,
+    device: TrustedDevice,
+    telemetry: TelemetryStore,
+    receipt_sender: Option<mpsc::UnboundedSender<TrustedMessage>>,
+) {
     loop {
         let mut receive = match connection.accept_uni().await {
             Ok(receive) => receive,
             Err(_) => return,
         };
         let result = match receive.read_u8().await {
-            Ok(IMAGE_BLOB_KIND) => receive_image_blob(&app, &device, &mut receive).await,
+            Ok(IMAGE_BLOB_KIND) => {
+                receive_image_blob(
+                    &app,
+                    &device,
+                    &mut receive,
+                    &telemetry,
+                    receipt_sender.as_ref(),
+                )
+                .await
+            }
             Ok(FILE_BLOB_KIND) => Err("文件剪贴板必须使用可续传双向流".into()),
             Ok(_) => Err("未知剪贴板数据流类型".into()),
             Err(error) => Err(format!("无法读取剪贴板数据流类型：{error}")),
@@ -1655,14 +2404,21 @@ async fn receive_clipboard_blobs(app: AppHandle, connection: Connection, device:
     }
 }
 
-async fn receive_file_streams(app: AppHandle, connection: Connection, device: TrustedDevice) {
+async fn receive_file_streams(
+    app: AppHandle,
+    connection: Connection,
+    device: TrustedDevice,
+    telemetry: TelemetryStore,
+) {
     loop {
         let (mut send, mut receive) = match connection.accept_bi().await {
             Ok(streams) => streams,
             Err(_) => return,
         };
         let result = match receive.read_u8().await {
-            Ok(FILE_BLOB_KIND) => receive_file_blob(&app, &device, &mut send, &mut receive).await,
+            Ok(FILE_BLOB_KIND) => {
+                receive_file_blob(&app, &device, &mut send, &mut receive, &telemetry).await
+            }
             Ok(_) => Err("可信连接收到未知双向数据流".into()),
             Err(error) => Err(format!("无法读取双向数据流类型：{error}")),
         };
@@ -1676,53 +2432,106 @@ async fn receive_image_blob(
     app: &AppHandle,
     device: &TrustedDevice,
     receive: &mut quinn::RecvStream,
+    telemetry: &TelemetryStore,
+    receipt_sender: Option<&mpsc::UnboundedSender<TrustedMessage>>,
 ) -> Result<(), String> {
-    if !ClipboardCapabilities::local().images {
-        return Err("本机平台不支持图片剪贴板".into());
-    }
     let header: ImageBlobHeader = read_frame(receive).await?;
-    if header.schema_version != 1
-        || header.png_length == 0
-        || header.png_length as usize > MAX_IMAGE_BLOB
-        || header.width == 0
-        || header.height == 0
-    {
-        return Err("图片数据流头无效".to_string());
+    let message_id = header.message_id.clone();
+    let transfer_key = telemetry.start_transfer(
+        message_id.clone(),
+        device.device_id.clone(),
+        "download",
+        "image",
+        header.png_length,
+    );
+    let mut processing_ms = None;
+    let result = async {
+        if !ClipboardCapabilities::local().images {
+            return Err("本机平台不支持图片剪贴板".into());
+        }
+        if header.schema_version != 1
+            || header.png_length == 0
+            || header.png_length as usize > MAX_IMAGE_BLOB
+            || header.width == 0
+            || header.height == 0
+        {
+            return Err("图片数据流头无效".to_string());
+        }
+        {
+            let state = app.state::<ServiceState>();
+            state.validate_incoming_offer(&device.device_id, &header.group_ids, "image")?;
+        }
+        let mut png = Vec::with_capacity(header.png_length as usize);
+        let mut buffer = vec![0_u8; 64 * 1024];
+        while png.len() < header.png_length as usize {
+            let remaining = header.png_length as usize - png.len();
+            let limit = remaining.min(buffer.len());
+            let read = receive
+                .read(&mut buffer[..limit])
+                .await
+                .map_err(|error| format!("图片数据读取失败：{error}"))?
+                .ok_or_else(|| "图片数据流提前结束".to_string())?;
+            png.extend_from_slice(&buffer[..read]);
+            telemetry.update_transfer(&transfer_key, png.len() as u64);
+        }
+        if !receive
+            .read_to_end(1)
+            .await
+            .map_err(|error| format!("图片数据流尾部无效：{error}"))?
+            .is_empty()
+        {
+            return Err("图片数据流包含未声明内容".into());
+        }
+        telemetry.mark_network_complete(&transfer_key);
+        let processing_started = Instant::now();
+        let processing_result = (|| {
+            if HEXLOWER.encode(&Sha256::digest(&png)) != header.sha256 {
+                return Err("图片数据长度或哈希不匹配".into());
+            }
+            let decoded = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+                .map_err(|error| format!("图片数据解码失败：{error}"))?
+                .to_rgba8();
+            if decoded.width() != header.width || decoded.height() != header.height {
+                return Err("图片数据尺寸与声明不匹配".into());
+            }
+            let state = app.state::<ServiceState>();
+            service::receive_remote_image(
+                &state,
+                app,
+                device,
+                service::RemoteImage {
+                    sequence: header.origin_sequence,
+                    rgba: decoded.into_raw(),
+                    width: header.width,
+                    height: header.height,
+                    captured_at: header.captured_at,
+                    group_ids: header.group_ids,
+                },
+            )
+        })();
+        processing_ms = Some(elapsed_millis(processing_started.elapsed()));
+        processing_result
     }
-    {
-        let state = app.state::<ServiceState>();
-        state.validate_incoming_offer(&device.device_id, &header.group_ids, "image")?;
-        state.validate_incoming_sequence(&device.device_id, header.origin_sequence)?;
+    .await;
+    let accepted = result.is_ok();
+    let receipt_message = result.as_ref().err().cloned();
+    telemetry.finish_transfer(
+        &transfer_key,
+        accepted,
+        receipt_message
+            .clone()
+            .or_else(|| Some("图片已写入设备槽位".into())),
+    );
+    if let Some(sender) = receipt_sender {
+        let _ = sender.send(TrustedMessage::ClipboardDeliveryAck {
+            schema_version: 1,
+            message_id,
+            accepted,
+            message: receipt_message,
+            processing_ms,
+        });
     }
-    let png = receive
-        .read_to_end(MAX_IMAGE_BLOB)
-        .await
-        .map_err(|error| format!("图片数据读取失败：{error}"))?;
-    if png.len() as u64 != header.png_length
-        || HEXLOWER.encode(&Sha256::digest(&png)) != header.sha256
-    {
-        return Err("图片数据长度或哈希不匹配".into());
-    }
-    let decoded = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
-        .map_err(|error| format!("图片数据解码失败：{error}"))?
-        .to_rgba8();
-    if decoded.width() != header.width || decoded.height() != header.height {
-        return Err("图片数据尺寸与声明不匹配".into());
-    }
-    let state = app.state::<ServiceState>();
-    service::receive_remote_image(
-        &state,
-        app,
-        device,
-        service::RemoteImage {
-            sequence: header.origin_sequence,
-            rgba: decoded.into_raw(),
-            width: header.width,
-            height: header.height,
-            captured_at: header.captured_at,
-            group_ids: header.group_ids,
-        },
-    )
+    result
 }
 
 async fn receive_file_blob(
@@ -1730,6 +2539,7 @@ async fn receive_file_blob(
     device: &TrustedDevice,
     send: &mut quinn::SendStream,
     receive: &mut quinn::RecvStream,
+    telemetry: &TelemetryStore,
 ) -> Result<(), String> {
     if !ClipboardCapabilities::local().files {
         return Err("本机平台不支持文件剪贴板".into());
@@ -1751,40 +2561,62 @@ async fn receive_file_blob(
         (state.incoming_files_root().join(peer_key), accepted)
     };
     if already_accepted {
-        write_frame(
-            send,
-            &FileResumePlan {
-                schema_version: 1,
-                transfer_id: header.message_id.clone(),
-                offsets: header
-                    .entries
-                    .iter()
-                    .map(|entry| if entry.is_directory { 0 } else { entry.size })
-                    .collect(),
-            },
-        )
-        .await?;
-        if !receive
-            .read_to_end(1)
-            .await
-            .map_err(|error| format!("无法确认重复文件流：{error}"))?
-            .is_empty()
-        {
-            return Err("重复文件流包含未声明正文".into());
+        let transfer_key = telemetry.start_transfer(
+            header.message_id.clone(),
+            device.device_id.clone(),
+            "download",
+            "files",
+            header.total_size,
+        );
+        telemetry.set_transfer_baseline(&transfer_key, header.total_size);
+        let result = async {
+            write_frame(
+                send,
+                &FileResumePlan {
+                    schema_version: 1,
+                    transfer_id: header.message_id.clone(),
+                    offsets: header
+                        .entries
+                        .iter()
+                        .map(|entry| if entry.is_directory { 0 } else { entry.size })
+                        .collect(),
+                },
+            )
+            .await?;
+            if !receive
+                .read_to_end(1)
+                .await
+                .map_err(|error| format!("无法确认重复文件流：{error}"))?
+                .is_empty()
+            {
+                return Err("重复文件流包含未声明正文".into());
+            }
+            telemetry.mark_network_complete(&transfer_key);
+            write_frame(
+                send,
+                &FileTransferAck {
+                    schema_version: 1,
+                    transfer_id: header.message_id,
+                    accepted: true,
+                    message: None,
+                    processing_ms: Some(0),
+                },
+            )
+            .await?;
+            send.finish()
+                .map_err(|error| format!("无法结束重复文件确认流：{error}"))
         }
-        write_frame(
-            send,
-            &FileTransferAck {
-                schema_version: 1,
-                transfer_id: header.message_id,
-                accepted: true,
-                message: None,
-            },
-        )
-        .await?;
-        send.finish()
-            .map_err(|error| format!("无法结束重复文件确认流：{error}"))?;
-        return Ok(());
+        .await;
+        telemetry.finish_transfer(
+            &transfer_key,
+            result.is_ok(),
+            result
+                .as_ref()
+                .err()
+                .cloned()
+                .or_else(|| Some("文件已存在，无需重复接收".into())),
+        );
+        return result;
     }
     create_private_dir_all(&incoming_root).await?;
     let temporary = incoming_root.join(format!(".part-{transfer_id}"));
@@ -1799,32 +2631,64 @@ async fn receive_file_blob(
         },
     )
     .await?;
+    let transfer_key = telemetry.start_transfer(
+        header.message_id.clone(),
+        device.device_id.clone(),
+        "download",
+        "files",
+        header.total_size,
+    );
+    let mut processing_ms = None;
     let result = async {
-        receive_file_entries(receive, &partial.root, &header, &partial.offsets).await?;
-        if !partial.completed {
-            tokio::fs::rename(&temporary, &completed)
-                .await
-                .map_err(|error| format!("无法提交接收文件：{error}"))?;
-        }
-        let bundle = Arc::new(ReceivedFileBundle::new(
-            completed.clone(),
-            header.entries.clone(),
-        ));
-        let state = app.state::<ServiceState>();
-        service::receive_remote_files(
-            &state,
-            app,
-            device,
-            service::RemoteFiles {
-                sequence: header.origin_sequence,
-                bundle,
-                captured_at: header.captured_at.clone(),
-                group_ids: header.group_ids.clone(),
-                total_size: header.total_size,
-            },
+        receive_file_entries(
+            receive,
+            &partial.root,
+            &header,
+            &partial.offsets,
+            telemetry,
+            &transfer_key,
         )
+        .await?;
+        telemetry.mark_network_complete(&transfer_key);
+        let processing_started = Instant::now();
+        let processing_result = async {
+            if !partial.completed {
+                tokio::fs::rename(&temporary, &completed)
+                    .await
+                    .map_err(|error| format!("无法提交接收文件：{error}"))?;
+            }
+            let bundle = Arc::new(ReceivedFileBundle::new(
+                completed.clone(),
+                header.entries.clone(),
+            ));
+            let state = app.state::<ServiceState>();
+            service::receive_remote_files(
+                &state,
+                app,
+                device,
+                service::RemoteFiles {
+                    sequence: header.origin_sequence,
+                    bundle,
+                    captured_at: header.captured_at.clone(),
+                    group_ids: header.group_ids.clone(),
+                    total_size: header.total_size,
+                },
+            )
+        }
+        .await;
+        processing_ms = Some(elapsed_millis(processing_started.elapsed()));
+        processing_result
     }
     .await;
+    telemetry.finish_transfer(
+        &transfer_key,
+        result.is_ok(),
+        result
+            .as_ref()
+            .err()
+            .cloned()
+            .or_else(|| Some("文件已写入设备槽位".into())),
+    );
     if result.is_ok() {
         let state = app.state::<ServiceState>();
         state.mark_accepted_file_transfer(&device.device_id, transfer_id);
@@ -1834,6 +2698,7 @@ async fn receive_file_blob(
         transfer_id: header.message_id,
         accepted: result.is_ok(),
         message: result.as_ref().err().cloned(),
+        processing_ms,
     };
     write_frame(send, &acknowledgement).await?;
     send.finish()
@@ -1948,7 +2813,16 @@ async fn receive_file_entries(
     root: &std::path::Path,
     header: &FileBlobHeader,
     offsets: &[u64],
+    telemetry: &TelemetryStore,
+    transfer_key: &str,
 ) -> Result<(), String> {
+    let mut transferred = header
+        .entries
+        .iter()
+        .zip(offsets)
+        .map(|(entry, offset)| (*offset).min(entry.size))
+        .sum::<u64>();
+    telemetry.set_transfer_baseline(transfer_key, transferred);
     let mut buffer = vec![0_u8; 64 * 1024];
     for (entry, offset) in header.entries.iter().zip(offsets) {
         let relative = safe_relative_path(&entry.relative_path)?;
@@ -2002,6 +2876,8 @@ async fn receive_file_entries(
                 .await
                 .map_err(|error| format!("文件数据写入失败：{error}"))?;
             remaining -= read as u64;
+            transferred = transferred.saturating_add(read as u64);
+            telemetry.update_transfer(transfer_key, transferred);
         }
         file.sync_all()
             .await
@@ -2096,6 +2972,17 @@ pub(crate) fn start(app: AppHandle) -> Result<TransportHandle, String> {
                         return;
                     }
                 };
+                let telemetry = {
+                    let state = app_for_thread.state::<ServiceState>();
+                    match TelemetryStore::with_store(state.store()) {
+                        Ok(telemetry) => telemetry,
+                        Err(error) => {
+                            let _ = ready_tx.send(Err(error));
+                            return;
+                        }
+                    }
+                };
+                let telemetry_notify = telemetry.notifier();
                 let handle = TransportHandle {
                     runtime: tokio::runtime::Handle::current(),
                     endpoint: endpoint.clone(),
@@ -2107,12 +2994,37 @@ pub(crate) fn start(app: AppHandle) -> Result<TransportHandle, String> {
                     pair_commands: Arc::new(Mutex::new(HashMap::new())),
                     pairing_connecting: Arc::new(Mutex::new(HashMap::new())),
                     peers: Arc::new(Mutex::new(HashMap::new())),
+                    preferred_addresses: Arc::new(Mutex::new(HashMap::new())),
                     connecting: Arc::new(Mutex::new(HashMap::new())),
                     latest_offer: Arc::new(Mutex::new(None)),
                     latest_rich: Arc::new(Mutex::new(None)),
                     latest_image: Arc::new(Mutex::new(None)),
                     latest_files: Arc::new(Mutex::new(None)),
+                    latest_content_sequence: Arc::new(AtomicU64::new(0)),
+                    telemetry_observed: Arc::new(AtomicBool::new(false)),
+                    telemetry_notify,
+                    telemetry,
                 };
+                let telemetry_handle = handle.clone();
+                let telemetry_app = app_for_thread.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let observing = telemetry_handle.telemetry_observed.load(Ordering::Acquire);
+                        if observing && telemetry_handle.is_active() {
+                            telemetry_handle.sample_telemetry();
+                            telemetry_handle.telemetry.emit(&telemetry_app);
+                        }
+                        let delay = if observing {
+                            Duration::from_secs(1)
+                        } else {
+                            Duration::from_secs(30)
+                        };
+                        tokio::select! {
+                            _ = tokio::time::sleep(delay) => {}
+                            _ = telemetry_handle.telemetry_notify.notified() => {}
+                        }
+                    }
+                });
                 let _ = ready_tx.send(Ok(handle.clone()));
                 loop {
                     let generation = handle.runtime_generation();
@@ -2135,6 +3047,20 @@ pub(crate) fn start(app: AppHandle) -> Result<TransportHandle, String> {
     ready_rx
         .recv()
         .map_err(|_| "网络线程启动失败".to_string())?
+}
+
+#[tauri::command]
+pub(crate) fn get_telemetry(state: State<'_, TransportHandle>) -> TelemetrySnapshot {
+    state.telemetry_snapshot()
+}
+
+#[tauri::command]
+pub(crate) fn set_telemetry_observing(
+    state: State<'_, TransportHandle>,
+    app: AppHandle,
+    observing: bool,
+) {
+    state.set_telemetry_observing(&app, observing);
 }
 
 async fn accept_connection(
@@ -2483,22 +3409,56 @@ impl ServerCertVerifier for PinnedCertificateVerifier {
     }
 }
 
-fn preferred_address(nearby: &service::NearbyDevice) -> Result<SocketAddr, String> {
-    nearby
+fn candidate_addresses(
+    nearby: &service::NearbyDevice,
+    preferred: Option<IpAddr>,
+) -> Vec<SocketAddr> {
+    let mut seen = HashSet::new();
+    let mut addresses = nearby
         .addresses
         .iter()
         .filter_map(|value| value.parse::<IpAddr>().ok())
+        .filter(|address| seen.insert(*address))
         .map(|address| SocketAddr::new(address, nearby.port))
-        .find(|address| !address.ip().is_loopback())
-        .or_else(|| {
-            nearby
-                .addresses
-                .iter()
-                .filter_map(|value| value.parse::<IpAddr>().ok())
-                .map(|address| SocketAddr::new(address, nearby.port))
-                .next()
-        })
-        .ok_or_else(|| "附近设备尚未解析出可连接地址".to_string())
+        .collect::<Vec<_>>();
+    let has_non_loopback = addresses.iter().any(|address| !address.ip().is_loopback());
+    if has_non_loopback {
+        addresses.retain(|address| !address.ip().is_loopback());
+    }
+    addresses.sort_by_key(|address| {
+        let preferred_rank = u8::from(preferred != Some(address.ip()));
+        let family_rank = match address.ip() {
+            IpAddr::V4(_) => 0,
+            IpAddr::V6(address) if !address.is_unicast_link_local() => 1,
+            IpAddr::V6(_) => 2,
+        };
+        (preferred_rank, family_rank)
+    });
+    addresses
+}
+
+fn jittered_retry_delay(seconds: u64) -> Duration {
+    let jitter = 750 + (uuid::Uuid::new_v4().as_u128() % 501) as u64;
+    Duration::from_millis(seconds.saturating_mul(jitter))
+}
+
+fn elapsed_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn disconnect_code(error: &str) -> &'static str {
+    let normalized = error.to_ascii_lowercase();
+    if normalized.contains("timeout") || error.contains("超时") {
+        "network_timeout"
+    } else if normalized.contains("certificate") || error.contains("证书") {
+        "identity_rejected"
+    } else if normalized.contains("protocol") || error.contains("协议") {
+        "protocol_error"
+    } else if normalized.contains("closed") || error.contains("关闭") {
+        "connection_closed"
+    } else {
+        "network_error"
+    }
 }
 
 fn peer_certificate(connection: &Connection) -> Result<Vec<u8>, String> {
@@ -2642,6 +3602,57 @@ mod tests {
         let left = pairing_context("pair", &[1; 32], &[2; 32], "device-a", "device-b");
         let right = pairing_context("pair", &[1; 32], &[2; 32], "device-b", "device-a");
         assert_ne!(left, right);
+    }
+
+    #[test]
+    fn reconnect_replays_only_newer_clipboard_sequences() {
+        assert!(should_replay_sequence(8, None));
+        assert!(should_replay_sequence(8, Some(7)));
+        assert!(!should_replay_sequence(8, Some(8)));
+        assert!(!should_replay_sequence(8, Some(9)));
+    }
+
+    #[test]
+    fn candidate_addresses_prefer_last_success_and_keep_fallbacks() {
+        let nearby = service::NearbyDevice {
+            instance_id: "instance".into(),
+            device_id: "peer".into(),
+            device_name: "Peer".into(),
+            platform: "linux".into(),
+            addresses: vec!["fe80::1".into(), "192.168.1.10".into(), "10.0.0.8".into()],
+            port: 45_821,
+            last_seen_at: "2026-07-15T00:00:00Z".into(),
+            paired: true,
+        };
+        let preferred = "10.0.0.8".parse::<IpAddr>().unwrap();
+        let addresses = candidate_addresses(&nearby, Some(preferred));
+        assert_eq!(addresses[0].ip(), preferred);
+        assert!(addresses.iter().any(|address| address.ip().is_ipv4()));
+        assert!(addresses.iter().any(|address| address.ip().is_ipv6()));
+    }
+
+    #[tokio::test]
+    async fn delivery_receipt_resolves_the_matching_message() {
+        let pending = PendingDeliveryReceipts::default();
+        let receiver = register_delivery_receipt(&pending, "message-1").unwrap();
+        assert!(complete_delivery_receipt(
+            &pending,
+            "message-1",
+            true,
+            Some("已接收".into()),
+            Some(7),
+        ));
+        let receipt = receiver.await.unwrap();
+        assert!(receipt.accepted);
+        assert_eq!(receipt.message.as_deref(), Some("已接收"));
+        assert_eq!(receipt.processing_ms, Some(7));
+        assert!(!complete_delivery_receipt(
+            &pending,
+            "message-1",
+            true,
+            None,
+            None,
+        ));
     }
 
     #[test]
@@ -2829,6 +3840,7 @@ mod tests {
                     transfer_id: file_header.message_id,
                     accepted: true,
                     message: None,
+                    processing_ms: Some(4),
                 },
             )
             .await
@@ -2855,6 +3867,23 @@ mod tests {
             .unwrap()
             .await
             .unwrap();
+        let connection_telemetry = TelemetryStore::default();
+        connection_telemetry.mark_connected("peer", &connection);
+        connection_telemetry.mark_disconnected(
+            "peer",
+            &connection,
+            "network_error",
+            "测试断联原因",
+            false,
+        );
+        connection_telemetry.mark_connected("peer", &connection);
+        let connection_snapshot = connection_telemetry.snapshot();
+        assert_eq!(
+            connection_snapshot.peers[0]
+                .last_disconnect_reason
+                .as_deref(),
+            Some("测试断联原因"),
+        );
         let (mut send, mut receive) = connection.open_bi().await.unwrap();
         let offer = TrustedMessage::ClipboardSlotOffer {
             schema_version: 1,
@@ -2889,6 +3918,9 @@ mod tests {
                 png: Arc::new(png),
             },
             vec!["00112233-4455-6677-8899-aabbccddeeff".into()],
+            "image-test".into(),
+            &TelemetryStore::default(),
+            "upload:peer:image-test",
         )
         .await
         .unwrap();
@@ -2900,6 +3932,9 @@ mod tests {
             9,
         )
         .unwrap();
+        let telemetry = TelemetryStore::default();
+        let transfer_key =
+            telemetry.start_transfer("file-test", "peer", "upload", "files", bundle.total_size);
         send_file_blob(
             connection.clone(),
             LocalFileOffer {
@@ -2909,11 +3944,23 @@ mod tests {
                 bundle: Arc::new(bundle),
             },
             vec!["00112233-4455-6677-8899-aabbccddeeff".into()],
+            &telemetry,
+            &transfer_key,
         )
         .await
         .unwrap();
         let mut ack = connection.accept_uni().await.unwrap();
         assert_eq!(ack.read_to_end(2).await.unwrap(), b"ok");
+        connection_telemetry.mark_disconnected(
+            "peer",
+            &connection,
+            "connection_closed",
+            "测试连接结束",
+            true,
+        );
+        let final_connection_snapshot = connection_telemetry.snapshot();
+        assert!(final_connection_snapshot.peers[0].total_uploaded_bytes > 0);
+        assert!(final_connection_snapshot.peers[0].total_downloaded_bytes > 0);
         client.close(0u32.into(), b"done");
         server_task.await.unwrap();
         let _ = std::fs::remove_dir_all(directory);

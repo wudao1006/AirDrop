@@ -3,9 +3,13 @@ use super::{
     service::AppSettings,
 };
 use rusqlite::{params, Connection, OptionalExtension};
-use std::{fs, path::Path, sync::Mutex};
+use std::{
+    fs,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 #[derive(Clone, Debug)]
 pub(crate) struct TrustedDevice {
@@ -59,8 +63,9 @@ pub(crate) struct StoredRuntime {
     pub(crate) subscribe_paused: bool,
 }
 
+#[derive(Clone)]
 pub(crate) struct Store {
-    connection: Mutex<Connection>,
+    connection: Arc<Mutex<Connection>>,
 }
 
 impl Store {
@@ -157,6 +162,12 @@ impl Store {
                    group_id TEXT PRIMARY KEY,
                    revision INTEGER NOT NULL,
                    tombstone_json TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS transfer_history (
+                   attempt_id INTEGER PRIMARY KEY,
+                   device_id TEXT NOT NULL,
+                   completed_at TEXT NOT NULL,
+                   payload_json TEXT NOT NULL
                  );",
             )
             .map_err(|error| format!("无法初始化本地数据库：{error}"))?;
@@ -223,7 +234,7 @@ impl Store {
             .pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(|error| format!("无法更新数据库版本：{error}"))?;
         Ok(Self {
-            connection: Mutex::new(connection),
+            connection: Arc::new(Mutex::new(connection)),
         })
     }
 
@@ -1504,6 +1515,75 @@ impl Store {
             .map(|value| value.is_some())
             .map_err(|error| format!("无法读取同步组邀请接受状态：{error}"))
     }
+
+    pub(crate) fn load_transfer_history(&self) -> Result<Vec<String>, String> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "本地数据库锁已损坏".to_string())?;
+        let mut statement = connection
+            .prepare(
+                "SELECT payload_json FROM transfer_history
+                 ORDER BY completed_at DESC, attempt_id DESC LIMIT 200",
+            )
+            .map_err(|error| format!("无法读取传输历史：{error}"))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("无法枚举传输历史：{error}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("传输历史记录已损坏：{error}"))
+    }
+
+    pub(crate) fn save_transfer_history(
+        &self,
+        attempt_id: u64,
+        device_id: &str,
+        completed_at: &str,
+        payload_json: &str,
+    ) -> Result<(), String> {
+        let attempt_id =
+            i64::try_from(attempt_id).map_err(|_| "传输历史编号超过数据库范围".to_string())?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| "本地数据库锁已损坏".to_string())?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("无法开始保存传输历史：{error}"))?;
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO transfer_history(
+                   attempt_id, device_id, completed_at, payload_json
+                 ) VALUES(?1, ?2, ?3, ?4)",
+                params![attempt_id, device_id, completed_at, payload_json],
+            )
+            .map_err(|error| format!("无法保存传输历史：{error}"))?;
+        transaction
+            .execute(
+                "DELETE FROM transfer_history
+                 WHERE device_id = ?1
+                   AND attempt_id NOT IN (
+                     SELECT attempt_id FROM transfer_history
+                     WHERE device_id = ?1
+                     ORDER BY completed_at DESC, attempt_id DESC LIMIT 10
+                   )",
+                params![device_id],
+            )
+            .map_err(|error| format!("无法清理设备传输历史：{error}"))?;
+        transaction
+            .execute(
+                "DELETE FROM transfer_history
+                 WHERE attempt_id NOT IN (
+                   SELECT attempt_id FROM transfer_history
+                   ORDER BY completed_at DESC, attempt_id DESC LIMIT 200
+                 )",
+                [],
+            )
+            .map_err(|error| format!("无法限制传输历史数量：{error}"))?;
+        transaction
+            .commit()
+            .map_err(|error| format!("无法提交传输历史：{error}"))
+    }
 }
 
 fn column_exists(connection: &Connection, table: &str, column: &str) -> Result<bool, String> {
@@ -1679,6 +1759,37 @@ mod tests {
             .remote_sequence_matches("ld1_peer", 7, &[0_u8; 32])
             .unwrap());
         drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn transfer_history_is_persistent_and_bounded_per_device() {
+        let directory = temporary_directory();
+        let store = Store::open(&directory).unwrap();
+        for attempt_id in 1..=12 {
+            let completed_at = if attempt_id == 1 {
+                "2026-07-16T00:00:00Z"
+            } else {
+                "2026-07-15T00:00:00Z"
+            };
+            store
+                .save_transfer_history(
+                    attempt_id,
+                    "peer-1",
+                    completed_at,
+                    &format!("{{\"attemptId\":{attempt_id}}}"),
+                )
+                .unwrap();
+        }
+        drop(store);
+        let reopened = Store::open(&directory).unwrap();
+        let history = reopened.load_transfer_history().unwrap();
+        assert_eq!(history.len(), 10);
+        assert_eq!(history[0], "{\"attemptId\":1}");
+        assert!(history
+            .iter()
+            .any(|payload| payload == "{\"attemptId\":12}"));
+        assert!(!history.iter().any(|payload| payload == "{\"attemptId\":3}"));
         let _ = std::fs::remove_dir_all(directory);
     }
 

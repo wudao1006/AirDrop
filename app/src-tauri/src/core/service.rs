@@ -654,6 +654,10 @@ impl ServiceState {
         self.identity.device_id()
     }
 
+    pub(crate) fn store(&self) -> Store {
+        self.store.clone()
+    }
+
     pub(crate) fn device_name(&self) -> Result<String, String> {
         self.device_name
             .lock()
@@ -874,6 +878,20 @@ impl ServiceState {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn reconciliation_sequence(&self, origin_device_id: &str) -> Option<u64> {
+        let sequence = self
+            .incoming_sequences
+            .lock()
+            .ok()
+            .and_then(|sequences| sequences.get(origin_device_id).copied())?;
+        let recoverable = self
+            .recoverable_sequences
+            .lock()
+            .ok()
+            .is_some_and(|sequences| sequences.contains(origin_device_id));
+        (!recoverable).then_some(sequence)
     }
 
     fn accept_incoming_sequence(
@@ -3754,6 +3772,33 @@ pub fn get_snapshot(
 }
 
 #[tauri::command]
+pub fn copy_diagnostic_report(
+    state: State<'_, ServiceState>,
+    app: AppHandle,
+    report: String,
+) -> Result<(), String> {
+    if report.trim().is_empty() || report.len() > 64 * 1024 {
+        return Err("诊断摘要为空或超过 64 KiB".into());
+    }
+    *state
+        .suppress_next_capture
+        .lock()
+        .map_err(|_| "剪贴板回环抑制锁已损坏".to_string())? = Some(report.clone());
+    if let Err(error) = retry_clipboard_write(|| {
+        app.clipboard()
+            .write_text(&report)
+            .map_err(|error| error.to_string())
+    }) {
+        *state
+            .suppress_next_capture
+            .lock()
+            .map_err(|_| "剪贴板回环抑制锁已损坏".to_string())? = None;
+        return Err(format!("无法复制诊断摘要：{error}"));
+    }
+    Ok(())
+}
+
+#[tauri::command]
 pub fn set_pause(
     state: State<'_, ServiceState>,
     app: AppHandle,
@@ -4545,18 +4590,21 @@ mod tests {
         assert!(state
             .accept_incoming_sequence("ld1_peer", 7, &hash_7)
             .unwrap());
+        assert_eq!(state.reconciliation_sequence("ld1_peer"), Some(7));
         assert!(!state
             .accept_incoming_sequence("ld1_peer", 7, &hash_7)
             .unwrap());
         drop(state);
 
         let state = ServiceState::open(&directory).unwrap();
+        assert_eq!(state.reconciliation_sequence("ld1_peer"), None);
         assert!(!state
             .accept_incoming_sequence("ld1_peer", 7, &changed_hash_7)
             .unwrap());
         assert!(state
             .accept_incoming_sequence("ld1_peer", 7, &hash_7)
             .unwrap());
+        assert_eq!(state.reconciliation_sequence("ld1_peer"), Some(7));
         assert!(!state
             .accept_incoming_sequence("ld1_peer", 7, &hash_7)
             .unwrap());
@@ -4566,6 +4614,7 @@ mod tests {
         assert!(state
             .accept_incoming_sequence("ld1_peer", 8, &hash_8)
             .unwrap());
+        assert_eq!(state.reconciliation_sequence("ld1_peer"), Some(8));
         drop(state);
         let _ = fs::remove_dir_all(directory);
     }

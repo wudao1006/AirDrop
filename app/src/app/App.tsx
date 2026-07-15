@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useState } from "react";
 import type { DesktopClient } from "../ipc/client";
-import type { PageId, UiSnapshot } from "../model";
+import { EMPTY_TELEMETRY, type PageId, type TelemetrySnapshot, type UiSnapshot } from "../model";
 import { AppShell } from "./AppShell";
 import { HomePage } from "../features/home/HomePage";
 import { ClipboardPage } from "../features/clipboard/ClipboardPage";
@@ -18,9 +18,11 @@ import { ErrorToast } from "../components/ErrorToast";
 export function App({ client }: { client: DesktopClient }) {
   const [page, setPage] = useState<PageId>("home");
   const [snapshot, setSnapshot] = useState<UiSnapshot | null>(null);
+  const [telemetry, setTelemetry] = useState<TelemetrySnapshot>(EMPTY_TELEMETRY);
   const [error, setError] = useState<string | null>(null);
   const clearError = useCallback(() => setError(null), []);
   useAndroidLifecycle(client);
+  const observesTelemetry = page === "devices" || page === "transfers";
 
   useEffect(() => {
     let mounted = true;
@@ -32,6 +34,28 @@ export function App({ client }: { client: DesktopClient }) {
     void client.getSnapshot().then(applySnapshot).catch((reason: unknown) => setError(reason instanceof Error ? reason.message : "AirDrop 启动失败"));
     return () => { mounted = false; unsubscribe(); };
   }, [client]);
+
+  useEffect(() => {
+    if (!observesTelemetry) return;
+    let mounted = true;
+    const applyTelemetry = (value: TelemetrySnapshot) => {
+      if (!mounted) return;
+      setTelemetry((current) => {
+        const nextSampledAt = Date.parse(value.sampledAt);
+        const currentSampledAt = Date.parse(current.sampledAt);
+        if (Number.isNaN(nextSampledAt)) return current;
+        return Number.isNaN(currentSampledAt) || nextSampledAt >= currentSampledAt ? value : current;
+      });
+    };
+    const unsubscribe = client.subscribeTelemetry(applyTelemetry);
+    void client.setTelemetryObserving(true).catch(() => undefined);
+    void client.getTelemetry().then(applyTelemetry).catch(() => undefined);
+    return () => {
+      mounted = false;
+      unsubscribe();
+      void client.setTelemetryObserving(false).catch(() => undefined);
+    };
+  }, [client, observesTelemetry]);
 
   useEffect(() => {
     if (client.platform !== "desktop" || !window.__TAURI_INTERNALS__) return;
@@ -58,12 +82,12 @@ export function App({ client }: { client: DesktopClient }) {
     switch (page) {
       case "home": return <HomePage {...shared} openClipboard={() => setPage("clipboard")} />;
       case "clipboard": return <ClipboardPage {...shared} />;
-      case "devices": return <DevicesPage snapshot={snapshot} client={client} onError={setError} />;
+      case "devices": return <DevicesPage snapshot={snapshot} telemetry={telemetry} client={client} onError={setError} />;
       case "groups": return <GroupsPage snapshot={snapshot} client={client} onError={setError} />;
-      case "transfers": return <TransfersPage />;
+      case "transfers": return <TransfersPage snapshot={snapshot} telemetry={telemetry} />;
       case "settings": return <SettingsPage {...shared} />;
     }
-  }, [client, page, snapshot]);
+  }, [client, page, snapshot, telemetry]);
 
   if (!snapshot) return <div className="splash"><div className="brand-mark"><span>✦</span></div><strong>正在启动 AirDrop</strong><span>{error ?? "正在准备…"}</span></div>;
 

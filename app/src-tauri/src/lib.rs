@@ -79,6 +79,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             core::service::get_snapshot,
+            core::transport::get_telemetry,
+            core::transport::set_telemetry_observing,
+            core::service::copy_diagnostic_report,
             core::service::set_pause,
             core::service::set_synchronization_paused,
             core::service::set_app_activity,
@@ -111,6 +114,12 @@ pub fn run() {
 
     app.run(|app_handle, event| {
         if matches!(&event, tauri::RunEvent::Exit) {
+            if let Err(error) = app_handle
+                .state::<core::transport::TransportHandle>()
+                .flush_telemetry_history()
+            {
+                tracing::warn!(error = %error, "transfer history flush failed during shutdown");
+            }
             app_handle
                 .state::<core::discovery::DiscoveryHandle>()
                 .suspend();

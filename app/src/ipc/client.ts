@@ -1,4 +1,4 @@
-import type { AppActivity, AppSettings, PlatformKind, UiSnapshot } from "../model";
+import type { AppActivity, AppSettings, PlatformKind, TelemetrySnapshot, UiSnapshot } from "../model";
 
 export type Unsubscribe = () => void;
 
@@ -6,6 +6,10 @@ export interface AppClient {
   readonly platform: PlatformKind;
   getSnapshot(): Promise<UiSnapshot>;
   subscribe(listener: (snapshot: UiSnapshot) => void): Unsubscribe;
+  getTelemetry(): Promise<TelemetrySnapshot>;
+  subscribeTelemetry(listener: (snapshot: TelemetrySnapshot) => void): Unsubscribe;
+  setTelemetryObserving(observing: boolean): Promise<void>;
+  copyDiagnosticReport(report: string): Promise<void>;
   useSlot(slotId: string, revision: number): Promise<void>;
   createImportIntent(slotId: string, revision: number): Promise<string>;
   confirmImport(importId: string): Promise<void>;
